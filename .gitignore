@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+
+# build
+dist/
+*.tsbuildinfo
+
+# logs / OS
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# local Pi / agent scratch (never commit session or latch state)
+.pi/
+.pi-subagents/
+.fallow/
+tmp/
+coverage/
+*.tgz
+
+# editor
+.idea/
+*.swp
+*~

@@ -1,0 +1,4 @@
+{
+  "autoAdvanceOnLanded": true,
+  "qaModel": "xai/grok-4.6:high"
+}
