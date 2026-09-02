@@ -61,8 +61,10 @@ import {
 	referenceCheckoutFor,
 	repoKey,
 	resolveQueryCwd,
+	seedWaiterState,
 	spawnCwdFor,
 	stateDir,
+	waiterStatePath,
 	trailingCd,
 	markVerdictDelivered,
 	formatWaitElapsed,
@@ -171,13 +173,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	let latch: LatchState | undefined;
 	let disabled = false;
 	let ensuring = false;
-	let stateFile: string | undefined;
 	let sessionId: string | undefined;
 	/**
-	 * The extension's own copy of the latch. `stateFile` is handed to the Rust
-	 * waiter as `--state`, and the waiter rewrites it wholesale with its own
-	 * verdict — that is how a PR #11 verdict overwrote a PR #18 latch. Never
-	 * read the latch back out of `stateFile`.
+	 * The extension's own copy of the latch, and the only file this module
+	 * writes state into. The waiter is handed one of its *own* files as
+	 * `--state` (`waiterStatePath`) and rewrites it wholesale on every poll —
+	 * that is how a PR #11 verdict once overwrote a PR #18 latch, back when the
+	 * two roles shared `pi-<id>.json`. Never read the latch out of waiter state
+	 * (F20).
 	 */
 	let latchFile: string | undefined;
 	let watchTimer: ReturnType<typeof setInterval> | undefined;
@@ -230,32 +233,35 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			});
 		});
 
+	/**
+	 * The `--state` file for the latched PR: a waiter file, never this session's.
+	 * Undefined before a PR is latched, because the waiter's files are keyed by
+	 * PR and there is nothing to name yet.
+	 */
+	function waiterState(): string | undefined {
+		if (!latch?.pr) return undefined;
+		return waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
+	}
+
+	/**
+	 * Write the latch. One file, ours (F20).
+	 *
+	 * This used to also seed the waiter's `--state` path with the same blob —
+	 * `pid`, `sessionId`, `origin` and all — which is what made a waiter rewrite
+	 * readable as a session latch. The waiter's bootstrap now happens once, at
+	 * spawn, in `seedWaiterState`, and carries `{pr, cwd}` only.
+	 */
 	function persist(): void {
-		if (!stateFile || !latchFile) return;
+		if (!latchFile) return;
 		try {
 			mkdirSync(stateDir(), { recursive: true });
 			if (latch) {
 				// Ownership travels with the latch: a live owner must not be adopted away.
-				const blob = JSON.stringify({ ...latch, pid: process.pid, sessionId });
-				writeFileSync(latchFile, blob);
-				// Seed only. The waiter owns `stateFile` once it starts and writes
-				// lastNext/verdict there; overwriting it is how an ACTIONABLE
-				// `read_comments_and_fix` vanished before the parent could be woken
-				// (icemining#2163). Re-seed when the file is missing or names a
-				// different PR.
-				let seed = true;
-				try {
-					if (existsSync(stateFile)) {
-						const existing = JSON.parse(readFileSync(stateFile, "utf8")) as { pr?: unknown };
-						if (String(existing.pr ?? "") === String(latch.pr)) seed = false;
-					}
-				} catch {
-					seed = true;
-				}
-				if (seed) writeFileSync(stateFile, blob);
+				writeFileSync(latchFile, JSON.stringify({ ...latch, pid: process.pid, sessionId }));
 			} else {
+				// Only ours. The waiter's file is the waiter's, and it may still hold
+				// an undelivered verdict for a PR this session merely stopped watching.
 				rmSync(latchFile, { force: true });
-				rmSync(stateFile, { force: true });
 			}
 		} catch {
 			// Never take the session down over the latch.
@@ -306,8 +312,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 
 	/**
 	 * Every file that may carry waiter state for the latched PR, newest naming
-	 * scheme first. `stateFile` is this session's `--state` path; the rest are
-	 * the waiter's own bookkeeping under both spellings it has used.
+	 * scheme first — the waiter's own bookkeeping under both spellings it has
+	 * used, which is every file that can carry a verdict now that TS writes none
+	 * of them.
 	 *
 	 * `latchFile` is deliberately absent: `pi-<id>.latch.json` is the
 	 * extension's private copy, and treating it as waiter state is the mistake
@@ -315,19 +322,24 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 */
 	function waiterStateFiles(): string[] {
 		const files: string[] = [];
-		if (stateFile) files.push(stateFile);
+		const own = waiterState();
+		if (own) files.push(own);
 		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
 		return [...new Set(files)];
 	}
 
 	function waiterRound(): { round?: string; roundTotal?: string } {
-		const files: string[] = [];
-		if (stateFile) files.push(stateFile);
+		const files: string[] = [...waiterStateFiles()];
 		if (latchFile) files.push(latchFile);
-		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
 		for (const path of files) {
 			const v = readLiveRound(path);
-			if (v?.round) return v;
+			if (!v?.round) continue;
+			// A yield handoff carries no round=, so the waiter's file still holds
+			// the previous cycle's until it polls again. Showing it is how the
+			// spinner stuck on r3 across a new wait. The stale value is filtered
+			// here rather than deleted out of a file this module does not own.
+			if (latch?.roundStale && v.round === latch.roundStale) continue;
+			return v;
 		}
 		if (latch?.round) return { round: latch.round, roundTotal: latch.roundTotal };
 		return {};
@@ -588,7 +600,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * latch must deliver that verdict itself or review fixes never start.
 	 */
 	async function checkActionable(ctx: ExtensionContext): Promise<void> {
-		if (disabled || !latch || !stateFile) return;
+		if (disabled || !latch) return;
 		const pr = latch.pr;
 		const candidates = waiterStateFiles();
 		let hit:
@@ -769,38 +781,42 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		});
 		// A yield handoff has no round=. Leaving the previous cycle's r3 in
 		// the waiter JSON is why the spinner stayed on 3 after a new wait.
-		if (!round) stripStaleWaiterRound();
+		if (!round) markInheritedWaiterRound();
 	}
 
-	function stripStaleWaiterRound(): void {
+	/**
+	 * Remember the `round=` a new wait inherits, so chrome can ignore it.
+	 *
+	 * A yield handoff has no `round=`; the waiter's file keeps the previous
+	 * cycle's until its next poll, and painting that is why the spinner stayed
+	 * on r3 after a fresh wait. The old fix deleted the field out of the
+	 * waiter's own file — a second writer on a file this module does not own
+	 * (F20). Recording the value is the same answer with one writer: the moment
+	 * the waiter writes any other round, the filter in `waiterRound` stops
+	 * matching and live progress appears.
+	 */
+	function markInheritedWaiterRound(): void {
 		if (!latch) return;
-		const files = [
-			stateFile,
-			latchFile,
-			...waiterManualFiles(latch.pr, stateDir()),
-		].filter((p): p is string => Boolean(p));
-		for (const path of files) {
-			try {
-				if (!existsSync(path)) continue;
-				const v = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-				if (v.pr != null && String(v.pr) !== String(latch.pr)) continue;
-				if (v.round == null && v.roundTotal == null && v.round_total == null) continue;
-				delete v.round;
-				delete v.roundTotal;
-				delete v.round_total;
-				delete v.round_number;
-				writeFileSync(path, JSON.stringify(v));
-			} catch {
-				// Never take the session down over chrome bookkeeping.
+		let stale: string | undefined;
+		for (const path of [...waiterStateFiles(), latchFile].filter(
+			(p): p is string => Boolean(p),
+		)) {
+			const v = readLiveRound(path);
+			if (v?.round) {
+				stale = v.round;
+				break;
 			}
 		}
+		if (!stale) return;
+		latch = { ...latch, roundStale: stale };
+		persist();
 	}
 
 	async function handoff(ctx: ExtensionContext, opts: { wakeOnTerminal?: boolean } = {}): Promise<void> {
 		if (disabled || ensuring || latchOff()) return;
 		ensuring = true;
 		try {
-			if (!latch || !stateFile) return;
+			if (!latch) return;
 
 			const state = await prState(latch.pr, latch.cwd);
 			if (state === "closed" || state === "merged") {
@@ -847,9 +863,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				);
 				return;
 			}
+			// The waiter is handed one of its own files, seeded with the same
+			// `{pr, cwd}` bootstrap `ghl-pr-await`'s handoff writes for itself —
+			// the `--daemon` hop takes no positional PR and reads both out of it.
+			const statePath = waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
+			seedWaiterState(statePath, { pr: latch.pr, cwd: latch.cwd });
 			const result = ensureDriver({
 				pr: latch.pr,
-				stateFile,
+				stateFile: statePath,
 				spawn: spawnDriver,
 				running,
 			});
@@ -909,20 +930,21 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	pi.on("session_start", async (event, ctx) => {
 		const id = ctx.sessionManager.getSessionId();
 		sessionId = id;
-		stateFile = id ? join(stateDir(), `pi-${id}.json`) : undefined;
 		latchFile = id ? join(stateDir(), `pi-${id}.latch.json`) : undefined;
 		seenCwds.clear();
 		pendingCommands.clear();
 		deferralActive = false;
-		if (!stateFile || !latchFile) return;
+		if (!latchFile) return;
 
 		const reason =
 			event && typeof event === "object" && typeof (event as { reason?: unknown }).reason === "string"
 				? (event as { reason: string }).reason
 				: "startup";
 
-		// Prefer this session's own latch, then the legacy shared path.
-		latch = readLatchFile(latchFile) ?? (existsSync(stateFile) ? readLatchFile(stateFile) : undefined);
+		// This session's own latch, and only that. The fallback used to be the
+		// shared `pi-<id>.json`, which by then was whatever the waiter had last
+		// written — a waiter rewrite read back as a session latch (F20).
+		latch = readLatchFile(latchFile);
 		if (latch) {
 			// Same-session reload. The previous process may have died without the
 			// waiter, so re-ensure it, but do not wake: the user is not here.
@@ -942,7 +964,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const repo = repoKey(ctx.cwd);
 		if (!repo) return;
 		const adopted = adoptableLatch(stateDir(), {
-			exclude: [stateFile, latchFile],
+			exclude: [latchFile],
 			repo,
 			cwd: ctx.cwd,
 		});

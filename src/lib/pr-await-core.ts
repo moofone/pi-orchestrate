@@ -58,7 +58,7 @@ export function isAcceptedFeaturePrAction(action: unknown): boolean {
 	return typeof action === "string" && ACCEPTED_FEATURE_PR_ACTIONS.has(action);
 }
 
-/** Waiter-owned fields on `pi-<id>.json` / `manual-<pr>.json`. */
+/** Waiter-owned fields on `manual-<pr>.json` (and legacy `pi-<id>.json`). */
 export type WaiterVerdict = {
 	lastNext?: string;
 	verdict?: string;
@@ -302,6 +302,16 @@ export type LatchState = {
 	/** Waiter review cycle, from `round=` / `round_total=` on git pr-await output. */
 	round?: string;
 	roundTotal?: string;
+	/**
+	 * The `round=` already in the waiter's file when this wait started.
+	 *
+	 * A yield handoff carries no `round=`, and the waiter's file still holds the
+	 * previous cycle's — which is why the spinner stayed on r3 across a new wait.
+	 * This used to be fixed by deleting `round` out of the waiter's own file;
+	 * that made the extension a second writer of a file it does not own (F20),
+	 * so the staleness is remembered here instead and filtered on read.
+	 */
+	roundStale?: string;
 };
 
 /**
@@ -633,9 +643,11 @@ export type UndeliveredVerdict = {
 /**
  * Undelivered ACTIONABLE verdicts for a PR, from every file that may hold one.
  *
- * Both waiter spellings plus any session `pi-<id>.json` the waiter has
+ * Both waiter spellings plus any legacy session `pi-<id>.json` the waiter has
  * rewritten — the verdict outlives the session that asked for it, which is
- * what makes recovery after a reload possible at all.
+ * what makes recovery after a reload possible at all. Nothing writes
+ * `pi-<id>.json` any more (F20), but files left by earlier builds may still
+ * hold an undelivered verdict, and dropping them would strand it.
  *
  * `pi-<id>.latch.json` is excluded: it is the extension's private copy of the
  * latch, and reading it as waiter state is the confusion behind the duplicate
@@ -657,7 +669,7 @@ export function undeliveredWaiterVerdicts(
 	}
 	for (const name of names) {
 		if (!name.startsWith("pi-") || !name.endsWith(".json")) continue;
-		if (name.endsWith(".latch.json")) continue;
+		if (isExtensionOwnedStateFile(name)) continue;
 		paths.push(join(dir, name));
 	}
 	const out: UndeliveredVerdict[] = [];
@@ -1020,13 +1032,72 @@ export function isDriverRunning(
 	return readPids(pr, dir).some((pid) => alive(pid));
 }
 
-export function writePid(pr: string, pid: number, dir = stateDir()): void {
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(pidFile(pr, dir), String(pid));
+/* ------------------------------------------------------------------ *
+ * File ownership (F20)
+ *
+ * One writer per file, and the name says who:
+ *
+ *   `pi-<id>.latch.json`   the extension's own latch. TS writes it; the waiter
+ *                          has never heard of it.
+ *   `manual-*.json`        the waiter's state, handed to it as `--state`. The
+ *                          waiter rewrites it wholesale on every poll.
+ *   `drive-*.pid` / `.log` the waiter's, entirely.
+ *
+ * TS used to hand the waiter `pi-<id>.json` — a file it had also seeded with
+ * `pid`, `sessionId` and `origin`. The waiter's next write dropped those, so
+ * `adoptableLatch` read a waiter rewrite back as an ownerless session latch and
+ * a PR #11 verdict overwrote a PR #18 latch. There are exactly two writes TS
+ * still makes outside its own file, both protocol rather than state:
+ * `seedWaiterState` below (the same `{pr, cwd}` bootstrap the Rust
+ * `spawn_handoff` writes before spawning) and `markVerdictDelivered` (a single
+ * shared flag the Rust side reads and writes too, with the same torn-JSON
+ * guard).
+ * ------------------------------------------------------------------ */
+
+/** Is this the extension's private latch rather than waiter state? */
+export function isExtensionOwnedStateFile(path: string): boolean {
+	return basename(path).endsWith(".latch.json");
 }
 
-export function clearPid(pr: string, dir = stateDir()): void {
-	rmSync(pidFile(pr, dir), { force: true });
+/**
+ * The `--state` path to hand `ghl-pr-await` for this PR — always a file the
+ * waiter owns. An existing one wins over a freshly spelled name: which spelling
+ * the installed binary uses is not knowable from here, and creating the other
+ * one would leave two waiter files for one PR.
+ */
+export function waiterStatePath(
+	repo: string | undefined,
+	pr: string,
+	dir = stateDir(),
+): string {
+	return waiterManualFiles(pr, dir)[0] ?? waiterPaths(repo, pr, dir).manual[0]!;
+}
+
+/**
+ * Bootstrap the waiter's state file so `--state FILE --daemon` can resolve the
+ * PR — the daemon hop takes no positional argument and reads both `pr` and
+ * `cwd` out of this file.
+ *
+ * `{pr, cwd}` and nothing else, byte for byte what `ghl-pr-await`'s own
+ * `spawn_handoff` writes. A file that already names this PR is left alone: it
+ * is the waiter's, and it may hold an undelivered verdict that overwriting
+ * would throw away (F4).
+ */
+export function seedWaiterState(path: string, seed: { pr: string; cwd: string }): void {
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		if (existsSync(path)) {
+			const existing = JSON.parse(readFileSync(path, "utf8")) as { pr?: unknown };
+			if (String(existing.pr ?? "") === String(seed.pr)) return;
+		}
+	} catch {
+		// Unreadable or torn: a re-seed is the recovery.
+	}
+	try {
+		writeFileSync(path, JSON.stringify({ pr: String(seed.pr), cwd: seed.cwd }));
+	} catch {
+		// Never take the session down over the latch.
+	}
 }
 
 export function latchOff(): boolean {

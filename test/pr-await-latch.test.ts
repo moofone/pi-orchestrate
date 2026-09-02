@@ -66,13 +66,29 @@ const {
 	osc8Link,
 	prLinkLabel,
 	prUrl,
+	isExtensionOwnedStateFile,
 	readLiveRound,
 	repoKey,
+	seedWaiterState,
 	spawnCwdFor,
+	waiterStatePath,
 	waitProgressSequence,
 } = await import("../src/lib/pr-await-core.ts");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The waiter's `--state` file for a PR in a harness directory.
+ *
+ * These tests used to name `pi-<id>.json`, because that is the file the
+ * extension handed the waiter as `--state` while also seeding it with the
+ * session's own latch. One file, two writers, and a waiter rewrite read back as
+ * a session latch (F20). The waiter now gets a file of its own, so the tests
+ * name the waiter's file — which is also what a real `ghl-pr-await` writes.
+ */
+function waiterState(dir: string, pr = "2142", repo = "icemining"): string {
+	return waiterStatePath(repo, pr, dir);
+}
 
 let sessionSeq = 0;
 
@@ -248,7 +264,7 @@ test("git pr-land --continue does not retarget the latch onto another PR", async
 	);
 	await h.settle();
 	await sleep(80);
-	const state = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.json`), "utf8"));
+	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 	assert.equal(state.pr, "2142", "pr-land 10 must not steal a latch that was on 2142");
 	h.cleanup();
 });
@@ -294,7 +310,7 @@ test("settle hands off to a detached driver — zero parent wakes, zero in-proce
 		/\x1b\]8;;https:\/\/github.com\/moofone\/icemining\/pull\/2142/,
 		`handoff toast must OSC-8 link the PR like wait chrome; got ${JSON.stringify(handoff)}`,
 	);
-	assert.ok(existsSync(join(h.dir, `pi-${h.sessionId}.json`)));
+	assert.ok(existsSync(waiterState(h.dir)));
 	h.cleanup();
 });
 
@@ -369,8 +385,11 @@ test("merged PR whose worktree is already gone is not handed off as a stall", as
 		return ok("[]");
 	}, REF);
 	await h.start();
+	// The extension's own latch file. It used to be legitimate to write this
+	// through the waiter's `--state` path, because they were the same file;
+	// session_start now reads the latch only from the file the extension owns.
 	writeFileSync(
-		join(h.dir, `pi-${h.sessionId}.json`),
+		join(h.dir, `pi-${h.sessionId}.latch.json`),
 		JSON.stringify({ pr: "2142", cwd: GONE, lastNext: "done" }),
 	);
 	// Reload the in-memory latch from the file as session_start does.
@@ -502,7 +521,8 @@ test("arms from a gh pr create URL when pr-await was never run", async () => {
 	await h.settle();
 	await sleep(80);
 	assert.equal(h.spawns.length, 1);
-	assert.ok(existsSync(join(h.dir, `pi-${h.sessionId}.json`)));
+	// Seeded for the waiter at spawn, under the PR the URL named.
+	assert.ok(existsSync(waiterState(h.dir, "2150")));
 	h.cleanup();
 });
 
@@ -874,7 +894,7 @@ test("a waiter overwriting the shared state path cannot retarget the latch", asy
 		// the extension used to share with it. This is the real pi-01a03ef0.json
 		// shape: PR #11's verdict sitting where #18's latch belonged.
 		writeFileSync(
-			join(h.dir, `pi-${h.sessionId}.json`),
+			waiterState(h.dir),
 			JSON.stringify({ pr: "11", cwd: REPO, verdict: "status=action_required", verdictDelivered: false }),
 		);
 		await h.start();
@@ -1114,8 +1134,9 @@ const ACTIONABLE_VERDICT = [
 	"comment bot=grok path=a.ts line=1 body=fix",
 ].join("\n");
 
-function writeActionable(dir: string, sessionId: string, extra: Record<string, unknown> = {}) {
-	const path = join(dir, `pi-${sessionId}.json`);
+/** Write a verdict the way the waiter does: into the waiter's own state file. */
+function writeActionable(dir: string, _sessionId: string, extra: Record<string, unknown> = {}) {
+	const path = waiterState(dir);
 	const existing = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
 	writeFileSync(
 		path,
@@ -1139,7 +1160,7 @@ test("handoff persist does not wipe a waiter ACTIONABLE verdict", async () => {
 	writeActionable(h.dir, h.sessionId);
 	await h.settle();
 	await sleep(40);
-	const state = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.json`), "utf8"));
+	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 	assert.equal(state.lastNext, "read_comments_and_fix", "persist must not clobber the waiter verdict");
 	assert.equal(state.verdictDelivered, true, "the delivered wake must mark the verdict spent");
 	h.cleanup();
@@ -1157,7 +1178,7 @@ test("undelivered ACTIONABLE on settle wakes the live parent once", async () => 
 	assert.match(h.wakes[0], /Fix current-head findings/);
 	assert.match(h.wakes[0], /Do not wait for another user message/);
 	assert.match(h.wakes[0], /comment bot=grok/);
-	const state = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.json`), "utf8"));
+	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 	assert.equal(state.verdictDelivered, true);
 	h.cleanup();
 });
@@ -1344,7 +1365,7 @@ test("a Feature-owned ACTIONABLE is dispatched by code, never woken into this se
 			h.notifies.some((n) => /read_comments_and_fix/.test(n)),
 			`a toast may still say what happened; got ${h.notifies.join(" | ")}`,
 		);
-		const state = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.json`), "utf8"));
+		const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 		assert.equal(state.verdictDelivered, true, "the verdict is spent even though no turn was bought");
 		assert.equal(
 			h.calls.filter((c) => c.includes("pr-await")).length,
@@ -1408,19 +1429,22 @@ test("a refused Feature dispatch leaves the verdict on disk for a later retry", 
 	try {
 		await h.start();
 		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
-		writeActionable(h.dir, h.sessionId);
-		writeFileSync(
-			join(h.dir, "manual-icemining-2142.json"),
-			JSON.stringify({
-				pr: "2142",
-				lastNext: "read_comments_and_fix",
-				verdict: ACTIONABLE_VERDICT,
-				verdictDelivered: false,
-			}),
-		);
+		// Both waiter spellings: which one the installed binary wrote is not
+		// knowable from here, and a refusal must leave every one of them intact.
+		for (const name of ["manual-icemining-2142.json", "manual-2142.json"]) {
+			writeFileSync(
+				join(h.dir, name),
+				JSON.stringify({
+					pr: "2142",
+					lastNext: "read_comments_and_fix",
+					verdict: ACTIONABLE_VERDICT,
+					verdictDelivered: false,
+				}),
+			);
+		}
 		await h.settle();
 		await sleep(80);
-		for (const name of [`pi-${h.sessionId}.json`, "manual-icemining-2142.json"]) {
+		for (const name of ["manual-icemining-2142.json", "manual-2142.json"]) {
 			const state = JSON.parse(readFileSync(join(h.dir, name), "utf8"));
 			assert.equal(
 				state.verdictDelivered,
@@ -1459,7 +1483,7 @@ test("an accepted Feature dispatch spends the verdict so it is not dispatched tw
 		await h.settle();
 		await sleep(120);
 		assert.equal(calls, 1, `an accepted verdict dispatches once; got ${calls}`);
-		const state = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.json`), "utf8"));
+		const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 		assert.equal(state.verdictDelivered, true);
 	} finally {
 		h.cleanup();
@@ -1799,7 +1823,7 @@ test("yield handoff drops the previous cycle's r3 so chrome is not stuck", async
 	try {
 		await h.start();
 		writeFileSync(
-			join(h.dir, `pi-${h.sessionId}.json`),
+			waiterState(h.dir),
 			JSON.stringify({
 				pr: "2142",
 				cwd: REPO,
@@ -1842,7 +1866,10 @@ test("wait chrome picks up live round= from the waiter JSON", async () => {
 		await h.start();
 		await h.bash(`cd ${REPO} && git pr-await 2142`, YIELD_OUTPUT);
 		await h.settle();
-		const statePath = join(h.dir, `pi-${h.sessionId}.json`);
+		// The waiter's file is seeded at spawn, inside the settle handoff, which
+		// is not awaited: give it the tick it needs before reading it back.
+		await sleep(50);
+		const statePath = waiterState(h.dir);
 		const cur = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
 		writeFileSync(statePath, JSON.stringify({ ...cur, round: "1", roundTotal: "3" }));
 		await sleep(50);
@@ -1850,5 +1877,137 @@ test("wait chrome picks up live round= from the waiter JSON", async () => {
 		assert.match(shown, /r1\/3/, `chrome must show live progress: ${shown}`);
 	} finally {
 		h.cleanup();
+	}
+});
+
+/* ---------------------------------------------------------------- *
+ * Phase 5 — file ownership (F20).
+ *
+ * One writer per file. `pi-<id>.latch.json` is the extension's; `manual-*.json`
+ * and `drive-*` are the waiter's. They used to share `pi-<id>.json`: TS seeded
+ * it with the session latch and handed the same path to `ghl-pr-await` as
+ * `--state`, which rewrote it wholesale. A waiter rewrite then read back as an
+ * ownerless session latch, which is how a PR #11 verdict overwrote a #18 latch
+ * and how sessions adopted PRs they had never heard of.
+ * ---------------------------------------------------------------- */
+
+test("P5 F20: the file name says who writes it", () => {
+	assert.equal(isExtensionOwnedStateFile("/s/pi-abc.latch.json"), true);
+	assert.equal(isExtensionOwnedStateFile("pi-abc.latch.json"), true);
+	assert.equal(isExtensionOwnedStateFile("/s/pi-abc.json"), false, "the shared file was never ours");
+	assert.equal(isExtensionOwnedStateFile("/s/manual-icemining-2142.json"), false);
+	assert.equal(isExtensionOwnedStateFile("/s/drive-2142.pid"), false);
+});
+
+test("P5 F20: the waiter is handed a file of its own, and this session writes only its latch", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+
+		const state = h.spawns[0]?.[h.spawns[0].indexOf("--state") + 1] ?? "";
+		assert.match(
+			state,
+			/\/manual-[^/]*2142\.json$/,
+			`--state must be a waiter file, got ${state}`,
+		);
+
+		// The shared file is gone entirely — not merely unused.
+		assert.equal(
+			existsSync(join(h.dir, `pi-${h.sessionId}.json`)),
+			false,
+			"nothing writes pi-<id>.json any more",
+		);
+		assert.ok(existsSync(join(h.dir, `pi-${h.sessionId}.latch.json`)));
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("P5 F20: the waiter's seed carries {pr, cwd} and none of the session's identity", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		const seed = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.deepEqual(
+			Object.keys(seed).sort(),
+			["cwd", "pr"],
+			`the seed is the bootstrap ghl-pr-await writes for itself, nothing more: ${JSON.stringify(seed)}`,
+		);
+		// The latch keeps every one of those fields — in its own file.
+		const own = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.latch.json`), "utf8"));
+		assert.equal(own.pid, process.pid);
+		assert.equal(own.sessionId, h.sessionId);
+		assert.equal(own.origin, "observed");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("P5 F20: seeding never overwrites a waiter file that already holds this PR's verdict", () => {
+	const dir = mkdtempSync(join(tmpdir(), "ghl-seed-"));
+	try {
+		const path = waiterStatePath("icemining", "2142", dir);
+		writeFileSync(
+			path,
+			JSON.stringify({
+				pr: "2142",
+				cwd: REPO,
+				lastNext: "read_comments_and_fix",
+				verdictDelivered: false,
+			}),
+		);
+		seedWaiterState(path, { pr: "2142", cwd: REPO });
+		const after = JSON.parse(readFileSync(path, "utf8"));
+		assert.equal(
+			after.lastNext,
+			"read_comments_and_fix",
+			"re-seeding over an undelivered verdict is how a finding vanished (F4)",
+		);
+
+		// A file naming a different PR is stale bookkeeping, not a verdict.
+		seedWaiterState(path, { pr: "2199", cwd: REPO });
+		assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { pr: "2199", cwd: REPO });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("P5 F20: a waiter rewrite is not a latch, even after a reload under the same id", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		// The waiter owns this file and rewrites it wholesale. Before F20 the
+		// extension read it back on the next session_start, so whatever the
+		// waiter last wrote became the session's latch.
+		writeFileSync(
+			waiterState(h.dir),
+			JSON.stringify({ pr: "18", cwd: REPO, lastNext: "read_comments_and_fix" }),
+		);
+		await h.start();
+		await sleep(80);
+		const own = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.latch.json`), "utf8"));
+		assert.equal(own.pr, "2142", "the latch is this session's record, not the waiter's");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("P5 F20: nothing in the extension writes a waiter pid file", async () => {
+	const core: Record<string, unknown> = await import("../src/lib/pr-await-core.ts");
+	for (const name of ["writePid", "clearPid"]) {
+		assert.equal(
+			name in core,
+			false,
+			`${name} wrote drive-<pr>.pid, which is the waiter's to write`,
+		);
 	}
 });
