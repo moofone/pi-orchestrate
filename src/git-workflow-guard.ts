@@ -9,28 +9,35 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import {
-	classifyGitWorkflowCommand,
+	classifyForRole,
 	classifyViewRepeat,
+	isWriterRole,
 	viewRepeatKey,
 } from "./lib/git-workflow-guard.ts";
 
 export {
+	classifyForRole,
 	classifyGitWorkflowCommand,
 	classifyViewRepeat,
 	extractPrNumber,
+	isWriterRole,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
+	WRITER_AGENTS,
 } from "./lib/git-workflow-guard.ts";
 
 export default function (pi: ExtensionAPI) {
 	const viewCounts = new Map<string, number>();
+	// The role is fixed for the life of the process: pi-subagents sets it in
+	// the child's env at spawn.
+	const writer = isWriterRole();
 
 	pi.on("tool_call", async (event) => {
 		if (event.toolName !== "bash") return;
 		const command = (event.input as { command?: string } | undefined)?.command;
 		if (!command) return;
 
-		const first = classifyGitWorkflowCommand(command);
+		const first = classifyForRole(command, { writer });
 		if (first.block) return first;
 
 		const key = viewRepeatKey(command);

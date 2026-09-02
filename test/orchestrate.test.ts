@@ -3003,11 +3003,38 @@ test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and
   assert.match(task, /\b99\b/, "the contract must name the PR under review");
   assert.match(task, /Review-fix round 1/, "fixer round is visible on the child");
   assert.match(task, /fixer round 1 latch/, "the post-settle await is labeled with the same round");
-  assert.match(task, /git-workflow\/SKILL\.md/, "the fixer is told to read git-workflow, not skip it");
-  assert.equal(params.skill, "git-workflow", "foreground spawn skill override");
-  assert.deepEqual(params.skills, ["git-workflow"], "async spawn skills override (fixer.md inheritSkills: false)");
-  assert.deepEqual(params.reads, [GIT_WORKFLOW_SKILL], "reads prefixes the task so SKILL.md is actually opened");
+
+  // F7: the solo skill tells a session to push once and then `git pr-await`.
+  // Handing that to a child is how a second waiter got forked from inside a
+  // fixer. The child gets its contract in the task text and nothing else.
+  assert.doesNotMatch(
+    task,
+    /git-workflow\/SKILL\.md/,
+    "the solo skill must not be cited to a child: its next= table orders a git pr-await",
+  );
+  assert.equal(params.skill, undefined, "no skill override for a writer child");
+  assert.equal(params.skills, undefined, "no skills override for a writer child");
+  assert.equal(params.reads, undefined, "no defaultReads pulling SKILL.md into the child");
+  assert.match(task, /commit/i, "the writer commits");
+  assert.match(task, /[Dd]o NOT `git push`/, "code pushes, one push per round");
+  assert.match(task, /do NOT `gh pr comment`/, "code — not the child — speaks on the PR");
   assertNoStalePoller("reviewFixLaunchParams", task);
+});
+
+test("P2 F7: the tdd-worker contract commits and never pushes", () => {
+  const paths = promptContractPaths();
+  const plan = "# Feature: t\n\n### Task 1 — do the thing\n\n- Command: `npm test`\n";
+  const params = orch.workerLaunchParams(
+    paths,
+    { id: "1", title: "do the thing", status: "pending", complexity: "simple" } as never,
+    "/Users/greg/Dev/git/ice-wt/feat-x",
+    plan,
+  ) as Record<string, unknown>;
+  const task = String(params.task);
+  assert.match(task, /commit/i, "a Task that edits and does not commit is not done (F11)");
+  assert.match(task, /[Dd]o NOT `git push`/, "the branch is pushed once, by code");
+  assert.equal(params.skill, undefined, "no solo skill on a writer child");
+  assert.equal(params.skills, undefined);
 });
 
 test("D1: a fixer that writes a handoff and changes nothing is disagreement, not a failed round", () => {

@@ -5,9 +5,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+	classifyForRole,
 	classifyGitWorkflowCommand,
 	classifyViewRepeat,
 	extractPrNumber,
+	isWriterRole,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
 } from "../src/lib/git-workflow-guard.ts";
@@ -89,4 +91,90 @@ test("repeat lone gh pr view after VIEW_REPEAT_LIMIT", () => {
 	assert.equal(third.block, true);
 	if (third.block) assert.match(third.reason, /git pr-await 2166/);
 	assert.equal(viewRepeatKey("git fetch; gh pr view 2166"), undefined);
+});
+
+/* ---------------------------------------------------------------- *
+ * P2 F7 — a writer child is not the solo session
+ *
+ * The fixer was handed the solo git-workflow skill, whose `next=` table tells
+ * it to run `git pr-await` once after a push. The guard allowlisted exactly
+ * that, so an obedient fixer forked a second waiter with its own state file
+ * from inside a child session. Nothing in the child role stopped it.
+ * ---------------------------------------------------------------- */
+
+test("P2 F7: a writer child may not wait, land, worktree, push, or touch the PR", () => {
+  const blocked = [
+    "git pr-await 2210",
+    "ghl-pr-await 2210",
+    "git pr-land 2210",
+    "ghl-pr-land 2210",
+    "git wt feat/x",
+    "ghl-wt feat/x",
+    "git wt-rm feat/x",
+    "gh pr create --title x --body y",
+    "gh pr merge 2210 --squash",
+    "gh pr comment 2210 --body 'I disagree'",
+    "git push",
+    "git push -u origin HEAD",
+    "git push --force-with-lease origin feat/x",
+  ];
+  for (const command of blocked) {
+    const verdict = classifyForRole(command, { writer: true });
+    assert.equal(verdict.block, true, `a writer child must not run: ${command}`);
+    assert.match(
+      String((verdict as { reason: string }).reason),
+      /\S/,
+      "a block must say why, so the child stops instead of retrying",
+    );
+  }
+});
+
+test("P2 F7: a writer child still commits, reads, and runs its own gate", () => {
+  const allowed = [
+    "git status --porcelain",
+    "git add -A",
+    "git commit -m 'Task 3 — bound the fix loop'",
+    "git diff HEAD",
+    "git log --oneline -5",
+    "git fetch origin",
+    "cargo test -p stratum-backend",
+    "npm test",
+  ];
+  for (const command of allowed) {
+    assert.equal(
+      classifyForRole(command, { writer: true }).block,
+      false,
+      `a writer child must still be able to run: ${command}`,
+    );
+  }
+});
+
+test("P2 F7: the solo session keeps the rust entrypoints the skill herds it toward", () => {
+  for (const command of ["git pr-await 2210", "git wt feat/x", "git pr-land 2210", "git push"]) {
+    assert.equal(
+      classifyForRole(command, { writer: false }).block,
+      false,
+      `the solo session owns ${command}`,
+    );
+  }
+  // The solo rules still apply on top of the role.
+  assert.equal(classifyForRole("git pr-poll 2210", { writer: false }).block, true);
+  assert.equal(classifyForRole("gh pr merge 2210", { writer: false }).block, true);
+});
+
+test("P2 F7: the writer role is read from the env pi-subagents already sets", () => {
+  assert.equal(isWriterRole({}), false, "a plain session is not a writer");
+  assert.equal(isWriterRole({ PI_SUBAGENT_CHILD_AGENT: "fixer" }), true);
+  assert.equal(isWriterRole({ PI_SUBAGENT_CHILD_AGENT: "tdd-worker" }), true);
+  assert.equal(isWriterRole({ PI_SUBAGENT_CHILD_AGENT: "feature-qa" }), true);
+  assert.equal(
+    isWriterRole({ PI_SUBAGENT_CHILD_AGENT: "planner" }),
+    false,
+    "a planner writes no code and needs no push",
+  );
+  assert.equal(
+    isWriterRole({ ORCHESTRATE_ROLE: "writer" }),
+    true,
+    "an explicit spawn env is honoured too",
+  );
 });

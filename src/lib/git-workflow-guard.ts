@@ -102,6 +102,79 @@ export function classifyGitWorkflowCommand(command: string): GuardVerdict {
 	return { block: false };
 }
 
+/* ------------------------------------------------------------------ *
+ * Writer children
+ *
+ * `/orchestrate` children write code and commit it. Everything else on the
+ * Feature — the worktree, the push, the PR, the wait, the land, the review
+ * comment — belongs to code in the parent, so that "exactly one waiter per PR"
+ * and "one push per round" are structural facts rather than prompt requests.
+ *
+ * The fixer used to be handed the solo git-workflow skill, whose `next=` table
+ * says "fix …, one push, then `git pr-await` once". The allowlist above let
+ * that through, and an obedient fixer forked a second waiter with its own
+ * state file from inside a child session (F7).
+ * ------------------------------------------------------------------ */
+
+/** Children that write code. `planner` and `plan-reviewer` are not writers. */
+export const WRITER_AGENTS = new Set(["tdd-worker", "fixer", "feature-qa"]);
+
+/**
+ * Whether this process is a writer child.
+ *
+ * `PI_SUBAGENT_CHILD_AGENT` is set by pi-subagents on every child it spawns
+ * (`runs/shared/pi-args.ts`), so the role is already on the wire and needs no
+ * cooperation from the spawn site. `ORCHESTRATE_ROLE=writer` is honoured as an
+ * explicit override.
+ */
+export function isWriterRole(env: Record<string, string | undefined> = process.env): boolean {
+	if (env.ORCHESTRATE_ROLE === "writer") return true;
+	return WRITER_AGENTS.has(String(env.PI_SUBAGENT_CHILD_AGENT ?? "").trim());
+}
+
+const WRITER_BLOCKS: { re: RegExp; reason: string }[] = [
+	{
+		re: /\bgit\s+pr-await\b|\bghl-pr-await\b/,
+		reason:
+			"a writer child never waits on the review. Settle with your handoff; code runs git pr-await once, from the parent.",
+	},
+	{
+		re: /\bgit\s+pr-land\b|\bghl-pr-land\b|\bgh\s+pr\s+merge\b/,
+		reason: "a writer child never lands the PR. Code lands it when the waiter says so.",
+	},
+	{
+		re: /\bgit\s+wt(?:-rm)?\b|\bghl-wt(?:-rm)?\b|\bgit\s+worktree\s+(?:add|remove|prune|move)\b/,
+		reason:
+			"a writer child never creates or removes a worktree. You were given one; work in it.",
+	},
+	{
+		re: /\bgh\s+pr\s+(?:create|comment|edit|close|reopen|ready)\b/,
+		reason:
+			"a writer child never speaks on the PR. Put it in your handoff; code opens the PR and posts on it.",
+	},
+	{
+		re: /\bgit\s+push\b/,
+		reason:
+			"a writer child commits; code pushes. Commit your work and settle — the push is one per round, from the parent.",
+	},
+];
+
+/**
+ * The guard for one command, given the role of the session running it.
+ *
+ * Writer blocks are checked first: the solo allowlist deliberately waves
+ * `git pr-await` through, and for a child that is exactly the wrong answer.
+ */
+export function classifyForRole(command: string, opts: { writer: boolean }): GuardVerdict {
+	if (opts.writer) {
+		const text = stripComments(command);
+		for (const rule of WRITER_BLOCKS) {
+			if (rule.re.test(text)) return { block: true, reason: rule.reason };
+		}
+	}
+	return classifyGitWorkflowCommand(command);
+}
+
 /** Session-scoped repeat key for a lone `gh pr view/checks` (no fetch/sleep/loop). */
 export function viewRepeatKey(command: string): string | undefined {
 	const text = stripComments(command);

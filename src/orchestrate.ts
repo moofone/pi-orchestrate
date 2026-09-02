@@ -3192,6 +3192,23 @@ async function worktreeFingerprint(pi: ExtensionAPI, worktree: string): Promise<
   }
 }
 
+/**
+ * The five lines every writer child gets, in its own task text.
+ *
+ * Children used to be handed the solo `git-workflow` skill instead. That
+ * skill's `next=` table says "fix …, one push, then `git pr-await` once" —
+ * correct for a person working alone, and exactly wrong for a child inside a
+ * Feature that already has a waiter (F7). Stating the contract here keeps it
+ * next to the work; `lib/git-workflow-guard.ts` is what actually enforces it.
+ */
+const WRITER_CONTRACT = [
+  "You write code and commit it. Nothing else on this Feature is yours.",
+  "Work only in the worktree named below, never in a reference checkout.",
+  "Commit what you finish. Do NOT `git push` — code pushes once per round.",
+  "Do NOT open a PR, do NOT `gh pr comment`, do NOT `gh pr merge`, do NOT `git wt`, do NOT `git pr-await`, do NOT `git pr-land`.",
+  "Anything you cannot do goes in your handoff. Then settle; code takes it from there.",
+];
+
 export function workerLaunchParams(
   paths: Paths,
   task: Task,
@@ -3206,7 +3223,8 @@ export function workerLaunchParams(
     agent: "tdd-worker",
     task: [
       `Implement exactly this Task and nothing else.`,
-      `Do NOT open a PR, do NOT \`git wt\`, do NOT \`git pr-await\`, do NOT start the next Task.`,
+      ...WRITER_CONTRACT,
+      `Do NOT start the next Task.`,
       `Feature plan (this Task's section only): ${paths.planFile}`,
       `Writer cwd: ${cwd}`,
       "",
@@ -3696,15 +3714,14 @@ export function reviewFixLaunchParams(
     agent: "fixer",
     task: [
       `Review-fix round ${spawn} on PR ${pr}.`,
-      `Read ${GIT_WORKFLOW_SKILL} now — the /orchestrate section. You are fixer: commit and push in the given worktree only. Code runs git pr-await after you settle.`,
       `Fix the review findings on PR ${pr} and nothing else.`,
-      `Do NOT open a PR, do NOT \`git wt\`, do NOT \`git pr-await\`, do NOT \`git pr-land\`, do NOT \`gh pr merge\`, do NOT start the next Task.`,
+      ...WRITER_CONTRACT,
       `The review is not yours to wait on: once you settle, code runs \`git pr-await ${pr}\` once (fixer round ${spawn} latch).`,
       `Feature plan: ${paths.planFile}`,
       `Single writer worktree (already created): ${worktree}`,
       "",
-      `Fix only findings against the current head of this PR. Red test first for critical or money-moving behaviour, then commit and push from ${worktree} only — never from a reference checkout.`,
-      `A comment marked 👀 is still being written: leave the current head alone and report it in your handoff instead of pushing over it.`,
+      `Fix only findings against the current head of this PR. Red test first for critical or money-moving behaviour, then commit in ${worktree} only — never in a reference checkout.`,
+      `A comment marked 👀 is still being written: leave the current head alone and report it in your handoff instead of changing it.`,
       `A finding against an older head is already answered — say so; do not re-fix it.`,
       "",
       `Waiter verdict (\`next=${result.next || "(none)"}\`${waiterRound}):`,
@@ -3723,12 +3740,11 @@ export function reviewFixLaunchParams(
     turnBudget: WRITER_TURN_BUDGET,
     intercomBridge: { ...WRITER_INTERCOM_OFF },
     tools: [...WRITER_TOOLS],
-    // fixer.md has inheritSkills: false (`--no-skills`). Pass both spellings:
-    // async spawn reads `skills`, foreground reads `skill`. `reads` prefixes
-    // the task with `[Read from: …]` so the model actually opens SKILL.md.
-    skill: "git-workflow",
-    skills: ["git-workflow"],
-    reads: [GIT_WORKFLOW_SKILL],
+    // No `skill` / `skills` / `reads`: the solo git-workflow skill's `next=`
+    // table orders "one push, then git pr-await once", and an obedient fixer
+    // forked a second waiter from inside a child session (F7). The child's
+    // whole contract is WRITER_CONTRACT, in the task text, backed by the
+    // mechanical block in `lib/git-workflow-guard.ts`.
     agentContract: { version: 1 },
     acceptance: {
       level: "none",
