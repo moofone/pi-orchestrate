@@ -145,7 +145,7 @@ function harness(
 			spawns.push(argv);
 			const stateFile = argv[argv.indexOf("--state") + 1];
 			try {
-				const s = JSON.parse(readFileSync(stateFile, "utf8"));
+				const s = JSON.parse(readFileSync(stateFile ?? "", "utf8"));
 				if (s?.pr) running.add(String(s.pr));
 			} catch {
 				running.add("unknown");
@@ -186,10 +186,29 @@ function harness(
 		sessionManager: { getSessionId: () => sessionId },
 	};
 
+	/**
+	 * Indexed reads of what the harness captured.
+	 *
+	 * `h.wake(0)` is `string | undefined` under noUncheckedIndexedAccess, and
+	 * asserting on `undefined` produces "expected undefined to match /…/" — which
+	 * says nothing about the actual failure, that no wake happened at all. These
+	 * say it.
+	 */
+	const nth = <T>(xs: T[], i: number, what: string): T => {
+		const v = xs[i];
+		if (v === undefined) {
+			throw new Error(`expected a ${what} at index ${i}, but only ${xs.length} were captured`);
+		}
+		return v;
+	};
+
 	return {
 		dir,
 		calls,
 		wakes,
+		wake: (i = 0) => nth(wakes, i, "wake"),
+		spawn: (i = 0) => nth(spawns, i, "spawn"),
+		dispatch: (i = 0) => nth(dispatches, i, "dispatch"),
 		wakeModes,
 		spawns,
 		dispatches,
@@ -299,8 +318,8 @@ test("settle hands off to a detached driver — zero parent wakes, zero in-proce
 		"the extension must not run pr-await itself",
 	);
 	assert.equal(h.spawns.length, 1);
-	assert.ok(h.spawns[0].includes("--state"));
-	assert.ok(h.spawns[0].includes("--daemon"));
+	assert.ok(h.spawn(0).includes("--state"));
+	assert.ok(h.spawn(0).includes("--daemon"));
 	assert.ok(
 		h.notifies.some((n) => /handed off \S*#2142/.test(n)),
 		`expected a repo-qualified handoff toast; got ${h.notifies.join(" | ")}`,
@@ -413,8 +432,8 @@ test("closed-unmerged wakes the live parent so the session continues", async () 
 	await sleep(80);
 	assert.equal(h.spawns.length, 0);
 	assert.equal(h.wakes.length, 1);
-	assert.match(h.wakes[0], /#2142 closed without merging/);
-	assert.match(h.wakes[0], /Do not wait for another user message/);
+	assert.match(h.wake(0), /#2142 closed without merging/);
+	assert.match(h.wake(0), /Do not wait for another user message/);
 	assert.equal(h.wakeModes[0], undefined, "idle parent starts a turn immediately");
 	assert.ok(h.notifies.some((n) => /closed without merging/.test(n)));
 	h.cleanup();
@@ -428,8 +447,8 @@ test("settle on an already-merged PR wakes the live parent to continue", async (
 	await sleep(80);
 	assert.equal(h.spawns.length, 0);
 	assert.equal(h.wakes.length, 1);
-	assert.match(h.wakes[0], /#2142 merged/);
-	assert.match(h.wakes[0], /Continue the work you deferred/);
+	assert.match(h.wake(0), /#2142 merged/);
+	assert.match(h.wake(0), /Continue the work you deferred/);
 	assert.ok(h.notifies.some((n) => /merged/i.test(n)));
 	h.cleanup();
 });
@@ -450,8 +469,8 @@ test("merge after handoff wakes the live parent so deferred work continues", asy
 	view = MERGED;
 	await sleep(80);
 	assert.equal(h.wakes.length, 1, "live parent must continue after merge");
-	assert.match(h.wakes[0], /#2142 merged/);
-	assert.match(h.wakes[0], /Do not wait for another user message/);
+	assert.match(h.wake(0), /#2142 merged/);
+	assert.match(h.wake(0), /Do not wait for another user message/);
 	assert.ok(
 		h.notifies.some((n) => /#2142(?:\x1b\]8;;\x07)? merged/.test(n)),
 		`merge toast must keep the PR label (OSC-8 close may sit before 'merged'); got ${h.notifies.join(" | ")}`,
@@ -476,7 +495,7 @@ test("merge during a later parent turn queues followUp instead of interrupting",
 	await sleep(80);
 	assert.equal(h.wakes.length, 1);
 	assert.equal(h.wakeModes[0], "followUp");
-	assert.match(h.wakes[0], /#2142 merged/);
+	assert.match(h.wake(0), /#2142 merged/);
 	h.cleanup();
 });
 
@@ -508,8 +527,8 @@ test("armObservedLatch (pi.exec path) watches and wakes on merge without a bash 
 		view = MERGED;
 		await sleep(80);
 		assert.equal(h.wakes.length, 1, "live parent must continue after merge");
-		assert.match(h.wakes[0], /#2142 merged/);
-		assert.match(h.wakes[0], /Continue the work you deferred/);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.match(h.wake(0), /Continue the work you deferred/);
 	} finally {
 		h.cleanup();
 	}
@@ -593,7 +612,7 @@ test("a merge notice names the repo, so a bare number cannot resolve elsewhere",
 	await h.settle();
 	await sleep(80);
 	assert.equal(h.wakes.length, 1);
-	assert.match(h.wakes[0], /icemining#2142/, `wake must be repo-qualified; got ${h.wakes[0]}`);
+	assert.match(h.wake(0), /icemining#2142/, `wake must be repo-qualified; got ${h.wake(0)}`);
 	assert.ok(
 		h.notifies.some((n) => /icemining#2142/.test(n)),
 		`toast must be repo-qualified; got ${h.notifies.join(" | ")}`,
@@ -669,13 +688,13 @@ test("reload under a NEW session id adopts an orphaned live latch and wakes", as
 		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.wakes.length, 1, `adopted latch must wake the reloaded parent; wakes=${h.wakes.length}`);
-		assert.match(h.wakes[0], /#9931 merged/);
+		assert.match(h.wake(0), /#9931 merged/);
 		// Inherited, not observed: the wake may not assert this session deferred it.
-		assert.match(h.wakes[0], /inherited/i);
+		assert.match(h.wake(0), /inherited/i);
 		assert.doesNotMatch(
-			h.wakes[0],
+			h.wake(0),
 			/the work you deferred/i,
-			`an inherited latch must not claim this session deferred the work; got ${h.wakes[0]}`,
+			`an inherited latch must not claim this session deferred the work; got ${h.wake(0)}`,
 		);
 	} finally {
 		h.cleanup();
@@ -1064,7 +1083,7 @@ test("a manual latch still wakes about a merge it actually witnesses", async () 
 		merged = true;
 		await sleep(200);
 		assert.equal(h.wakes.length, 1, `a witnessed merge must wake; got ${h.wakes.join(" | ")}`);
-		assert.match(h.wakes[0], /icemining#9955 merged/);
+		assert.match(h.wake(0), /icemining#9955 merged/);
 	} finally {
 		h.cleanup();
 	}
@@ -1083,8 +1102,8 @@ test("no wake is ever labelled with a bare, repo-less PR number", async () => {
 		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.wakes.length, 1);
-		assert.doesNotMatch(h.wakes[0], /(?:^|\s)PR #478\b/, `bare label: ${h.wakes[0]}`);
-		assert.match(h.wakes[0], /icemining#478/);
+		assert.doesNotMatch(h.wake(0), /(?:^|\s)PR #478\b/, `bare label: ${h.wake(0)}`);
+		assert.match(h.wake(0), /icemining#478/);
 	} finally {
 		h.cleanup();
 	}
@@ -1175,10 +1194,10 @@ test("undelivered ACTIONABLE on settle wakes the live parent once", async () => 
 	await h.settle();
 	await sleep(80);
 	assert.equal(h.wakes.length, 1, `expected one ACTIONABLE wake, got ${h.wakes.length}`);
-	assert.match(h.wakes[0], /next=read_comments_and_fix/);
-	assert.match(h.wakes[0], /Fix current-head findings/);
-	assert.match(h.wakes[0], /Do not wait for another user message/);
-	assert.match(h.wakes[0], /comment bot=grok/);
+	assert.match(h.wake(0), /next=read_comments_and_fix/);
+	assert.match(h.wake(0), /Fix current-head findings/);
+	assert.match(h.wake(0), /Do not wait for another user message/);
+	assert.match(h.wake(0), /comment bot=grok/);
 	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 	assert.equal(state.verdictDelivered, true);
 	h.cleanup();
@@ -1256,7 +1275,7 @@ test("same-session reload wakes on undelivered ACTIONABLE", async () => {
 	await h.start();
 	await sleep(80);
 	assert.equal(h.wakes.length, 1, "/rreload must deliver the waiting fix verdict");
-	assert.match(h.wakes[0], /next=read_comments_and_fix/);
+	assert.match(h.wake(0), /next=read_comments_and_fix/);
 	h.cleanup();
 });
 
@@ -1270,7 +1289,7 @@ test("watch delivers ACTIONABLE written after handoff", async () => {
 	writeActionable(h.dir, h.sessionId);
 	await sleep(80);
 	assert.equal(h.wakes.length, 1, "watch must inject the waiter verdict");
-	assert.match(h.wakes[0], /next=read_comments_and_fix/);
+	assert.match(h.wake(0), /next=read_comments_and_fix/);
 	h.cleanup();
 });
 
@@ -1282,8 +1301,8 @@ test("merged PR wins over a leftover ACTIONABLE verdict", async () => {
 	await h.settle();
 	await sleep(80);
 	assert.equal(h.wakes.length, 1);
-	assert.match(h.wakes[0], /#2142 merged/);
-	assert.doesNotMatch(h.wakes[0], /read_comments_and_fix/);
+	assert.match(h.wake(0), /#2142 merged/);
+	assert.doesNotMatch(h.wake(0), /read_comments_and_fix/);
 	h.cleanup();
 });
 
@@ -1330,10 +1349,10 @@ test("a Feature-owned merge dispatches next=done and still wakes the parent", as
 		view = MERGED;
 		await sleep(80);
 		assert.equal(h.wakes.length, 1, "merge still wakes; the no-wake exception is ACTIONABLE only");
-		assert.match(h.wakes[0], /#2142 merged/);
+		assert.match(h.wake(0), /#2142 merged/);
 		assert.equal(h.dispatches.length, 1, "status.md must be updated in code so yield does not stick");
-		assert.equal(h.dispatches[0].verdict.next, "done");
-		assert.equal(h.dispatches[0].owner.pr, "2142");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(h.dispatch(0).owner.pr, "2142");
 	} finally {
 		h.cleanup();
 	}
@@ -1354,11 +1373,11 @@ test("a Feature-owned ACTIONABLE is dispatched by code, never woken into this se
 			`a Feature PR must not ask this session to implement; got ${h.wakes.join(" | ")}`,
 		);
 		assert.equal(h.dispatches.length, 1, "the verdict must be dispatched exactly once");
-		assert.equal(h.dispatches[0].owner.dir, featureDir);
-		assert.equal(h.dispatches[0].owner.pr, "2142");
-		assert.equal(h.dispatches[0].verdict.next, "read_comments_and_fix");
+		assert.equal(h.dispatch(0).owner.dir, featureDir);
+		assert.equal(h.dispatch(0).owner.pr, "2142");
+		assert.equal(h.dispatch(0).verdict.next, "read_comments_and_fix");
 		assert.match(
-			h.dispatches[0].verdict.output,
+			h.dispatch(0).verdict.output,
 			/comment bot=grok/,
 			"the writer needs the waiter's findings, not just the verdict name",
 		);
@@ -1402,8 +1421,8 @@ test("a verdict written only under the repo-qualified waiter name is still dispa
 		await sleep(80);
 		assert.equal(h.wakes.length, 0, `got ${h.wakes.join(" | ")}`);
 		assert.equal(h.dispatches.length, 1, "the repo-qualified verdict must reach the dispatcher");
-		assert.equal(h.dispatches[0].owner.dir, featureDir);
-		assert.equal(h.dispatches[0].verdict.next, "read_comments_and_fix");
+		assert.equal(h.dispatch(0).owner.dir, featureDir);
+		assert.equal(h.dispatch(0).verdict.next, "read_comments_and_fix");
 		const spent = JSON.parse(readFileSync(join(h.dir, "manual-icemining-2142.json"), "utf8"));
 		assert.equal(spent.verdictDelivered, true, "an accepted dispatch spends the verdict");
 	} finally {
@@ -1535,7 +1554,7 @@ test("a solo PR still gets its waiter ensured on settle", async () => {
 		await h.settle();
 		await sleep(60);
 		assert.equal(h.spawns.length, 1, "solo latches still ensure a detached waiter");
-		assert.ok(h.spawns[0].includes("--daemon"));
+		assert.ok(h.spawn(0).includes("--daemon"));
 	} finally {
 		h.cleanup();
 	}
@@ -1583,8 +1602,8 @@ test("the featureOwnedPr hook decides ownership, so no test walks the orchestrat
 		await sleep(80);
 		assert.equal(h.wakes.length, 0, `got ${h.wakes.join(" | ")}`);
 		assert.equal(h.dispatches.length, 1);
-		assert.equal(h.dispatches[0].owner.name, "feat-hooked");
-		assert.equal(h.dispatches[0].owner.worktree, WT);
+		assert.equal(h.dispatch(0).owner.name, "feat-hooked");
+		assert.equal(h.dispatch(0).owner.worktree, WT);
 	} finally {
 		h.cleanup();
 	}
@@ -1626,8 +1645,8 @@ test("a Feature in another repo, or on another PR, does not swallow the solo wak
 		await sleep(80);
 		assert.equal(h.dispatches.length, 0, "neither Feature owns icemining#2142");
 		assert.equal(h.wakes.length, 1, `the solo wake must survive; got ${h.wakes.join(" | ")}`);
-		assert.match(h.wakes[0], /Fix current-head findings/);
-		assert.match(h.wakes[0], /Do not wait for another user message/);
+		assert.match(h.wake(0), /Fix current-head findings/);
+		assert.match(h.wake(0), /Do not wait for another user message/);
 	} finally {
 		h.cleanup();
 	}
@@ -1672,8 +1691,8 @@ test("a later Feature ACTIONABLE with a new round dispatches a second fixer", as
 			2,
 			"a new review round must dispatch another fixer, not stop after one",
 		);
-		assert.equal(h.dispatches[1].verdict.next, "read_comments_and_fix");
-		assert.match(h.dispatches[1].verdict.output, /second-round finding/);
+		assert.equal(h.dispatch(1).verdict.next, "read_comments_and_fix");
+		assert.match(h.dispatch(1).verdict.output, /second-round finding/);
 	} finally {
 		h.cleanup();
 	}
@@ -1689,10 +1708,10 @@ test("a merged Feature PR still announces the merge and dispatches next=done, no
 		await h.settle();
 		await sleep(80);
 		assert.equal(h.wakes.length, 1);
-		assert.match(h.wakes[0], /#2142 merged/);
-		assert.doesNotMatch(h.wakes[0], /read_comments_and_fix/);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.doesNotMatch(h.wake(0), /read_comments_and_fix/);
 		assert.equal(h.dispatches.length, 1, "merge must land the Feature so yield does not stick");
-		assert.equal(h.dispatches[0].verdict.next, "done", "a merged PR has no findings left to fix");
+		assert.equal(h.dispatch(0).verdict.next, "done", "a merged PR has no findings left to fix");
 	} finally {
 		h.cleanup();
 	}
@@ -1908,7 +1927,7 @@ test("P5 F20: the waiter is handed a file of its own, and this session writes on
 		await h.settle();
 		await sleep(80);
 
-		const state = h.spawns[0]?.[h.spawns[0].indexOf("--state") + 1] ?? "";
+		const state = h.spawn(0)?.[h.spawn(0).indexOf("--state") + 1] ?? "";
 		assert.match(
 			state,
 			/\/manual-[^/]*2142\.json$/,
@@ -2041,7 +2060,7 @@ test("P5 F18: a waiter verdict wakes the session with no poll in between", async
 			1,
 			`fs.watch must deliver the verdict; the 10-minute timer cannot have fired`,
 		);
-		assert.match(h.wakes[0], /read_comments_and_fix/);
+		assert.match(h.wake(0), /read_comments_and_fix/);
 	} finally {
 		h.cleanup();
 	}
@@ -2080,7 +2099,7 @@ test("P5 F18: a waiter that says the PR is over does get the gh check, and the w
 		writeFileSync(path, JSON.stringify({ pr: "2142", cwd: REPO, lastNext: "done" }));
 		await sleep(500);
 		assert.equal(h.wakes.length, 1, `expected one merge wake; got ${h.wakes.join(" | ")}`);
-		assert.match(h.wakes[0], /merged/);
+		assert.match(h.wake(0), /merged/);
 	} finally {
 		h.cleanup();
 	}

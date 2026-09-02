@@ -54,7 +54,10 @@ function makeFakePi(exec?: (cmd: string, args: string[]) => Promise<unknown>) {
       sentUserMessages.push({ text: String(text ?? ""), options });
     },
     sentUserMessages,
-  } as never;
+  };
+  // Not `as never`: that made every `pi.events.emit(...)` in this file an
+  // error, because `never` has no properties. Call sites hand it to helpers
+  // typed as `Function`, so the real inferred shape is what they want.
 }
 
 /**
@@ -72,7 +75,11 @@ function branchHeadExec(
   ],
 ) {
   let i = 0;
-  const at = () => steps[Math.min(i, steps.length - 1)];
+  const at = () => {
+    const step = steps[Math.min(i, steps.length - 1)];
+    if (!step) throw new Error("branchHeads fixture needs at least one step");
+    return step;
+  };
   return (cmd: string, args: string[]) => {
     if (cmd !== "git") return undefined;
     const a = args ?? [];
@@ -1467,7 +1474,17 @@ test("W2: applySpawnPolicy pins writers and planner; rejects other cursor billin
     }
   ).applySpawnPolicy;
 
-  const writer = { agent: "tdd-worker", model: "cursor/composer-2.5-fast:high", timeoutMs: 4 * 60 * 60 * 1000 };
+  // `applySpawnPolicy` mutates its argument in place — that is the contract
+  // under test — so the literals must be typed as the shape it may write, not
+  // as the narrower shape they happen to start with.
+  type SpawnParams = {
+    agent: string;
+    model?: string;
+    timeoutMs?: number;
+    context?: string;
+    turnBudget?: { maxTurns: number };
+  };
+  const writer: SpawnParams = { agent: "tdd-worker", model: "cursor/composer-2.5-fast:high", timeoutMs: 4 * 60 * 60 * 1000 };
   const w = apply(writer);
   assert.equal(w.action, "pin");
   assert.equal(writer.model, "zai/glm-5.3-flash:medium");
@@ -1475,28 +1492,28 @@ test("W2: applySpawnPolicy pins writers and planner; rejects other cursor billin
   assert.ok((writer.timeoutMs as number) <= 90 * 60 * 1000, "4h writer timeout must clamp");
   assert.equal((writer.turnBudget as { maxTurns: number }).maxTurns, 220);
 
-  const already = { agent: "tdd-worker", model: "zai/glm-5.3-flash:medium" };
+  const already: SpawnParams = { agent: "tdd-worker", model: "zai/glm-5.3-flash:medium" };
   assert.equal(apply(already).action, "allow");
   assert.equal(already.model, "zai/glm-5.3-flash:medium", "do not demote an allowed writer");
   assert.equal((already.turnBudget as { maxTurns: number }).maxTurns, 220);
 
-  const critical = { agent: "tdd-worker", model: "cursor/grok-4.6:medium" };
+  const critical: SpawnParams = { agent: "tdd-worker", model: "cursor/grok-4.6:medium" };
   assert.equal(apply(critical).action, "allow");
   assert.equal(critical.model, "cursor/grok-4.6:medium", "do not demote the critical writer");
 
-  const anthropicQa = { agent: "feature-qa", model: "anthropic/claude-opus-5:high" };
+  const anthropicQa: SpawnParams = { agent: "feature-qa", model: "anthropic/claude-opus-5:high" };
   assert.equal(apply(anthropicQa).action, "pin");
   assert.equal(anthropicQa.model, "xai/grok-4.6:high", "retired Opus QA pins onto native grok");
 
-  const planner = { agent: "planner", model: "cursor/grok-4.6:xhigh" };
+  const planner: SpawnParams = { agent: "planner", model: "cursor/grok-4.6:xhigh" };
   assert.equal(apply(planner).action, "pin");
   assert.equal(planner.model, "xai/grok-4.6:high");
 
-  const inheritPlanner = { agent: "planner" };
+  const inheritPlanner: SpawnParams = { agent: "planner" };
   assert.equal(apply(inheritPlanner).action, "pin");
   assert.equal(inheritPlanner.model, "xai/grok-4.6:high");
 
-  const demote = { agent: "planner", model: "grok-build/grok-4.6:xhigh" };
+  const demote: SpawnParams = { agent: "planner", model: "grok-build/grok-4.6:xhigh" };
   assert.equal(apply(demote).action, "pin");
   assert.equal(demote.model, "xai/grok-4.6:high");
 
@@ -1992,6 +2009,7 @@ test("R2: readRunSnapshot reads a completed run off disk as terminal and ok", ()
     steps: [{ status: "complete" }],
   });
   const snap = orch.readRunSnapshot(runDir);
+  assert.ok(snap, "the fixture run must produce a snapshot");
   assert.ok(snap, "a run with a status.json must produce a snapshot");
   assert.equal(snap.terminal, true);
   assert.equal(snap.ok, true);
@@ -2007,6 +2025,7 @@ test("R2: readRunSnapshot reports a stopped run as terminal, not ok, stopped", (
     steps: [{ status: "stopped" }],
   });
   const snap = orch.readRunSnapshot(runDir);
+  assert.ok(snap, "the fixture run must produce a snapshot");
   assert.equal(snap.terminal, true);
   assert.equal(snap.ok, false);
   assert.equal(snap.stopped, true);
@@ -2020,6 +2039,7 @@ test("R2: a running run whose process is gone is terminal, not ok", () => {
     steps: [{ status: "running" }],
   });
   const snap = orch.readRunSnapshot(runDir, () => false);
+  assert.ok(snap, "the fixture run must produce a snapshot");
   assert.equal(snap.terminal, true, "a dead runner process ends the run");
   assert.equal(snap.ok, false);
 });
@@ -2032,6 +2052,7 @@ test("R2: a running run whose process is alive is not terminal", () => {
     steps: [{ status: "running" }],
   });
   const snap = orch.readRunSnapshot(runDir, () => true);
+  assert.ok(snap, "the fixture run must produce a snapshot");
   assert.equal(snap.terminal, false);
 });
 
@@ -2175,7 +2196,7 @@ test("R6: an orphaned Task whose worker finished is recorded done, not re-run", 
   });
   const { ctx, notices } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(
-    movedHeadPi(),
+    movedHeadPi() as never,
     ctx,
     paths as never,
     "auth-reject-analytics",
@@ -2207,7 +2228,7 @@ test("R6: an orphaned Task that produced nothing is re-run, not blocked", async 
     stderr: "",
   }));
   const proceed = await orch.reconcileOrphanTask(
-    stillPi,
+    stillPi as never,
     ctx,
     paths as never,
     "auth-reject-analytics",
@@ -2221,7 +2242,7 @@ test("R6: a Task with no in-flight record leaves the plan alone", async () => {
   const { paths } = orphanFixture("pending", undefined);
   const { ctx } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(
-    movedHeadPi(),
+    movedHeadPi() as never,
     ctx,
     paths as never,
     "auth-reject-analytics",
@@ -2245,7 +2266,7 @@ test("R6: a live orphan run is waited on, never started a second time", async ()
   );
   const { ctx, notices } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(
-    movedHeadPi(),
+    movedHeadPi() as never,
     ctx,
     paths as never,
     "auth-reject-analytics",
@@ -5165,7 +5186,7 @@ test("P3 F11: an uncommitted Task is committed by code, not counted as done", as
     }
     return { code: 0, stdout: "", stderr: "" };
   });
-  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 3 — parser");
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 3 — parser");
   assert.equal(gate.state, "committed", "a dirty tree after a writer is committed by code");
   assert.ok(
     calls.includes("git add -A"),
@@ -5184,7 +5205,7 @@ test("P3 F11: a commit that does not clear the tree blocks instead of reporting 
     if (a[0] === "commit") return { code: 1, stdout: "", stderr: "nothing to commit, hook failed" };
     return { code: 0, stdout: "", stderr: "" };
   });
-  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 1 — x");
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
   assert.equal(gate.state, "dirty", "a failed commit is not a closed gate");
   assert.match(gate.reason, /hook failed/, "the git stderr reaches the user verbatim");
 });
@@ -5195,7 +5216,7 @@ test("P3 F11: an already-clean tree runs no commit at all", async () => {
     calls.push([cmd, ...(args ?? [])].join(" "));
     return { code: 0, stdout: "", stderr: "" };
   });
-  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 1 — x");
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
   assert.equal(gate.state, "clean", "the worker committed; there is nothing for code to do");
   assert.deepEqual(
     calls.filter((c) => c.includes("commit") || c.includes("add")),
@@ -5206,10 +5227,10 @@ test("P3 F11: an already-clean tree runs no commit at all", async () => {
 
 test("P3 F11: git that cannot answer is inconclusive, never a silent land", async () => {
   const pi = makeFakePi(async () => ({ code: 128, stdout: "", stderr: "not a git repository" }));
-  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 1 — x");
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
   assert.equal(gate.state, "unknown", "an unreadable status must not be read as clean or dirty");
   assert.equal(
-    await orch.porcelainStatus(pi, "/wt"),
+    await orch.porcelainStatus(pi as never, "/wt"),
     undefined,
     "porcelainStatus distinguishes 'clean' from 'git could not say'",
   );

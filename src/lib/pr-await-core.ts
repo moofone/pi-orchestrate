@@ -234,7 +234,10 @@ export function originSlug(cwd: string): string | undefined {
 }
 
 /** GitHub PR URL from latch fields, if we have enough to form one. */
-export function prUrl(s: Pick<LatchState, "pr" | "url" | "slug" | "cwd">): string | undefined {
+// These four already treat every field but `pr` as optional at runtime — the
+// guards below say so. The types demanded all of them, which forced callers and
+// tests to invent a `cwd` they do not have.
+export function prUrl(s: Partial<LatchState>): string | undefined {
 	if (s.url && /^https?:\/\//i.test(s.url)) return s.url.replace(/\/+$/, "");
 	const slug = s.slug || (s.cwd ? originSlug(s.cwd) : undefined);
 	if (slug && s.pr) return `https://github.com/${slug}/pull/${s.pr}`;
@@ -353,13 +356,13 @@ export function armObservedLatch(ctx: unknown, seed: ObservedLatchSeed): void {
 }
 
 /** `moofone/icemining#2142`, else `icemining#2142`, else `PR #2142`. */
-export function prLabel(s: Pick<LatchState, "pr" | "cwd" | "slug">): string {
-	const name = s.slug ?? repoKey(s.cwd);
+export function prLabel(s: Partial<LatchState>): string {
+	const name = s.slug ?? repoKey(s.cwd ?? "");
 	return name ? `${name}#${s.pr}` : `PR #${s.pr}`;
 }
 
 /** Compact label, OSC-8 linked to the GitHub PR when we can form a URL. */
-export function prLinkLabel(s: Pick<LatchState, "pr" | "cwd" | "slug" | "url">): string {
+export function prLinkLabel(s: Partial<LatchState>): string {
 	const label = prLabel(s);
 	const url = prUrl(s);
 	return url ? osc8Link(url, label) : label;
@@ -728,7 +731,7 @@ export function referenceCheckoutFor(cwd: string): string | undefined {
  * remote.origin.url` in its own cwd, so a daemon started outside a checkout
  * cannot ever succeed — it just error-loops.
  */
-export function spawnCwdFor(latch: Pick<LatchState, "cwd"> | undefined): string | undefined {
+export function spawnCwdFor(latch: Partial<LatchState> | undefined): string | undefined {
 	if (!latch?.cwd) return undefined;
 	// `referenceCheckoutFor` returns `cwd` itself when it holds a `.git`, and
 	// otherwise maps a removed `<repo>-wt/<branch>` worktree back to its

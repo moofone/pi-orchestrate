@@ -46,8 +46,8 @@ test("ensureDriver is idempotent while already running", () => {
 	assert.equal(first.action, "spawned");
 	assert.equal(second.action, "already");
 	assert.equal(spawns.length, 1);
-	assert.ok(spawns[0].includes("--daemon"));
-	assert.ok(spawns[0].includes("--state"));
+	assert.ok(spawns[0]!.includes("--daemon"));
+	assert.ok(spawns[0]!.includes("--state"));
 });
 
 test("parseField still rejects longer keys", () => {

@@ -127,9 +127,9 @@ test("an undelivered verdict on disk dispatches a fixer with no session latch", 
 	});
 	const result = await reconcileFeaturePrs(h.deps);
 	assert.equal(h.dispatched.length, 1, "the verdict must reach the dispatcher");
-	assert.equal(h.dispatched[0].verdict.next, "read_comments_and_fix");
+	assert.equal(h.dispatched[0]!.verdict.next, "read_comments_and_fix");
 	assert.match(
-		h.dispatched[0].verdict.output,
+		h.dispatched[0]!.verdict.output,
 		/credit_share overflows/,
 		"the writer needs the findings, not just the verdict name",
 	);
@@ -174,7 +174,7 @@ test("a merged PR closes the Feature with no latch involved", async () => {
 	});
 	const result = await reconcileFeaturePrs(h.deps);
 	assert.equal(h.dispatched.length, 1);
-	assert.equal(h.dispatched[0].verdict.next, "done");
+	assert.equal(h.dispatched[0]!.verdict.next, "done");
 	assert.equal(result.finished, 1);
 	assert.equal(h.waiters.length, 0, "a merged PR must never get a waiter");
 });
@@ -186,7 +186,7 @@ test("a closed-unmerged PR asks for confirmation, not an archive", async () => {
 		driverRunning: () => false,
 	});
 	await reconcileFeaturePrs(h.deps);
-	assert.equal(h.dispatched[0].verdict.next, "stop");
+	assert.equal(h.dispatched[0]!.verdict.next, "stop");
 });
 
 test("an unknown PR state never closes a live Feature", async () => {
@@ -243,7 +243,7 @@ test("the head reported by GitHub is persisted for the next pass", async () => {
 	});
 	await reconcileFeaturePrs(h.deps);
 	assert.equal(h.statuses.length, 1);
-	assert.equal(h.statuses[0].patch.prHead, "d5ec214");
+	assert.equal(h.statuses[0]!.patch.prHead, "d5ec214");
 });
 
 // ---------------------------------------------------------------------------
@@ -306,8 +306,8 @@ test("listFeaturePrOwners reads the PR number out of a URL", () => {
 		});
 		const found = listFeaturePrOwners({ root });
 		assert.equal(found.length, 1);
-		assert.equal(found[0].pr, "2131");
-		assert.equal(found[0].repo, "icemining");
+		assert.equal(found[0]!.pr, "2131");
+		assert.equal(found[0]!.repo, "icemining");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -345,8 +345,8 @@ test("undeliveredWaiterVerdicts finds a verdict under either waiter name", () =>
 		);
 		const found = undeliveredWaiterVerdicts("2232", dir);
 		assert.equal(found.length, 1);
-		assert.equal(found[0].next, "read_comments_and_fix");
-		assert.equal(found[0].round, "3", "the round comes from the verdict body");
+		assert.equal(found[0]!.next, "read_comments_and_fix");
+		assert.equal(found[0]!.round, "3", "the round comes from the verdict body");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -461,8 +461,8 @@ test("F1: a killed session leaves a verdict that the next reconcile dispatches",
 		const result = await reconcileFeaturePrs(h.deps);
 		assert.equal(result.seen, 1);
 		assert.equal(result.dispatched, 1, "the orphaned verdict must be picked up from disk");
-		assert.equal(h.dispatched[0].owner.dir, dir);
-		assert.equal(h.dispatched[0].verdict.next, "read_comments_and_fix");
+		assert.equal(h.dispatched[0]!.owner.dir, dir);
+		assert.equal(h.dispatched[0]!.verdict.next, "read_comments_and_fix");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 		rmSync(state, { recursive: true, force: true });
@@ -482,7 +482,7 @@ test("F8: a merged PR closes its Feature even though every waiter is dead", asyn
 		});
 		const result = await reconcileFeaturePrs(h.deps);
 		assert.equal(result.finished, 1);
-		assert.equal(h.dispatched[0].verdict.next, "done");
+		assert.equal(h.dispatched[0]!.verdict.next, "done");
 		assert.equal(h.waiters.length, 0);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
