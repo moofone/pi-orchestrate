@@ -233,7 +233,29 @@ Recommendation: split into three things with three owners.
 
 Ordered so each phase leaves the system strictly better and can ship alone. Work on a branch; the current uncommitted diff should be committed first as its own change (it is directionally right except the adoption cwd match, which Phase 1 makes irrelevant for Features).
 
-### Phase 0 — Unstick what is stuck today (manual, 30 min)
+### Phase 0 — Unstick what is stuck today — **DONE 2026-09-02 11:36 ADT**
+
+Executed against live state. Everything below was **moved to `archive/`, never deleted**, so each step is reversible with a `mv` back. Two items resolved themselves before the run and two changed shape; both are recorded under the step.
+
+| # | Step | Result |
+|---|---|---|
+| 1 | Archive merged Features | **5 archived**, not 4. PR 2232 merged at 11:24Z, the same morning, so `per-coin-mining-claim` joined the list. Each `status.md` set to `phase: done` with the merge date before the move. |
+| 2 | `batched-auth-projection` | `plan_review: running` → `done`. `handoffs/plan-review.md` (3.8 K, written 2026-09-01 21:05) is the evidence the reviewer finished. Approve is no longer refused. |
+| 3 | PR 2232 pending verdict | **No action needed.** The PR merged and the waiter cleaned up: `manual-icemining-2232.json` is gone and its pid (71700) is dead. The stopgap copy-the-file trick is now moot. |
+| 4 | Leftover `pending-*` folders | **16 archived** across 5 repos, far more than the 2 the review named. One was **kept**: see below. |
+| 5 | Stray files in `ice-wt/feat-per-coin-mining-claim` | **Gone.** `pr-land` removed the whole worktree on merge. Nothing to commit or discard. |
+| 6 | Commit the baseline | **Done**, `984894f` (fingerprint-by-round, cwd-matched adoption, `openFeaturePr`; 596 lines, 239 tests pass). The QA report itself is `bcd6617`. Adding an `origin` remote is **not done** — creating a GitHub repo is the owner's call. |
+| 7 | `pi-orchestrate` folder cleanup | Stub `durable-pr-reconciler/` and `pending-…T11-13-31-967Z/` archived. `durable-pr-reconciler-2/plan.md` reset to `> Status: DRAFT`; its `next_action` now names the missing remote as the blocker. |
+
+**One folder was kept against the review's own instruction.** `pi-extensions/pending-2026-08-31T19-08-48-820Z/` is not race debris: it holds a real 16.2 K plan titled `# Feature: Orchestrate QA remediations` with 5 Tasks, stuck at `name: pending` because the naming step never ran on it. Deleting it would have destroyed a plan. It is the *victim* of F15 rather than its residue, and it needs naming (Phase 4), not cleanup.
+
+**Second correction to step 4.** Of the 16 archived, 10 held only a `handoffs/plan-run.md` and no `plan.md` at all — pure F15 residue. 5 more held a 363 B–1.4 K planner seed still titled `# Feature: (planning)` with zero Tasks: planners that died before writing a title. 1 was already self-marked `(superseded — not a new Feature)`. None carried recoverable work.
+
+**Archiving the five did not clear the F8 prompt injection.** Four Features are still `phase: pr` with `pr: none` — `bind-probe-reward-scope`, `mdl-wallet-address-field`, `pearl-chart-fork-hashrate`, `quiesce-identical-current-state`. These are F10 casualties, not F8 ones: `openFeaturePr` failed and swallowed the error, so they parked in the PR phase without ever getting a PR number. `liveFeatureNeedsIdleParent` matches on `phase` alone, so it still returns true for `icemining` and every pi session in that repo still gets `FORBIDDEN` + "stay idle" appended. Phase 1.5 (gate or delete the injection) and Phase 2.5 (`openFeaturePr` pre-flight) are what actually close this; no Phase 0 move can.
+
+**Also observed, out of Phase 0 scope.** `manual-1935.json` and `manual-472.json` still hold undelivered verdicts for PRs that are **still OPEN** (icemining#1935, icemining-devops#472). Neither is claimed by any Feature's `status.md`, so they are solo latches: F1 hits them too, but no `/orchestrate` Feature is stalled behind them and Phase 1's reconciler will not adopt them. Eight pi sessions were live during this run; every target was verified inert (`worker_run_id: none`, no in-flight Task) before it was moved.
+
+Original steps, as written before the run:
 
 1. Archive the four merged Features (`fail-closed-ban-issuer`, `relay-keep-first-jobs`, `coins-chart-y-zoom`, `security-review-modes`) with `/orchestrate archive <name>`.
 2. `batched-auth-projection`: set `plan_review: done` (the handoff `plan-review.md` exists) or re-run `/orchestrate review batched-auth-projection`.
