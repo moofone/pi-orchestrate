@@ -265,9 +265,39 @@ Original steps, as written before the run:
 6. This repo, before the remediation plan can be approved (F22): give `pi-orchestrate` an `origin` (create the GitHub repo, `git remote add origin …`, `git push -u origin main`). Without it `ghl-wt`, `gh pr create` and `pr-await` all fail. Then commit the current uncommitted baseline (fingerprint-by-round, cwd-matched adoption, `openFeaturePr`) so the Feature branch is cut from a tree that has those APIs.
 7. This repo, folder cleanup (F15/F16): delete the stub `durable-pr-reconciler/` and `pending-2026-09-02T11-13-31-967Z/`; set `durable-pr-reconciler-2/plan.md` back to `> Status: DRAFT` so the approve card reappears, or re-run approve directly once step 6 is done. Optionally rename `-2` to the plain name after the stub is gone (update `name:`, `dir:`, `plan:`, `branch:` in status.md together).
 
-### Phase 1 — Durable PR phase (fixes RC1–RC4; F1, F2, F3, F4, F8)
+### Phase 1 — Durable PR phase — **DONE 2026-09-02**
 
-1.1 **Feature PR reconciler in `orchestrate.ts`** (new module `src/lib/pr-reconcile.ts`).
+Implemented as the five Tasks of `durable-pr-reconciler-2`, one commit each, TDD throughout. The suite went from 239 to 284 passing, all green, and `tsc --noEmit` is clean.
+
+| Task | Commit | What landed |
+|---|---|---|
+| 1 | `78ed304` | `waiterPaths(repo, pr)` plus `waiterPidFiles` / `waiterManualFiles`. `isDriverRunning` answers for a live pid under **either** spelling. |
+| 2 | `dbbf376` | Every latch read of waiter state goes through those helpers; `handoff()` no longer spawns a waiter for a Feature-owned PR. |
+| 3 | `7302d29` | A verdict is spent only when dispatch **accepts** it; a refusal records a hashed `pending_verdict` instead of consuming the round. |
+| 4 | `700a6c1` | New `src/lib/pr-reconcile.ts`: the durable owner, keyed on `status.md`, fully dependency-injected. |
+| 5 | `aa56795` | Reconciler wired to `session_start`, every verb, a 60 s unref'd timer, and chain-lock release. Idle-parent prompt gated. |
+
+**RC1 / F1.** `pr-reconcile.ts` is the durable owner. It asks three questions of each live `phase: pr` Feature — has the PR finished, is a verdict waiting on disk, is anyone waiting on it — and answers them from `status.md` and the waiter's own files, so no session's memory is load-bearing. It runs on `session_start` (the reload case), on every `/orchestrate` verb, on one process-wide 60 s timer armed only while some Feature is in the PR phase, and the moment a chain releases the Feature lock with a verdict queued. Latch adoption is untouched: it stays correct for solo latches and is no longer the only route for Features.
+
+**F2.** Both naming schemes are read everywhere. The suffix match is string arithmetic rather than a regex, because `drive-.*-232` matches `drive-icemining-2232.pid`, and answering "#232 already has a waiter" because #2232 does would leave #232 with none at all. TypeScript still writes no `manual-*` or `drive-*.pid`; a test asserts the read path creates nothing.
+
+**F3.** One spawner per PR. The latch skips `ensureDriver` when a Feature owns the PR, and the reconciler starts a waiter only when no pid is alive under any spelling. Solo latches still ensure their own waiter, which a test pins.
+
+**F4.** The mark moved to the far side of the decision. `dispatchFeaturePrVerdict` spends the waiter files at the instant it commits to `spawn_writer`, `reawait`, `land` or `archive` — before awaiting the fixer, not after, since that writer holds the Feature for the better part of an hour. A `refuse` leaves every file undelivered and writes `pending_verdict`. The fingerprint is hashed through `fingerprintTag` because a verdict body is many lines and status.md holds one value per line; storing it raw made the duplicate-toast guard fail on the first run.
+
+**F8 / Phase 1.5.** `liveFeatureNeedsIdleParent` had two defects: its regex `^(implement|pr|qa)$` never matched the phases actually written (`implementing`, `feature-qa`), and it asked only whether the *repo* had such a Feature. It now matches the real phase names and only when the session's cwd is that Feature's own worktree, or the repo root for a Feature that has none. Verified live: the gate returns false for `~/Dev/git/icemining`, where it returned true for days. `resources_discover` and `before_agent_start` stay registered, per the locked scope; deleting them is Phase 5 (F17).
+
+**F21 (a), (b), (d).** `test/waiter-contract.test.ts` (10 tests) pins the naming contract. `test/pr-reconcile.test.ts` (21 tests) covers verdict dispatch with no latch in the picture, merged-PR close with every waiter dead, and the rejections: an `unknown` `gh` answer never closes a Feature, archived and non-`pr` Features are skipped, and `pi-<id>.latch.json` is never read as waiter state.
+
+**Deliberately not done, and still open.** Two Phase 1 items live in other repositories and were scoped out by the plan: `ghl-monitor.sh` still respawns drivers from `pi-*.latch.json`, and the Rust waiter still takes no per-PR lock. Both remain as written in F3. The residual risk is a duplicate waiter started by the monitor, which the extension can no longer cause but also cannot prevent. Landing the Rust naming change in `gh-pr-reviewer` main so source and binary agree is likewise still open, and until it does both spellings must keep being read.
+
+**One thing worth flagging.** Registering a second `session_start` handler would have silently replaced the overlay republish, since `pi.on` is not documented to chain. The two are merged into one handler.
+
+Original plan, as written before implementation:
+
+#### Phase 1 — Durable PR phase (fixes RC1–RC4; F1, F2, F3, F4, F8)
+
+##### 1.1 **Feature PR reconciler in `orchestrate.ts`** (new module `src/lib/pr-reconcile.ts`).
 - Trigger: `session_start`, every `/orchestrate` verb, and a 60 s timer while any Feature is in `phase: pr` (timer unref'd; one per process).
 - For each live Feature with `phase: pr` and a `pr:` number: (a) `gh pr view --json state,mergedAt,headRefOid` → merged/closed → `phase: done` / `confirm`; (b) scan the state dir for **every** file whose `pr` matches (both naming schemes, `pi-*.json`, `manual-*`) with an undelivered ACTIONABLE → `dispatchFeaturePrVerdictForOwner`; (c) ensure exactly one waiter (1.3).
 - Persist `pr_head`, `verdict_fingerprint`, `pending_verdict` in status.md so a restart resumes from disk.
