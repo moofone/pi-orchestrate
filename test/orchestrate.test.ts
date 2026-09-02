@@ -5371,3 +5371,192 @@ test("P3 F14: reviewPlan records the run it spawned", () => {
     "reconcile first: both gates below must see the settled field, not the stale one",
   );
 });
+
+/* ------------------------------------------------------------------ *
+ * Phase 4 — Plan → approve (F15, F16, F22)
+ * ------------------------------------------------------------------ */
+
+test("P4 F15: the approve-card path names nothing", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const fn = src.slice(src.indexOf("function presentDraftApproveCards("));
+  const body = fn.slice(0, fn.indexOf("\nfunction ", 1));
+  assert.equal(
+    body.includes("ensureFeatureNamed"),
+    false,
+    "renaming from agent_settled is F15: it moves the folder out from under a " +
+      "planner child that is still writing to the path it was handed",
+  );
+  assert.equal(
+    body.includes("bindFeature("),
+    false,
+    "and nothing in the card path may rebind a Feature to a new directory",
+  );
+});
+
+test("P4 F15: the planner completion path names once, inside the chain lock", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const tail = src.slice(src.indexOf('runChildInPhase(pi, ctx, "plan"'));
+  const lock = tail.indexOf("withChainLock(pendingDir");
+  const name = tail.indexOf("ensureFeatureNamed(feat, readText(feat.planFile))");
+  assert.ok(lock > 0 && name > lock, "naming must happen inside the lock, not before it");
+  assert.ok(
+    tail.indexOf("reviewPlan(pi, ctx, feat", name) > name,
+    "and the reviewer starts on the named folder, not the pending one",
+  );
+  assert.equal(
+    src.split("ensureFeatureNamed(").length - 1 <= 5,
+    true,
+    "every extra naming site is another chance to rename a live folder",
+  );
+});
+
+test("P4 F15: an unnamed draft still gets a card — the name is derived, not written", () => {
+  const plan = [
+    "# Feature: Something Real",
+    "> Status: DRAFT",
+    "> Name: pending",
+    "> Branch: pending",
+  ].join("\n");
+  const cards = orch.draftApproveCards([
+    {
+      archived: false,
+      dir: "/tmp/orch/pending-2026-09-02T11-13-31-967Z",
+      name: "pending-2026-09-02T11-13-31-967Z",
+      plan,
+      status: "name: pending\nplan_review: done\n",
+    },
+  ]);
+  assert.equal(cards.length, 1, "removing the rename must not hide the Feature");
+  assert.equal(cards[0]?.name, "something-real");
+  assert.equal(cards[0]?.command, "/orchestrate approve something-real");
+  assert.equal(
+    cards[0]?.dir,
+    "/tmp/orch/pending-2026-09-02T11-13-31-967Z",
+    "the folder is still the pending one: the card renders an identity, it does not create one. " +
+      "`discoverFeatures` derives the same name, so the command resolves and approve does the rename.",
+  );
+});
+
+test("P4 F16: approve refuses a repo with no origin, and says so in one line", () => {
+  const refused = orch.approveRemoteRequirement({
+    hostBase: false,
+    originUrl: "",
+    repo: "pi-orchestrate",
+  });
+  assert.equal(refused.ok, false);
+  assert.match(
+    (refused as { reason: string }).reason,
+    /pi-orchestrate has no git remote "origin"/,
+    "the reason names the repo and the missing remote, not git internals",
+  );
+  assert.equal(
+    (refused as { reason: string }).reason.includes("\n"),
+    false,
+    "one line: this is a refusal, not a git error dump",
+  );
+  assert.deepEqual(
+    orch.approveRemoteRequirement({
+      hostBase: false,
+      originUrl: "git@github.com:me/repo.git",
+      repo: "repo",
+    }),
+    { ok: true },
+  );
+  assert.deepEqual(
+    orch.approveRemoteRequirement({ hostBase: true, originUrl: "", repo: "pi-extensions" }),
+    { ok: true },
+    "a host base materializes its worktree by copy + git init and never opens a PR",
+  );
+});
+
+test("P4 F16: markPlanApproved rewrites, inserts after the title, or prepends", () => {
+  assert.match(
+    orch.markPlanApproved("# Feature: X\n\n> Status: DRAFT — awaiting approval\n"),
+    /^> Status: APPROVED$/m,
+  );
+  assert.equal(
+    orch.markPlanApproved("# Feature: X\n\n> Status: DRAFT\n").includes("DRAFT"),
+    false,
+    "the DRAFT line is replaced, not duplicated",
+  );
+  assert.match(
+    orch.markPlanApproved("# Feature: X\n\nbody\n"),
+    /# Feature: X\n\n> Status: APPROVED/,
+  );
+  assert.match(orch.markPlanApproved("body only\n"), /^> Status: APPROVED\nbody only/);
+});
+
+test("P4 F16: nothing is written before the refusals are past", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const verb = src.slice(src.indexOf('      if (verb === "approve") {'));
+  const body = verb.slice(0, verb.indexOf('if (verb === "implement"'));
+  assert.equal(
+    body.includes("markPlanApproved"),
+    false,
+    "F16: the approve verb writes no status marker at all — beginImplementation does, " +
+      "under the chain lock, once the worktree exists",
+  );
+  assert.ok(
+    body.indexOf("approveRemoteRequirement") < body.indexOf("ensureFeatureNamed"),
+    "the remote check is read-only and comes first; naming renames a folder",
+  );
+  assert.ok(
+    body.indexOf("ensureFeatureNamed") < body.indexOf("beginImplementation(pi, ctx, feat"),
+    "and the chain only starts on a Feature that has a real name",
+  );
+});
+
+test("P4 F16: APPROVED is written after the worktree exists and the Tasks parse", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const fn = src.slice(src.indexOf("async function beginImplementation("));
+  const body = fn.slice(0, fn.indexOf("\npi.registerCommand"));
+  const wt = body.indexOf("ensureFeatureWorktree(pi, ctx, paths, named.branch)");
+  const tasks = body.indexOf("taskCountError(tasks.length)");
+  const approved = body.indexOf("markPlanApproved(readText(paths.planFile))");
+  assert.ok(wt > 0 && tasks > wt && approved > tasks, "validate → lock → APPROVED → chain");
+  assert.ok(
+    body.indexOf("opts.approve && isDraft(plan)") > 0,
+    "the DRAFT guard must not reject the very approve that is about to lift it",
+  );
+});
+
+test("P4 F22: the worktree comes from the Rust command, with --yes, and nothing else", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  assert.match(
+    src,
+    /pi\.exec\("git", \["wt", branch, "--yes"\]/,
+    "ghl-wt prompts y\\/N on stdin; under pi.exec stdin is empty, so every call " +
+      "without --yes exited `aborted`",
+  );
+  assert.equal(
+    src.includes("GIT_WT"),
+    false,
+    "the ~/glm-review/git-wt.sh fallback is deleted: one implementation, the Rust one",
+  );
+  assert.equal(
+    src.includes("glm-review"),
+    false,
+    "and no path to the retired shell script survives",
+  );
+});
+
+test("P4 F22: the worktree failure leads with git's own words", () => {
+  const message = orch.worktreeFailureMessage(
+    "feat/thing",
+    { stderr: "ghl-wt: fatal: 'origin' does not appear to be a git repository\n", stdout: "" },
+    "pi-orchestrate-wt",
+  );
+  const lines = message.split("\n");
+  assert.match(lines[0]!, /^git wt feat\/thing --yes produced no worktree\.$/);
+  assert.equal(
+    lines[1],
+    "ghl-wt: fatal: 'origin' does not appear to be a git repository",
+    "verbatim, and second — it is the only text that says why",
+  );
+  assert.match(message, /pi-orchestrate-wt\//);
+  assert.match(
+    orch.worktreeFailureMessage("feat/x", {}, "farm"),
+    /\(no output\)/,
+    "a silent failure still has to render",
+  );
+});

@@ -94,8 +94,6 @@ const KEYWORDS = new Set([
   "archive",
   "help",
 ]);
-const GIT_WT = join(homedir(), "glm-review/git-wt.sh");
-
 export const GIT_WORKFLOW_SKILL = "/Users/greg/.grok/skills/git-workflow/SKILL.md";
 
 export const FORBIDDEN = [
@@ -829,25 +827,27 @@ export function renderApproveEntry(
   };
 }
 
+/**
+ * Draw the approve card for every named draft. Read-only with respect to the
+ * Feature: it renders what exists and writes nothing but its own shown-marker.
+ *
+ * It used to call `ensureFeatureNamed` first, from the `agent_settled` handler
+ * — which renames `pending-<utc>` to `<name>` the instant a `# Feature:` line
+ * appears, while the planner child is still writing to the path it was handed.
+ * The planner recreated the pending folder, the completion path named it too, and
+ * `uniquifyName` appended `-2`. Three folders per plan, the real one under the
+ * name nobody would type (F15). Naming now happens once, in the planner
+ * completion path, under the chain lock. Nothing is hidden by that: the card's
+ * name comes from `featureIdentityName`, which derives it from the title, and
+ * `discoverFeatures` derives the same one — so `/orchestrate approve <name>`
+ * resolves an unnamed folder and approve performs the rename.
+ */
 function presentDraftApproveCards(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   paths: Paths,
 ): void {
   try {
-    for (const row of discoverFeatures(paths)) {
-      if (row.archived) continue;
-      if (!isDraft(row.plan) || isApproved(row.plan)) continue;
-      const labeled =
-        statusField(row.status, "name") ||
-        planHeaderField(row.plan, "Name") ||
-        row.name;
-      if (!isPendingToken(labeled)) continue;
-      if (!nameFromTitle(featureTitle(row.plan, ""))) continue;
-      const isolated: Paths = { ...paths };
-      bindFeature(isolated, row.dir);
-      ensureFeatureNamed(isolated, row.plan);
-    }
     const newly: ApproveCardData[] = [];
     for (const card of draftApproveCards(discoverFeatures(paths))) {
       if (!card.dir) continue;
@@ -1032,6 +1032,78 @@ async function materializeHostWorktree(
   }
 }
 
+/**
+ * What the user is shown when `git wt` produced no worktree.
+ *
+ * `ghl-wt`'s own stderr goes through verbatim and first: it is the only text
+ * that says *why* (no origin, branch already used, dirty base). The old message
+ * led with "No usable worktree" and buried git's answer, so a missing remote
+ * read as an orchestrate bug (F22).
+ */
+export function worktreeFailureMessage(
+  branch: string,
+  result: { stdout?: string; stderr?: string },
+  farm: string,
+): string {
+  const said = `${result.stderr ?? ""}\n${result.stdout ?? ""}`.trim();
+  return [
+    `git wt ${branch} --yes produced no worktree.`,
+    said || "(no output)",
+    `Need a checkout under ${farm}/, never a reference checkout.`,
+  ].join("\n");
+}
+
+/** Rewrite (or insert) the plan's `> Status:` line as `APPROVED`. */
+export function markPlanApproved(plan: string): string {
+  if (/^>\s*Status:/m.test(plan)) {
+    return plan.replace(/^>\s*Status:.*$/m, "> Status: APPROVED");
+  }
+  if (/^#\s+.+$/m.test(plan)) {
+    return plan.replace(/^(#\s+.+)$/m, `$1\n\n> Status: APPROVED`);
+  }
+  return `> Status: APPROVED\n${plan}`;
+}
+
+export type ApprovePreflight = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Approve pre-flight: a Feature that cannot reach a PR must not be started.
+ *
+ * `ghl-wt` branches off `origin/<default>`, `gh pr create` needs a remote, and
+ * `pr-await`/`pr-land` need a PR — so a repo with no `origin` fails the whole
+ * lifecycle, and it used to fail *after* the plan had been marked APPROVED,
+ * deep inside `ensureFeatureWorktree`, as a raw git internals dump (F16/F22).
+ * Host bases are exempt: their worktree is a copy plus `git init`, and they
+ * never open a PR.
+ */
+export function approveRemoteRequirement(input: {
+  hostBase: boolean;
+  originUrl: string;
+  repo: string;
+}): ApprovePreflight {
+  if (input.hostBase) return { ok: true };
+  if (input.originUrl.trim()) return { ok: true };
+  return {
+    ok: false,
+    reason:
+      `Cannot approve: ${input.repo} has no git remote "origin", so this Feature could never open a PR. ` +
+      `Add one (git remote add origin …), then approve. The plan stays DRAFT.`,
+  };
+}
+
+/** `remote.origin.url`, or `""` when there is none (or git refused to answer). */
+async function originUrl(pi: ExtensionAPI, cwd: string): Promise<string> {
+  try {
+    const out = await pi.exec("git", ["remote", "get-url", "origin"], {
+      cwd,
+      timeout: 30_000,
+    });
+    return out.code === 0 ? out.stdout.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 async function ensureFeatureWorktree(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
@@ -1083,27 +1155,22 @@ async function ensureFeatureWorktree(
       return dir;
     }
   }
-  let result = await pi.exec("git", ["wt", branch], {
+  // One implementation, the Rust one. `--yes` is not optional: `ghl-wt` prompts
+  // y/N on stdin, and under pi.exec stdin is empty, so every call without it
+  // exited `aborted` — which the retired shell-script fallback then hid behind
+  // a second implementation with different semantics (F22).
+  const result = await pi.exec("git", ["wt", branch, "--yes"], {
     cwd: paths.gitRoot,
     timeout: 180000,
   });
-  const created =
-    (existsSync(preferred) && preferred) ||
-    parseAlreadyUsedWorktree(`${result.stderr}\n${result.stdout}`) ||
-    (await findExistingWorktree(pi, paths.gitRoot, branch));
-  if (!created && existsSync(GIT_WT)) {
-    result = await pi.exec(GIT_WT, [branch], {
-      cwd: paths.gitRoot,
-      timeout: 180000,
-    });
-  }
   const dir =
     (existsSync(preferred) && preferred) ||
     parseAlreadyUsedWorktree(`${result.stderr}\n${result.stdout}`) ||
     (await findExistingWorktree(pi, paths.gitRoot, branch));
   if (!dir || !isAllowedWorktreePath(dir, paths.repo)) {
-    uiNotify(ctx, 
-      `No usable worktree for ${branch}.\n${(result.stderr || result.stdout || "").trim()}\nNeed a checkout under ${basename(worktreeFarmFor(paths.repo))}/, never a reference checkout.`,
+    uiNotify(
+      ctx,
+      worktreeFailureMessage(branch, result, basename(worktreeFarmFor(paths.repo))),
       "error",
     );
     return null;
@@ -6054,16 +6121,17 @@ async function beginImplementation(
   ctx: ExtensionCommandContext,
   paths: Paths,
   wanted?: string,
+  opts: { approve?: boolean } = {},
 ): Promise<void> {
   const plan = readText(paths.planFile);
   if (!plan.trim()) {
-    uiNotify(ctx, 
+    uiNotify(ctx,
       `No Feature at ${paths.planFile}. /orchestrate <objective> first.`,
       "error",
     );
     return;
   }
-  if (isDraft(plan) && !isApproved(plan)) {
+  if (!opts.approve && isDraft(plan) && !isApproved(plan)) {
     uiNotify(ctx, 
       `Feature is still DRAFT.\n${paths.planFile}\nRun /orchestrate approve ${basename(paths.featureDir)} first.`,
       "warning",
@@ -6102,6 +6170,19 @@ async function beginImplementation(
     if (tooMany) {
       uiNotify(ctx, tooMany, "error");
       return;
+    }
+    // F16: APPROVED is written last, once nothing left can refuse — the
+    // worktree exists and the plan has a workable Task list. Written first, a
+    // failed approve left the plan APPROVED with nothing running: `isDraft` is
+    // then false, the card is never re-offered, and `defaultFeature('approve')`
+    // stops finding the Feature at all.
+    if (opts.approve) {
+      writeText(paths.planFile, markPlanApproved(readText(paths.planFile)));
+      uiNotify(
+        ctx,
+        `Approved ${named.name} (${named.branch})\nStarting Tasks → Feature PR via git-workflow`,
+        "info",
+      );
     }
     upsertStatusFile(paths, {
       feature: featureTitle(named.plan, paths.repo),
@@ -6333,32 +6414,31 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         if (!feat) return;
         const plan = readText(feat.planFile);
         if (!plan.trim()) {
-          uiNotify(ctx, `No plan at ${paths.planFile}`, "error");
+          uiNotify(ctx, `No plan at ${feat.planFile}`, "error");
           return;
         }
-        let next = plan;
-        if (/^>\s*Status:/m.test(next)) {
-          next = next.replace(/^>\s*Status:.*$/m, "> Status: APPROVED");
-        } else if (/^#\s+.+$/m.test(next)) {
-          next = next.replace(/^(#\s+.+)$/m, `$1\n\n> Status: APPROVED`);
-        } else {
-          next = `> Status: APPROVED\n${next}`;
+        // F16: validate → lock → APPROVED → chain. Everything that can refuse
+        // runs here, before a single byte of `> Status: APPROVED` is written;
+        // the marker itself goes in inside `beginImplementation`'s chain lock,
+        // after the worktree exists.
+        const preflight = approveRemoteRequirement({
+          hostBase: isHostBase(feat.repo),
+          originUrl: await originUrl(pi, feat.gitRoot),
+          repo: feat.repo,
+        });
+        if (!preflight.ok) {
+          uiNotify(ctx, preflight.reason, "error");
+          return;
         }
-        writeText(feat.planFile, next);
-        const named = ensureFeatureNamed(feat, next);
-        next = named.plan;
+        const named = ensureFeatureNamed(feat, plan);
         if (isPendingToken(named.name) || isPendingToken(named.branch)) {
-          uiNotify(ctx, 
-            `Approved, but Name is still pending — planner never wrote a real # Feature: title.\n${feat.planFile}`,
-            "warning",
+          uiNotify(ctx,
+            `Cannot approve: Name is still pending — the planner never wrote a real # Feature: title.\nPlan stays DRAFT at ${feat.planFile}`,
+            "error",
           );
           return;
         }
-        uiNotify(ctx, 
-          `Approved ${named.name} (${named.branch})\nStarting Tasks → Feature PR via git-workflow`,
-          "info",
-        );
-        await beginImplementation(pi, ctx, feat);
+        await beginImplementation(pi, ctx, feat, undefined, { approve: true });
         return;
       }
 
@@ -6636,23 +6716,31 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         );
         return;
       }
-      const named = ensureFeatureNamed(feat, readText(feat.planFile));
-      if (isPendingToken(named.name)) {
-        uiNotify(
-          ctx,
-          `Planner finished but Name is still pending — need a real # Feature: title.\n${feat.planFile}`,
-          "warning",
-        );
-        return;
-      }
+      // F15: this is the only place a Feature is named. Naming renames the
+      // folder out from under whoever holds the old path, so it runs exactly
+      // once, after the planner child has exited, inside the chain lock. The
+      // lock key is the pre-rename `featureDir`, which is what the `finally`
+      // releases — `feat` is rebound by the rename, the captured string is not.
+      let named: { plan: string; name: string; branch: string } | undefined;
       let reviewOk = false;
-      const ran = await withChainLock(feat.featureDir, async () => {
+      const pendingDir = feat.featureDir;
+      const ran = await withChainLock(pendingDir, async () => {
+        named = ensureFeatureNamed(feat, readText(feat.planFile));
+        if (isPendingToken(named.name)) return;
         reviewOk = await reviewPlan(pi, ctx, feat, named.name);
       });
       if (!ran) {
         uiNotify(
           ctx,
-          `A chain is already running on ${named.name}. plan-reviewer did not start.`,
+          `A chain is already running on ${basename(pendingDir)}. plan-reviewer did not start.`,
+          "warning",
+        );
+        return;
+      }
+      if (!named || isPendingToken(named.name)) {
+        uiNotify(
+          ctx,
+          `Planner finished but Name is still pending — need a real # Feature: title.\n${feat.planFile}`,
           "warning",
         );
         return;
