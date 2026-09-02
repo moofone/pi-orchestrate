@@ -5222,39 +5222,148 @@ export async function discoverBranchPr(
   }
 }
 
-/** Push HEAD and open one non-draft Feature PR. tdd-worker never does this. */
+/**
+ * The repo's default branch. `--base main` was hard-coded, which is simply
+ * wrong in any repo that calls it something else.
+ *
+ * Falls back to `main` rather than refusing: an unreachable `gh` is not a
+ * reason to withhold a PR that would otherwise open fine.
+ */
+export async function defaultBaseBranch(pi: ExtensionAPI, worktree: string): Promise<string> {
+  try {
+    const r = await pi.exec("gh", ["repo", "view", "--json", "defaultBranchRef"], {
+      cwd: worktree,
+      timeout: 30_000,
+    });
+    if (r.code !== 0) return "main";
+    const json = JSON.parse(String(r.stdout ?? "")) as { defaultBranchRef?: { name?: unknown } };
+    const name = json.defaultBranchRef?.name;
+    return typeof name === "string" && name.trim() ? name.trim() : "main";
+  } catch {
+    return "main";
+  }
+}
+
+/**
+ * The public PR body: the plan's `## Context` plus the Task titles.
+ *
+ * `--body-file plan.md` posted the whole plan — `/Users/greg/orchestrator/…`
+ * paths, `> Worker:` model routing, gate commands — as the public body of a
+ * PR on someone else's repo (F10). Reviewers need what changed and why; none
+ * of the rest is theirs to read.
+ */
+export function featurePrBody(plan: string, title: string): string {
+  // Not a single regex: JS has no `\Z`, so "up to the next H2 or the end of
+  // the plan" is a slice, and a Context that is the last section still lands.
+  const start = plan.search(/^##\s+Context\s*$/m);
+  let context = "";
+  if (start >= 0) {
+    const rest = plan.slice(start).replace(/^.*\n?/, "");
+    const end = rest.search(/^##\s/m);
+    context = (end >= 0 ? rest.slice(0, end) : rest).trim();
+  }
+  const tasks = parseTasks(plan).map((t) => `- Task ${t.id} — ${t.title}`);
+  return [
+    context || title.trim(),
+    ...(tasks.length ? ["", "## Tasks", "", ...tasks] : []),
+  ]
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Push the branch and open one non-draft Feature PR. Writers never do this.
+ *
+ * Pre-flighted, because `gh pr create` on a branch with no commits fails with
+ * "No commits between …" and the old code discarded that stderr and reported
+ * "no PR number returned" — which is how `quiesce-identical-current-state`
+ * parked in `phase: pr` with nothing anyone could act on (F10).
+ *
+ * A check git cannot answer never blocks: an unreadable `status` or `rev-list`
+ * falls through to `gh pr create`, whose own error is now surfaced verbatim.
+ */
 export async function openFeaturePr(
   pi: ExtensionAPI,
   worktree: string,
-  input: { title: string; body?: string; bodyFile?: string; base?: string },
+  input: { title: string; body?: string; base?: string },
 ): Promise<{ pr: string; url?: string; reason?: string } | undefined> {
   const title = input.title.trim();
   if (!title) return { reason: "missing PR title" };
-  const base = input.base?.trim() || "main";
-  const args = ["pr", "create", "--title", title, "--base", base];
-  if (input.bodyFile) args.push("--body-file", input.bodyFile);
-  else args.push("--body", (input.body ?? title).trim() || title);
+  const base = input.base?.trim() || (await defaultBaseBranch(pi, worktree));
 
-  try {
-    await pi.exec("git", ["push", "-u", "origin", "HEAD"], {
-      cwd: worktree,
-      timeout: 120_000,
-    });
-  } catch {
-    /* already on origin is fine; create/discover still run */
+  const git = async (args: string[], timeout = 30_000) => {
+    try {
+      return await pi.exec("git", args, { cwd: worktree, timeout });
+    } catch (error) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: String((error as { message?: string })?.message ?? error),
+      };
+    }
+  };
+
+  // 1. Nothing uncommitted. A writer that edited and did not commit produces a
+  // PR that is missing the work it was opened for (F11).
+  const porcelain = await git(["status", "--porcelain"]);
+  if (porcelain.code === 0 && String(porcelain.stdout ?? "").trim()) {
+    const files = String(porcelain.stdout).trim().split("\n").slice(0, 8).join("; ");
+    return { reason: `uncommitted changes in ${worktree}: ${files}` };
   }
 
+  // 2. Something to review. `origin/<base>` is refreshed first, or the count
+  // is measured against whatever the last fetch left behind.
+  await git(["fetch", "origin", base], 120_000);
+  const ahead = await git(["rev-list", "--count", `origin/${base}..HEAD`]);
+  if (ahead.code === 0 && Number.parseInt(String(ahead.stdout ?? "").trim(), 10) === 0) {
+    // A branch that is level with base may still already have a PR.
+    const existing = await discoverBranchPr(pi, worktree);
+    if (existing) return existing;
+    const branch = (await git(["rev-parse", "--abbrev-ref", "HEAD"])).stdout?.trim() || "HEAD";
+    return {
+      reason:
+        `no commits on ${branch} ahead of origin/${base} — nothing to review ` +
+        `(did the writers commit?)`,
+    };
+  }
+
+  const pushed = await git(["push", "-u", "origin", "HEAD"], 120_000);
+  if (pushed.code !== 0) {
+    const existing = await discoverBranchPr(pi, worktree);
+    if (existing) return existing;
+    const why = `${String(pushed.stderr ?? "").trim() || String(pushed.stdout ?? "").trim()}`;
+    return { reason: `git push failed: ${why.slice(-600) || `exit ${pushed.code}`}` };
+  }
+
+  const args = [
+    "pr",
+    "create",
+    "--title",
+    title,
+    "--base",
+    base,
+    "--body",
+    (input.body ?? title).trim() || title,
+  ];
+  let createError = "";
   try {
     const created = await pi.exec("gh", args, { cwd: worktree, timeout: 60_000 });
     const parsed = parseOpenedPr(`${created.stdout ?? ""}\n${created.stderr ?? ""}`);
     if (parsed) return parsed;
-  } catch {
-    /* fall through to discover */
+    if (created.code !== 0) {
+      createError = `${String(created.stderr ?? "").trim() || String(created.stdout ?? "").trim()}`;
+    }
+  } catch (error) {
+    createError = String((error as { message?: string })?.message ?? error);
   }
 
   const existing = await discoverBranchPr(pi, worktree);
   if (existing) return existing;
-  return { reason: "no PR number returned" };
+  return {
+    reason: createError
+      ? `gh pr create failed: ${createError.slice(-600)}`
+      : "no PR number returned",
+  };
 }
 
 /** Open one Feature PR in code (`gh pr create`), then drive `git pr-await`. */
@@ -5282,23 +5391,22 @@ async function landFeaturePr(
     uiNotify(ctx, `All Tasks done on ${name}. Opening one Feature PR from ${worktree}…`, "info");
 
     const plan = readText(paths.planFile);
+    const title = featureTitle(plan, name);
     const opened = await openFeaturePr(pi, worktree, {
-      title: featureTitle(plan, name),
-      bodyFile: existsSync(paths.planFile) ? paths.planFile : undefined,
-      body: featureTitle(plan, name),
+      title,
+      body: featurePrBody(plan, title),
     });
     pr = opened?.pr ?? "";
     url = opened?.url ?? url;
     if (!pr) {
+      // Verbatim, and on disk: "Feature PR not on the branch" told nobody
+      // whether the branch was empty, the push was rejected, or gh was down.
+      const why = opened?.reason ?? "no PR number returned";
       upsertStatusFile(paths, {
         phase: "pr",
-        nextAction: "Feature PR not on the branch",
+        nextAction: `Feature PR not opened — ${why.replace(/\s+/g, " ").slice(0, 300)}`,
       });
-      uiNotify(
-        ctx,
-        `Could not open the Feature PR (${opened?.reason ?? "no PR number returned"}).`,
-        "error",
-      );
+      uiNotify(ctx, `Could not open the Feature PR.\n${why}`, "error");
       return;
     }
   }

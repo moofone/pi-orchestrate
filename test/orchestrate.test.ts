@@ -4905,3 +4905,190 @@ test("P2 F9: the handshake is a handshake, and the land is not a review deadline
     "ghl-pr-land merges and waits for GitHub to agree — minutes, not half an hour",
   );
 });
+
+const PLAN_WITH_CONTEXT = [
+  "# Feature: Quiesce identical current-state",
+  "",
+  "> Status: APPROVED",
+  "> Branch: feat/quiesce",
+  "> Worker: cursor/grok-4.6",
+  "> Plan: /Users/greg/orchestrator/icemining/quiesce/plan.md",
+  "",
+  "## Context",
+  "",
+  "Republishing an unchanged current-state row wakes every consumer for nothing.",
+  "The fix is to compare before publishing.",
+  "",
+  "## Tasks",
+  "",
+  "### Task 1 — Compare before publish",
+  "",
+  "- Command: `cargo test -p stratum-backend`",
+  "",
+  "### Task 2 — Cover the equal case",
+  "",
+  "- Command: `cargo test -p stratum-backend`",
+  "",
+  "## Out of Scope",
+  "",
+  "- The collector leg.",
+].join("\n");
+
+test("P2 F10: the PR body is the Context and the Task titles, never the whole plan file", () => {
+  const body = orch.featurePrBody(PLAN_WITH_CONTEXT, "Quiesce identical current-state");
+  assert.equal(typeof body, "string");
+  assert.match(body, /Republishing an unchanged current-state row/, "the Context is the body");
+  assert.match(body, /Compare before publish/, "the Task titles say what landed");
+  assert.match(body, /Cover the equal case/);
+  assert.doesNotMatch(body, /\/Users\/greg\/orchestrator/, "no local paths on a public PR");
+  assert.doesNotMatch(body, /Worker:/, "no model routing on a public PR");
+  assert.doesNotMatch(body, /cargo test -p stratum-backend/, "gate commands are not PR prose");
+  assert.doesNotMatch(body, /Status: APPROVED/);
+
+  const bare = orch.featurePrBody("# Feature: t\n\n### Task 1 — only task\n", "t");
+  assert.match(bare, /only task/, "a plan with no Context still gets a usable body");
+});
+
+test("P2 F10: the base branch comes from the repo, not from a hard-coded main", async () => {
+  const pi = makeFakePi(async (cmd, args) => {
+    if (cmd === "gh" && args?.[0] === "repo" && args?.[1] === "view") {
+      return {
+        code: 0,
+        stdout: '{"defaultBranchRef":{"name":"develop"}}',
+        stderr: "",
+      };
+    }
+    return { code: 1, stdout: "", stderr: "no" };
+  });
+  assert.equal(await orch.defaultBaseBranch(pi as never, "/tmp/wt"), "develop");
+
+  const broken = makeFakePi(async () => ({ code: 1, stdout: "", stderr: "gh is not logged in" }));
+  assert.equal(
+    await orch.defaultBaseBranch(broken as never, "/tmp/wt"),
+    "main",
+    "an unreachable gh falls back rather than blocking the PR",
+  );
+});
+
+test("P2 F10: a branch with nothing on it refuses before gh pr create, and says why", async () => {
+  const calls: string[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    if (cmd === "gh" && args?.[0] === "repo") {
+      return { code: 0, stdout: '{"defaultBranchRef":{"name":"main"}}', stderr: "" };
+    }
+    if (args?.[0] === "status") return { code: 0, stdout: "", stderr: "" };
+    if (args?.[0] === "rev-list") return { code: 0, stdout: "0\n", stderr: "" };
+    if (args?.[0] === "rev-parse" && args?.[1] === "--abbrev-ref") {
+      return { code: 0, stdout: "feat/quiesce\n", stderr: "" };
+    }
+    if (cmd === "gh" && args?.[1] === "view") return { code: 1, stdout: "", stderr: "no PR" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+
+  const opened = await orch.openFeaturePr(pi as never, "/tmp/wt", {
+    title: "Quiesce identical current-state",
+    body: "b",
+  });
+  assert.equal(opened?.pr, undefined, "nothing was opened");
+  assert.match(
+    String(opened?.reason),
+    /no commits/i,
+    `the reason must name the real problem: ${opened?.reason}`,
+  );
+  assert.match(String(opened?.reason), /origin\/main/, "and the base it compared against");
+  assert.equal(
+    calls.some((c) => c.startsWith("gh pr create")),
+    false,
+    "gh pr create is not run against an empty branch",
+  );
+});
+
+test("P2 F10: a dirty worktree refuses, naming the files", async () => {
+  const pi = makeFakePi(async (cmd, args) => {
+    if (cmd === "gh" && args?.[0] === "repo") {
+      return { code: 0, stdout: '{"defaultBranchRef":{"name":"main"}}', stderr: "" };
+    }
+    if (args?.[0] === "status") {
+      return { code: 0, stdout: " M src/pay.rs\n?? notes.txt\n", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const opened = await orch.openFeaturePr(pi as never, "/tmp/wt", { title: "t", body: "b" });
+  assert.equal(opened?.pr, undefined);
+  assert.match(String(opened?.reason), /uncommitted|dirty/i);
+  assert.match(String(opened?.reason), /src\/pay\.rs/, "the user needs to know what is uncommitted");
+});
+
+test("P2 F10: a failed push and a failed create surface their stderr verbatim", async () => {
+  const pushFailed = makeFakePi(async (cmd, args) => {
+    if (cmd === "gh" && args?.[0] === "repo") {
+      return { code: 0, stdout: '{"defaultBranchRef":{"name":"main"}}', stderr: "" };
+    }
+    if (args?.[0] === "status") return { code: 0, stdout: "", stderr: "" };
+    if (args?.[0] === "rev-list") return { code: 0, stdout: "3\n", stderr: "" };
+    if (args?.[0] === "push") {
+      return { code: 1, stdout: "", stderr: "! [remote rejected] feat/x -> feat/x (protected branch hook declined)" };
+    }
+    if (cmd === "gh" && args?.[1] === "view") return { code: 1, stdout: "", stderr: "no PR" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const pushed = await orch.openFeaturePr(pushFailed as never, "/tmp/wt", { title: "t", body: "b" });
+  assert.equal(pushed?.pr, undefined);
+  assert.match(
+    String(pushed?.reason),
+    /protected branch hook declined/,
+    `the git stderr must reach the user: ${pushed?.reason}`,
+  );
+
+  const createFailed = makeFakePi(async (cmd, args) => {
+    if (cmd === "gh" && args?.[0] === "repo") {
+      return { code: 0, stdout: '{"defaultBranchRef":{"name":"main"}}', stderr: "" };
+    }
+    if (args?.[0] === "status") return { code: 0, stdout: "", stderr: "" };
+    if (args?.[0] === "rev-list") return { code: 0, stdout: "3\n", stderr: "" };
+    if (args?.[0] === "push") return { code: 0, stdout: "", stderr: "" };
+    if (cmd === "gh" && args?.[1] === "create") {
+      return { code: 1, stdout: "", stderr: "GraphQL: was submitted too quickly (createPullRequest)" };
+    }
+    if (cmd === "gh" && args?.[1] === "view") return { code: 1, stdout: "", stderr: "no PR" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const created = await orch.openFeaturePr(createFailed as never, "/tmp/wt", { title: "t", body: "b" });
+  assert.equal(created?.pr, undefined);
+  assert.match(
+    String(created?.reason),
+    /submitted too quickly/,
+    `"no PR number returned" hid the real error: ${created?.reason}`,
+  );
+});
+
+test("P2 F10: landFeaturePr sends the built body, not --body-file plan.md", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const start = src.indexOf("async function landFeaturePr");
+  const body = src.slice(start, start + 3000);
+  assert.match(body, /featurePrBody\(/, "the PR body is built, not the plan file");
+  assert.doesNotMatch(
+    body,
+    /bodyFile:/,
+    "--body-file plan.md posted local paths and Worker: lines as the public PR body",
+  );
+  assert.match(body, /opened\?\.reason/, "a failed open must surface its reason");
+});
+
+test("P2 F10: a Context that is the last section of the plan still reaches the PR body", () => {
+  const plan = [
+    "# Feature: t",
+    "",
+    "### Task 1 — only task",
+    "",
+    "## Context",
+    "",
+    "The last section of the plan is still the body.",
+  ].join("\n");
+  assert.match(
+    orch.featurePrBody(plan, "t"),
+    /The last section of the plan is still the body\./,
+    "JS has no \\Z: 'to the next H2 or the end' must not silently return nothing",
+  );
+});
