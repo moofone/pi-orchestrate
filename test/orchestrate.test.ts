@@ -13,7 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2914,6 +2914,175 @@ const FIX_VERDICT = [
   "round=3",
   "reviewer said: credit_share overflows on an attacker-sized difficulty",
 ].join("\n");
+
+// ---------------------------------------------------------------------------
+// F4: a verdict is spent only when dispatch accepts it.
+//
+// The verdict used to be marked delivered before the dispatch ran, and dispatch
+// legitimately returns `refuse` while a fixer holds the chain lock for 30-60
+// minutes. The verdict was consumed and never retried, and the waiter does not
+// re-emit it — so the Feature stalled with findings outstanding.
+// ---------------------------------------------------------------------------
+
+test("F4: a refused read_comments_and_fix records pending_verdict instead of vanishing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-refuse-"));
+  const paths = featurePaths(dir);
+  writeFileSync(paths.planFile, "# Feature: t\n");
+  writeFileSync(
+    paths.statusFile,
+    [
+      "# Status",
+      "",
+      "pause: off",
+      `worktree: ${dir}`,
+      "phase: pr",
+      "pr: 99",
+      "pr_round: 0",
+      // A live writer this Feature already owns: exactly the window in which a
+      // late verdict used to be swallowed.
+      "worker_run_id: run-live",
+      `worker_run_dir: ${dir}/live-run`,
+      "",
+    ].join("\n"),
+  );
+  mkdirSync(join(dir, "live-run"), { recursive: true });
+  writeFileSync(
+    join(dir, "live-run", "status.json"),
+    JSON.stringify({ state: "running", pid: process.pid, startedAt: Date.now() }),
+  );
+
+  const pi = makeFakePi(async () => ({ code: 0, stdout: "", stderr: "" }));
+  const spawn = autoSettleSpawn(pi, "run-should-not-happen");
+  const { ctx, notices } = makeFakeCtx();
+
+  const action = await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      { done: false, next: "read_comments_and_fix", output: FIX_VERDICT, round: "3" },
+    ),
+    4000,
+  );
+
+  assert.equal(action, "refuse", "a live writer must refuse a second fixer");
+  assert.equal(spawn.count, 0, "no second writer on the same branch");
+
+  const status = readFileSync(paths.statusFile, "utf8");
+  const pending = status.match(/^pending_verdict:\s*(.+)$/m)?.[1]?.trim() ?? "";
+  assert.ok(
+    pending && pending !== "none",
+    `a refused verdict must be recorded so it can be drained; status was:\n${status}`,
+  );
+  assert.ok(
+    notices.some((n) => /99/.test(n)),
+    `the refusal is reported; got ${notices.join(" | ")}`,
+  );
+
+  // Refusing twice must not append a second record or spam a second toast.
+  const before = notices.length;
+  await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      { done: false, next: "read_comments_and_fix", output: FIX_VERDICT, round: "3" },
+    ),
+    4000,
+  );
+  const again = readFileSync(paths.statusFile, "utf8");
+  assert.equal(
+    again.match(/^pending_verdict:/gm)?.length,
+    1,
+    "pending_verdict is one field, not an append log",
+  );
+  assert.equal(
+    again.match(/^pending_verdict:\s*(.+)$/m)?.[1]?.trim(),
+    pending,
+    "the same verdict keeps the same fingerprint",
+  );
+  assert.equal(notices.length, before, "an unchanged refusal must not toast again");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("F4: an accepted verdict marks the waiter file spent before the fixer finishes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-accept-"));
+  const stateDir = mkdtempSync(join(tmpdir(), "orch-accept-state-"));
+  const prevStateDir = process.env.GHL_LATCH_STATE_DIR;
+  process.env.GHL_LATCH_STATE_DIR = stateDir;
+  const paths = featurePaths(dir);
+  writeFileSync(paths.planFile, "# Feature: t\n");
+  writeFileSync(
+    paths.statusFile,
+    [
+      "# Status",
+      "",
+      "pause: off",
+      `worktree: ${dir}`,
+      "phase: pr",
+      "pr: 99",
+      "pr_round: 0",
+      "worker_run_id: none",
+      "worker_run_dir: none",
+      "",
+    ].join("\n"),
+  );
+  // Both spellings on disk, both undelivered.
+  const manualNew = join(stateDir, "manual-icemining-99.json");
+  const manualOld = join(stateDir, "manual-99.json");
+  for (const path of [manualNew, manualOld]) {
+    writeFileSync(
+      path,
+      JSON.stringify({ pr: "99", lastNext: "read_comments_and_fix", verdictDelivered: false }),
+    );
+  }
+
+  const pi = makeFakePi(async () => ({
+    code: 0,
+    stdout: "status=handed_off\nnext=yield\n",
+    stderr: "",
+  }));
+  autoSettleSpawn(pi, "run-accept-1");
+  const { ctx } = makeFakeCtx();
+
+  try {
+    const action = await withDeadline(
+      (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+        pi,
+        ctx,
+        paths,
+        "99",
+        dir,
+        { done: false, next: "read_comments_and_fix", output: FIX_VERDICT, round: "3" },
+      ),
+      8000,
+    );
+    assert.equal(action, "spawn_writer");
+    for (const path of [manualNew, manualOld]) {
+      const spent = JSON.parse(readFileSync(path, "utf8"));
+      assert.equal(
+        spent.verdictDelivered,
+        true,
+        `${path} must be spent once the action was accepted, so the 15s watch does not re-dispatch it`,
+      );
+    }
+    const status = readFileSync(paths.statusFile, "utf8");
+    const pending = status.match(/^pending_verdict:\s*(.+)$/m)?.[1]?.trim();
+    assert.ok(
+      !pending || pending === "none",
+      `an accepted verdict leaves nothing pending; got ${pending}`,
+    );
+  } finally {
+    if (prevStateDir === undefined) delete process.env.GHL_LATCH_STATE_DIR;
+    else process.env.GHL_LATCH_STATE_DIR = prevStateDir;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
 
 test("D2: a Feature read_comments_and_fix spawns one fixer and never asks the parent to fix", async () => {
   assert.equal(

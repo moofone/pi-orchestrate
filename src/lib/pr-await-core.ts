@@ -30,6 +30,29 @@ export function actionableFingerprint(input: {
 
 export const MECHANICAL = new Set(["git_pr_land", "git_pr_land_continue"]);
 
+/**
+ * Dispatch outcomes that consume the verdict.
+ *
+ * A verdict is one delivery. Marking it spent before the dispatch ran meant a
+ * `refuse` — which is the normal answer while a fixer holds the chain lock for
+ * half an hour — threw the finding away, and the waiter does not re-emit
+ * (F4). Only these four actually did something with it; `refuse`, `notify`,
+ * `confirm` and `idle` leave it on disk to be retried.
+ */
+export const ACCEPTED_FEATURE_PR_ACTIONS = new Set([
+	"spawn_writer",
+	"reawait",
+	"land",
+	"archive",
+]);
+
+export function isAcceptedFeaturePrAction(action: unknown): boolean {
+	// A hook that returns nothing accepted it: that is the historic contract,
+	// and the tests' capture hooks rely on it.
+	if (action === undefined || action === null) return true;
+	return typeof action === "string" && ACCEPTED_FEATURE_PR_ACTIONS.has(action);
+}
+
 /** Waiter-owned fields on `pi-<id>.json` / `manual-<pr>.json`. */
 export type WaiterVerdict = {
 	lastNext?: string;
@@ -105,6 +128,29 @@ export function readLiveRound(
 		return { round, roundTotal };
 	} catch {
 		return undefined;
+	}
+}
+
+/**
+ * Mark every waiter file for this PR spent, under both name spellings.
+ *
+ * Called by the dispatcher the moment it accepts an action, not when the fixer
+ * finishes: a writer holds the Feature for 30-60 minutes, and leaving the file
+ * undelivered for that long makes the 15s watch and the reconciler re-dispatch
+ * the same verdict and refuse it over and over.
+ */
+export function spendWaiterVerdict(
+	repo: string | undefined,
+	pr: string,
+	dir = stateDir(),
+): void {
+	const paths = new Set([
+		...waiterManualFiles(pr, dir),
+		...waiterPaths(repo, pr, dir).manual,
+	]);
+	for (const path of paths) {
+		if (!existsSync(path)) continue;
+		markVerdictDelivered(path);
 	}
 }
 

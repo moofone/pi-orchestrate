@@ -1389,6 +1389,83 @@ test("a verdict written only under the repo-qualified waiter name is still dispa
 	}
 });
 
+test("a refused Feature dispatch leaves the verdict on disk for a later retry", async () => {
+	// F4: the verdict used to be marked delivered before dispatch, and dispatch
+	// returns `refuse` whenever a fixer already holds the chain lock. The waiter
+	// never re-emits, so the finding was lost. A refusal must change nothing.
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-refused");
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		featureOwnedPr: (pr: string) => ({
+			dir: "/tmp/feat-refused",
+			statusFile: "/tmp/feat-refused/status.md",
+			repo: "icemining",
+			name: "feat-refused",
+			pr,
+			worktree: WT,
+		}),
+		onFeatureActionable: () => "refuse",
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		writeFileSync(
+			join(h.dir, "manual-icemining-2142.json"),
+			JSON.stringify({
+				pr: "2142",
+				lastNext: "read_comments_and_fix",
+				verdict: ACTIONABLE_VERDICT,
+				verdictDelivered: false,
+			}),
+		);
+		await h.settle();
+		await sleep(80);
+		for (const name of [`pi-${h.sessionId}.json`, "manual-icemining-2142.json"]) {
+			const state = JSON.parse(readFileSync(join(h.dir, name), "utf8"));
+			assert.equal(
+				state.verdictDelivered,
+				false,
+				`${name} must stay undelivered so the verdict can be retried`,
+			);
+		}
+		assert.equal(h.wakes.length, 0, "a refusal must not turn the parent into the fixer");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("an accepted Feature dispatch spends the verdict so it is not dispatched twice", async () => {
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-accepted");
+	let calls = 0;
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		watchMs: 20,
+		featureOwnedPr: (pr: string) => ({
+			dir: "/tmp/feat-accepted",
+			statusFile: "/tmp/feat-accepted/status.md",
+			repo: "icemining",
+			name: "feat-accepted",
+			pr,
+			worktree: WT,
+		}),
+		onFeatureActionable: () => {
+			calls += 1;
+			return "spawn_writer";
+		},
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(120);
+		assert.equal(calls, 1, `an accepted verdict dispatches once; got ${calls}`);
+		const state = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.json`), "utf8"));
+		assert.equal(state.verdictDelivered, true);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("a Feature-owned PR does not get a second waiter on settle", async () => {
 	// Three spawners raced here (F3): the handshake, this settle, and ghl-monitor.
 	// The reconciler owns Feature waiters now, so settle must not fork one.

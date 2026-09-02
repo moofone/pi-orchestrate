@@ -43,11 +43,13 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
+  actionableFingerprint,
   armObservedLatch,
   findFeatureOwningPr,
   landFailedAlreadyMerged,
   MECHANICAL,
   printedLandCommand,
+  spendWaiterVerdict,
   type FeaturePrOwner,
 } from "./lib/pr-await-core.ts";
 
@@ -2203,6 +2205,11 @@ function upsertStatusFile(
     qaPass?: string;
     qaPassCap?: string;
     planReview?: string;
+    /** Fingerprint of a verdict dispatch refused; `none` clears it. */
+    pendingVerdict?: string;
+    /** Head the current verdict was raised against. */
+    prHead?: string;
+    verdictFingerprint?: string;
     tasks?: Task[];
   },
 ): void {
@@ -2263,6 +2270,11 @@ function upsertStatusFile(
   if (patch.qaPass !== undefined) setField("qa_pass", patch.qaPass);
   if (patch.qaPassCap !== undefined) setField("qa_pass_cap", patch.qaPassCap);
   if (patch.planReview !== undefined) setField("plan_review", patch.planReview);
+  if (patch.pendingVerdict !== undefined) setField("pending_verdict", patch.pendingVerdict);
+  if (patch.prHead !== undefined) setField("pr_head", patch.prHead);
+  if (patch.verdictFingerprint !== undefined) {
+    setField("verdict_fingerprint", patch.verdictFingerprint);
+  }
   if (patch.nextAction) setField("next_action", patch.nextAction);
   if (patch.tasks) {
     const table = [
@@ -3838,11 +3850,58 @@ export async function dispatchFeaturePrVerdict(
   // The waiter owns the rest: no status write, no toast, no model turn.
   if (action === "idle") return action;
 
+  // Hashed, not raw: a verdict body is many lines and status.md holds one
+  // value per line, so the raw fingerprint would be unreadable back out.
+  const fingerprint = fingerprintTag(
+    actionableFingerprint({
+      next: result.next,
+      verdict: result.output,
+      round: result.round,
+    }),
+  );
+
+  if (action === "refuse") {
+    // A writer already owns this Feature. The verdict is NOT consumed: it is
+    // recorded so the reconciler can drain it when the lock frees. Marking it
+    // delivered here is what lost review findings for a whole fixer round (F4).
+    const already = statusField(status, "pending_verdict");
+    upsertStatusFile(paths, {
+      pr,
+      pendingVerdict: fingerprint,
+      ...(already === fingerprint
+        ? {}
+        : {
+            nextAction:
+              `pr-await next=${result.next || "(none)"} refused — a writer holds this Feature; ` +
+              `queued for retry`,
+          }),
+    });
+    // The same refusal arrives on every 15s watch tick while the writer runs.
+    // Saying so once is information; saying it 120 times is noise.
+    if (already !== fingerprint) {
+      uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next), "warning");
+    }
+    return action;
+  }
+
+  /**
+   * Consume the verdict and clear any queued retry.
+   *
+   * Called the moment an action is committed to, not when the writer finishes
+   * 30-60 minutes later: until the file is marked, every watch tick and every
+   * reconcile pass sees the same undelivered ACTIONABLE and dispatches it again.
+   */
+  const accept = () => {
+    spendWaiterVerdict(paths.repo, pr);
+    upsertStatusFile(paths, { pendingVerdict: "none", verdictFingerprint: fingerprint });
+  };
+
   const spent = fixSpawnCount(statusField(status, "pr_round"));
 
   if (action === "reawait") {
     // A reviewer that never answered leaves nothing to fix, so no writer is
     // spawned; only the waiter can notice the review restarting.
+    accept();
     upsertStatusFile(paths, {
       pr,
       nextAction: `pr-await next=${result.next || "(none)"} — re-awaiting once (fixer round ${spent})`,
@@ -3855,6 +3914,7 @@ export async function dispatchFeaturePrVerdict(
   }
 
   if (action === "land") {
+    accept();
     await runFeaturePrLand(
       pi,
       ctx,
@@ -3870,6 +3930,7 @@ export async function dispatchFeaturePrVerdict(
   if (action === "archive") {
     // Latch-detected merge never went through `drivePrAwait`'s `next=done`
     // branch, so phase may still be `pr` / `next=yield`. Always land here.
+    accept();
     upsertStatusFile(paths, { phase: "done", pr, nextAction: "landed" });
     uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
     return action;
@@ -3889,7 +3950,12 @@ export async function dispatchFeaturePrVerdict(
     return action;
   }
 
-  const fix = () => runReviewFixWriter(pi, ctx, paths, pr, worktree, result);
+  // The verdict is spent as the writer starts, not when it finishes: the
+  // fixer holds the Feature for the better part of an hour.
+  const fix = async () => {
+    accept();
+    await runReviewFixWriter(pi, ctx, paths, pr, worktree, result);
+  };
   if (opts.holdsChainLock) {
     await fix();
     return action;
@@ -3897,6 +3963,9 @@ export async function dispatchFeaturePrVerdict(
   // One writer per Feature, decided by the lock rather than by the snapshot
   // above: between the classify and here, a chain may have started.
   if (await withChainLock(paths.featureDir, fix)) return action;
+  // Lost that race. Nothing was spent, so record the retry the same way the
+  // early refusal does.
+  upsertStatusFile(paths, { pr, pendingVerdict: fingerprint });
   uiNotify(ctx, featurePrVerdictNotice("refuse", pr, result.next), "warning");
   return "refuse";
 }

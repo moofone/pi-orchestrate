@@ -41,6 +41,7 @@ import {
 	adoptableLatch,
 	ensureDriver,
 	findFeatureOwningPr,
+	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	latchOff,
 	logFile,
@@ -151,12 +152,16 @@ export type LatchHooks = {
 	 * What to do with a Feature-owned verdict. The default hands it to
 	 * `orchestrate.ts`, which spawns one writer and re-awaits in code; tests
 	 * capture the call instead of spawning a child.
+	 *
+	 * The returned action decides whether the verdict was consumed. Returning
+	 * nothing means accepted, which is what the capture hooks rely on; a
+	 * `refuse` leaves every waiter file undelivered for a later retry (F4).
 	 */
 	onFeatureActionable?: (
 		ctx: ExtensionContext,
 		owner: FeaturePrOwner,
 		verdict: { pr: string; next: string; output: string; round?: string },
-	) => void | Promise<void>;
+	) => void | string | Promise<void | string>;
 };
 
 export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
@@ -185,6 +190,12 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	/** Fingerprint of the ACTIONABLE verdict already injected this session. */
 	let lastActionableFingerprint: string | undefined;
 	/**
+	 * Fingerprint of a verdict this session dispatched and had refused. It is
+	 * retried on every watch tick — that is how it drains when the chain lock
+	 * frees — so it is tracked separately to keep the retry silent.
+	 */
+	let lastRefusedFingerprint: string | undefined;
+	/**
 	 * True only while this session is actually waiting. absorb / armObservedLatch
 	 * set it; a later user prompt clears it so a merge cannot hijack a chat that
 	 * has moved on (icemining#2150 into an unrelated git-workflow conversation).
@@ -212,7 +223,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			// into every session at load time, and `orchestrate.ts` must never import
 			// back into the latch.
 			const orch = await import("./orchestrate.ts");
-			await orch.dispatchFeaturePrVerdictForOwner(pi, ctx, owner, {
+			return await orch.dispatchFeaturePrVerdictForOwner(pi, ctx, owner, {
 				next: verdict.next,
 				output: verdict.output,
 				round: verdict.round,
@@ -597,10 +608,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			round: hit.round,
 		});
 		if (fp === lastActionableFingerprint) return;
-		lastActionableFingerprint = fp;
-		for (const path of candidates) markVerdictDelivered(path);
-		status(ctx, `pr-await ${prLabel(latch)} · ${hit.lastNext}`);
-		notify(ctx, `pr-latch: ${prLinkLabel(latch)} ${hit.lastNext}`);
+		// A verdict this session already tried and had refused is re-attempted on
+		// every watch tick — that retry is how it drains when the chain lock is
+		// released — but it must not re-announce itself each time.
+		const repeatOfRefusal = fp === lastRefusedFingerprint;
+		if (!repeatOfRefusal) {
+			status(ctx, `pr-await ${prLabel(latch)} · ${hit.lastNext}`);
+			notify(ctx, `pr-latch: ${prLinkLabel(latch)} ${hit.lastNext}`);
+		}
 
 		// A PR a live Feature owns is fixed by a writer that code dispatches, so
 		// this session is told nothing to do. Waking it would make whoever holds
@@ -627,13 +642,19 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			// What the verdict costs — a writer, a re-await, nothing — is the
 			// dispatcher's call, and it toasts that itself. This one only says the
 			// verdict left this session.
-			notify(
-				ctx,
-				`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} → Feature ${owner.name}: dispatched by ` +
-					`/orchestrate. This session stays idle.`,
-			);
+			if (!repeatOfRefusal) {
+				notify(
+					ctx,
+					`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} → Feature ${owner.name}: dispatched by ` +
+						`/orchestrate. This session stays idle.`,
+				);
+			}
+			// Dispatch decides whether the verdict was consumed. Marking it first
+			// is F4: a `refuse` while a fixer holds the chain lock threw the
+			// finding away, and the waiter never re-emits it.
+			let action: unknown;
 			try {
-				await onFeatureActionable(ctx, owner, {
+				action = await onFeatureActionable(ctx, owner, {
 					pr,
 					next: hit.lastNext,
 					output: hit.verdict ?? "",
@@ -641,15 +662,31 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				});
 			} catch (err) {
 				// A failed dispatch is reported, never converted into a parent turn:
-				// the session that holds the latch is still not the fixer.
+				// the session that holds the latch is still not the fixer. The
+				// verdict stays on disk so a later attempt can still find it.
+				lastRefusedFingerprint = fp;
 				notify(
 					ctx,
 					`pr-latch: dispatching ${prLinkLabel(latch)} ${hit.lastNext} to Feature ${owner.name} failed ` +
 						`(${String(err)}). Run /orchestrate resume ${owner.name}.`,
 				);
+				return;
 			}
+			if (!isAcceptedFeaturePrAction(action)) {
+				// Refused: leave every file undelivered. The reconciler and the next
+				// watch tick both retry it once the writer that holds the Feature is
+				// done. `lastActionableFingerprint` stays unset so that retry works.
+				lastRefusedFingerprint = fp;
+				return;
+			}
+			lastActionableFingerprint = fp;
+			lastRefusedFingerprint = undefined;
+			for (const path of candidates) markVerdictDelivered(path);
 			return;
 		}
+		// Solo: this session is the fixer, so the wake itself is the delivery.
+		lastActionableFingerprint = fp;
+		for (const path of candidates) markVerdictDelivered(path);
 		wakeParent(ctx, actionableResumeText(latch, hit.lastNext, hit.verdict));
 	}
 
