@@ -68,6 +68,64 @@ export function statusValue(text: string, key: string): string | undefined {
 	return v && v !== "none" ? v : undefined;
 }
 
+/**
+ * Apply `key: value` updates to a status.md, preserving everything else.
+ *
+ * The reader stopped being a regex; this is its counterpart. The writer built
+ * `new RegExp("^(" + key + ":\\s*).+$", "m")` per field per call and did
+ * surgery on the text — so a value containing `$1` was interpolated by
+ * `String.replace`, a field whose current value was empty did not match `.+`
+ * and got silently duplicated at the top instead of updated, and reader and
+ * writer could disagree about what counted as a field.
+ *
+ * Only the field block is touched. Everything from the first `##` heading on —
+ * the Tasks table, and any notes appended after it — is carried through
+ * verbatim, as are comments, blank lines, and field order.
+ */
+export function writeStatusFields(
+	text: string,
+	updates: Iterable<readonly [string, string]>,
+): string {
+	const lines = text.split("\n");
+	// The field block ends at the first `##`; `# Status` is the title.
+	let tailAt = lines.findIndex((l) => l.trim().startsWith("##"));
+	if (tailAt < 0) tailAt = lines.length;
+
+	const pending = new Map<string, string>();
+	for (const [k, v] of updates) pending.set(k.trim().toLowerCase(), v);
+
+	const head = lines.slice(0, tailAt);
+	let lastFieldAt = -1;
+	for (let i = 0; i < head.length; i++) {
+		const line = head[i]!;
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(">") || trimmed.startsWith("|")) {
+			continue;
+		}
+		const at = trimmed.indexOf(":");
+		if (at <= 0) continue;
+		const key = trimmed.slice(0, at).trim().toLowerCase();
+		if (!key || key.includes(" ")) continue;
+		lastFieldAt = i;
+		// First occurrence wins, matching `parseStatusFields`. A duplicate key
+		// further down is stale and must not be the one that gets updated.
+		if (pending.has(key)) {
+			head[i] = `${key}: ${pending.get(key)}`;
+			pending.delete(key);
+		}
+	}
+
+	// Anything still pending is a new field. Append it to the end of the block,
+	// not the top: the seeded order is the order a human reads.
+	if (pending.size) {
+		const added = [...pending].map(([k, v]) => `${k}: ${v}`);
+		const at = lastFieldAt >= 0 ? lastFieldAt + 1 : Math.min(1, head.length);
+		head.splice(at, 0, ...added);
+	}
+
+	return [...head, ...lines.slice(tailAt)].join("\n");
+}
+
 /* ------------------------------------------------------------------ *
  * The phases
  * ------------------------------------------------------------------ */

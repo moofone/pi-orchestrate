@@ -51,6 +51,7 @@ import {
   landFailedAlreadyMerged,
   listFeaturePrOwners,
   MECHANICAL,
+  parseKeyedTokens,
   printedLandCommand,
   repoKey,
   spendWaiterVerdict,
@@ -63,8 +64,9 @@ import {
   formatTransitionLogLine,
   isInterruption,
   readPhase as readFeaturePhase,
+  writeStatusFields,
   resumePhase,
-  statusField as readStatusField,
+  statusField,
   transitionRefusal as phaseTransitionRefusal,
   type FeaturePhase,
   type FeaturePhase as Phase,
@@ -92,20 +94,6 @@ export function worktreeFarmFor(repo: string): string {
   const farm = REPO_TO_WT_ROOT[repo] ?? `${repo}-wt`;
   return join(REF_ROOT, farm);
 }
-const KEYWORDS = new Set([
-  "approve",
-  "implement",
-  "tdd",
-  "resume",
-  "pause",
-  "status",
-  "show",
-  "qa",
-  "review",
-  "pr",
-  "archive",
-  "help",
-]);
 export const GIT_WORKFLOW_SKILL = "/Users/greg/.grok/skills/git-workflow/SKILL.md";
 
 export const FORBIDDEN = [
@@ -414,10 +402,6 @@ function rebindToFeatureDir(paths: Paths, dir: string): Paths {
   return bindFeature(paths, dir);
 }
 
-function resolveLiveDir(paths: Paths): string {
-  return paths.featureDir;
-}
-
 /** Rename pending-* (or any pre-name folder) → <name>/. No current/ symlink. */
 function promoteLiveFolder(paths: Paths, name: string): string {
   if (!name || isPendingToken(name) || isReservedName(name)) {
@@ -446,27 +430,6 @@ function upsertHeader(plan: string, key: string, value: string): string {
     return plan.replace(/^(#\s+.+)$/m, `$1\n\n> ${key}: ${value}`);
   }
   return `> ${key}: ${value}\n${plan}`;
-}
-
-function featureDisplayName(plan: string): string {
-  const name = planHeaderField(plan, "Name");
-  if (!isPendingToken(name)) return name;
-  const title = featureTitle(plan, "");
-  if (!isPlaceholderTitle(title)) return title;
-  return "unnamed";
-}
-
-/**
- * One `key: value` from a status.md.
- *
- * The body moved to `lib/feature-state.ts` and stopped being a regex. It used
- * to build `new RegExp("^" + key + ":\\s*(.*)$", "im")` on every call — an
- * unescaped key interpolated into a pattern, a fresh compile per field, and a
- * definition that disagreed with pr-await-core's copy about case, about empty
- * values, and about `none`. Both now call the same parser.
- */
-function statusField(text: string, key: string): string {
-  return readStatusField(text, key);
 }
 
 function isPaused(status: string): boolean {
@@ -2478,10 +2441,13 @@ export function upsertStatusFile(
       "",
     ].join("\n");
   }
+  // Collected, then applied in one structured pass. The old per-field
+  // `new RegExp` + `String.replace` interpolated `$1` out of any value that
+  // contained it, and `.+` failed to match a field whose current value was
+  // empty — which duplicated the field at the top instead of updating it.
+  const pending: Array<[string, string]> = [];
   const setField = (key: string, value: string) => {
-    const re = new RegExp(`^(${key}:\\s*).+$`, "m");
-    if (re.test(text)) text = text.replace(re, `$1${value}`);
-    else text = text.replace(/^(# Status\n)/, `$1${key}: ${value}\n`);
+    pending.push([key, value]);
   };
   setField("repo", paths.repo);
   setField("plan", patch.planPath ?? paths.planFile);
@@ -2527,6 +2493,11 @@ export function upsertStatusFile(
       text += `\n## Tasks\n\n${table}\n`;
     }
   }
+  // One structured pass over the field block, after the Tasks table has been
+  // rebuilt — `writeStatusFields` leaves everything from the first `##` on
+  // untouched, so the order does not matter, but doing it last keeps the
+  // field-block edit adjacent to the write it produces.
+  text = writeStatusFields(text, pending);
   const next = text.endsWith("\n") ? text : `${text}\n`;
   writeText(paths.statusFile, next);
   syncOverlayTodosFromPaths(paths, next);
@@ -2844,25 +2815,6 @@ export function subagentToolGuard(event: {
   }
   return undefined;
 }
-
-/** Evidence the worker must return when a Task carries no host-runnable gate. */
-/**
- * `level: "checked"` grades the child on its own report: `runStructuralChecks`
- * asks only whether each kind is present in the text the child wrote, and
- * answers "evidence missing from child report" when it is not.
- *
- * `no-staged-files` is the one kind wired to something real — it runs
- * `git status --short` in the child's cwd, which is the Task worktree. It is
- * listed here so every Task carries at least one check the child cannot
- * satisfy by writing a sentence about itself.
- */
-const ACCEPTANCE_EVIDENCE = [
-  "changed-files",
-  "tests-added",
-  "commands-run",
-  "residual-risks",
-  "no-staged-files",
-] as const;
 
 interface RpcReply {
   success?: boolean;
@@ -3707,9 +3659,24 @@ export const PR_AWAIT_CALL_TIMEOUT_MS = 60_000;
  */
 export const AWAIT_DISPATCH_MAX_DEPTH = 2;
 
+/**
+ * The **last** `key=` in the text, matched case-insensitively.
+ *
+ * Deliberately not `parseField`, which takes the first and is case-sensitive.
+ * A `git pr-await` handshake prints its top-level fields and then, on an
+ * actionable verdict, the reviewer body beneath them — which repeats `next=`.
+ * The dispatcher wants the verdict the waiter just reached, so it reads the
+ * last one. Both now tokenise with `parseKeyedTokens`, so they agree about
+ * where a token starts and ends; only the choice of occurrence differs, and
+ * that difference is the point.
+ */
 export function parseKeyedField(text: string, key: string): string {
-  const matches = [...text.matchAll(new RegExp(`\\b${key}=([^\\s]+)`, "gi"))];
-  return matches.length ? (matches[matches.length - 1]?.[1] ?? "").trim() : "";
+  const want = key.toLowerCase();
+  let found = "";
+  for (const [k, v] of parseKeyedTokens(text)) {
+    if (k.toLowerCase() === want) found = v;
+  }
+  return found.trim();
 }
 
 interface PrAwaitOutcome {

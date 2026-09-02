@@ -368,10 +368,44 @@ export function prLinkLabel(s: Partial<LatchState>): string {
 	return url ? osc8Link(url, label) : label;
 }
 
-/** `(?:^|\\s)` is load-bearing: do not match a longer key ending in `field`. */
+/**
+ * Every `key=value` token in a waiter's output, in document order.
+ *
+ * The waiter prints whitespace-separated `key=value` — one per line for the
+ * top-level fields, several per line for `comment bot=… path=… line=…`. Two
+ * regexes used to parse it, one here and one in orchestrate.ts, and they
+ * disagreed: this one took the *first* match and was case-sensitive, the other
+ * took the *last* and was not. Same format, two answers, which is the bug that
+ * `statusValue` had before it was unified.
+ *
+ * Tokenising once fixes the disagreement about what a token *is*. Which
+ * occurrence wins stays a decision each caller makes explicitly below, because
+ * there the difference is real: a verdict body embedded under the top-level
+ * fields repeats keys, and whether the newest or the outermost is authoritative
+ * depends on the key.
+ */
+export function parseKeyedTokens(text: string): Array<[string, string]> {
+	const out: Array<[string, string]> = [];
+	for (const token of String(text ?? "").split(/\s+/)) {
+		const at = token.indexOf("=");
+		if (at <= 0) continue;
+		out.push([token.slice(0, at), token.slice(at + 1)]);
+	}
+	return out;
+}
+
+/**
+ * The **first** `field=` in the text, matched case-sensitively.
+ *
+ * Splitting on whitespace is what the old `(?:^|\s)` prefix bought: a longer
+ * key ending in `field` (`prev_cursor=` for `cursor=`) is a different token and
+ * cannot match.
+ */
 export function parseField(text: string, field: string): string | undefined {
-	const m = text.match(new RegExp(`(?:^|\\s)${field}=([^\\s]+)`));
-	return m?.[1];
+	for (const [key, value] of parseKeyedTokens(text)) {
+		if (key === field) return value;
+	}
+	return undefined;
 }
 
 export function parseAwaitCall(command: string): { pr: string; cursor?: string } | undefined {

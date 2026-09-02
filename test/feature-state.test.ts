@@ -36,6 +36,7 @@ import {
   statusField,
   statusValue,
   transitionRefusal,
+  writeStatusFields,
   type FeaturePhase,
 } from "../src/lib/feature-state.ts";
 
@@ -275,6 +276,82 @@ test("chaos: `none` is absent for statusValue and present for statusField", () =
     }),
     RUNS,
   );
+});
+
+/* ================================================================== *
+ * 2b. The writer — the counterpart to the parser
+ * ================================================================== */
+
+test("chaos: anything written reads back, and nothing else moves", () => {
+  const keyArb = fc.stringMatching(/^[a-z][a-z0-9_]{0,20}$/);
+  const valueArb = fc.string({ maxLength: 120 }).map((v) => v.replace(/[\r\n]/g, " ").trim());
+
+  fc.assert(
+    fc.property(keyArb, valueArb, valueArb, (key, before, after) => {
+      const tail = "## Tasks\n\n| id | t | s | h |\n|--|--|--|--|\n| 1 | x: y | done | none |\n";
+      const doc = `# Status\n\nrepo: icemining\n${key}: ${before}\nphase: pr\n\n${tail}`;
+      const out = writeStatusFields(doc, [[key, after]]);
+
+      assert.equal(statusField(out, key), after, "the written value must read back");
+      assert.equal(statusField(out, "repo"), "icemining", "neighbours are untouched");
+      assert.equal(readPhase(out), "pr");
+      assert.ok(out.includes(tail), "everything from `## Tasks` on is carried through verbatim");
+      return true;
+    }),
+    RUNS,
+  );
+});
+
+test("a value containing $1 is written literally, not interpolated", () => {
+  // `String.replace` expands `$1`/`$&` in the replacement. The old writer built
+  // the replacement by interpolation, so a next_action mentioning `$1` — or a
+  // branch name, or a git error quoted verbatim — came out mangled.
+  const doc = "# Status\n\nnext_action: none\n\n## Tasks\n";
+  for (const value of ["$1 and $& and $$", "cost $1000", "$`weird$'"]) {
+    const out = writeStatusFields(doc, [["next_action", value]]);
+    assert.equal(statusField(out, "next_action"), value, `mangled: ${value}`);
+  }
+});
+
+test("a field whose current value is empty is updated, not duplicated", () => {
+  // The old pattern was `^(key:\s*).+$` — `.+` needs at least one character,
+  // so an empty field did not match and the writer inserted a second copy at
+  // the top. `parseStatusFields` takes the first occurrence, so the stale
+  // empty one won and the write was silently lost.
+  const doc = "# Status\n\nfeature: \nphase: planning\n\n## Tasks\n";
+  const out = writeStatusFields(doc, [["feature", "the-name"]]);
+  assert.equal(statusField(out, "feature"), "the-name");
+  assert.equal(
+    out.split("\n").filter((l) => l.startsWith("feature:")).length,
+    1,
+    "one field, not two",
+  );
+});
+
+test("a new field is appended to the block, and an absent block is created", () => {
+  const doc = "# Status\n\nrepo: icemining\n\n## Tasks\n";
+  const out = writeStatusFields(doc, [["phase_prev", "pr"]]);
+  assert.equal(statusField(out, "phase_prev"), "pr");
+  assert.ok(out.indexOf("phase_prev:") < out.indexOf("## Tasks"), "inside the field block");
+
+  const bare = writeStatusFields("# Status\n", [["phase", "planning"]]);
+  assert.equal(readPhase(bare), "planning");
+});
+
+test("a colon-bearing Tasks row is never mistaken for a field to update", () => {
+  const doc = [
+    "# Status",
+    "",
+    "phase: implementing",
+    "",
+    "## Tasks",
+    "",
+    "| id | title | status | handoff |",
+    "| 1 | phase: done | pending | none |",
+  ].join("\n");
+  const out = writeStatusFields(doc, [["phase", "pr"]]);
+  assert.equal(readPhase(out), "pr");
+  assert.ok(out.includes("| 1 | phase: done | pending | none |"), "the row is untouched");
 });
 
 /* ================================================================== *

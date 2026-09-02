@@ -5199,7 +5199,7 @@ test("P3 F11: an uncommitted Task is committed by code, not counted as done", as
 });
 
 test("P3 F11: a commit that does not clear the tree blocks instead of reporting success", async () => {
-  const pi = makeFakePi(async (cmd, args) => {
+  const pi = makeFakePi(async (_cmd, args) => {
     const a = args ?? [];
     if (a[0] === "status") return { code: 0, stdout: " M src/a.ts", stderr: "" };
     if (a[0] === "commit") return { code: 1, stdout: "", stderr: "nothing to commit, hook failed" };
