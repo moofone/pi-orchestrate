@@ -20,6 +20,7 @@ import fc from "fast-check";
 import {
   FEATURE_PHASES,
   INITIAL_PHASE,
+  INTERRUPTION_PHASES,
   LEGACY_PHASE_ALIASES,
   PHASE_TRANSITIONS,
   TERMINAL_PHASES,
@@ -29,6 +30,7 @@ import {
   parsePhase,
   parseStatusFields,
   readPhase,
+  resumePhase,
   statusField,
   statusValue,
   transitionRefusal,
@@ -302,6 +304,70 @@ test("chaos: every legacy alias resolves to a real phase, and none is itself one
     );
     assert.equal(parsePhase(alias), canonical);
   }
+});
+
+/* ================================================================== *
+ * 3b. Interruptions and resume
+ * ================================================================== */
+
+const statusDoc = (fields: Record<string, string>) =>
+  ["# Status", "", ...Object.entries(fields).map(([k, v]) => `${k}: ${v}`), ""].join("\n");
+
+test("chaos: pause-then-resume returns to the phase that was suspended", () => {
+  fc.assert(
+    fc.property(
+      phase().filter((p) => !INTERRUPTION_PHASES.has(p) && !TERMINAL_PHASES.has(p)),
+      fc.constantFrom<FeaturePhase>("paused", "blocked"),
+      (working, interruption) => {
+        const doc = statusDoc({ phase: interruption, phase_prev: working });
+        assert.equal(
+          resumePhase(doc),
+          working,
+          `${interruption} recorded ${working} but resumed elsewhere`,
+        );
+        // And the move it proposes is one the machine will actually accept.
+        assert.ok(canTransition(interruption, resumePhase(doc)!));
+        return true;
+      },
+    ),
+    RUNS,
+  );
+});
+
+test("chaos: a resume target is never trusted blindly", () => {
+  fc.assert(
+    fc.property(fc.string({ maxLength: 30 }), phase(), (junk, current) => {
+      // Garbage, an interruption resuming into an interruption, and a Feature
+      // that is not interrupted at all must all decline to answer — the caller
+      // falls back to deriving, which is the old behaviour and is safe.
+      const withJunk = statusDoc({ phase: "paused", phase_prev: junk });
+      const answer = resumePhase(withJunk);
+      if (answer !== undefined) {
+        assert.ok(isFeaturePhase(answer), `resumed into "${answer}"`);
+        assert.equal(INTERRUPTION_PHASES.has(answer), false, "an interruption is not a resume target");
+      }
+      if (!INTERRUPTION_PHASES.has(current)) {
+        assert.equal(
+          resumePhase(statusDoc({ phase: current, phase_prev: "implementing" })),
+          undefined,
+          "a Feature that is not interrupted has nothing to resume",
+        );
+      }
+      return true;
+    }),
+    RUNS,
+  );
+});
+
+test("chaos: a missing or terminal phase_prev declines rather than guessing", () => {
+  assert.equal(resumePhase(statusDoc({ phase: "paused" })), undefined);
+  assert.equal(resumePhase(statusDoc({ phase: "paused", phase_prev: "none" })), undefined);
+  assert.equal(resumePhase(statusDoc({ phase: "blocked", phase_prev: "paused" })), undefined);
+  // `done` is a legal target from an interruption (archiving a paused Feature),
+  // so it is offered — the caller decides, and the machine permits the move.
+  assert.equal(resumePhase(statusDoc({ phase: "paused", phase_prev: "done" })), "done");
+  // A legacy spelling still resolves.
+  assert.equal(resumePhase(statusDoc({ phase: "paused", phase_prev: "qa" })), "feature-qa");
 });
 
 /* ================================================================== *

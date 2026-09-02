@@ -61,7 +61,9 @@ import {
 import {
   TRANSITIONS_LOG as TRANSITIONS_LOG_NAME,
   formatTransitionLogLine,
+  isInterruption,
   readPhase as readFeaturePhase,
+  resumePhase,
   statusField as readStatusField,
   transitionRefusal as phaseTransitionRefusal,
   type FeaturePhase as Phase,
@@ -2374,6 +2376,8 @@ export function upsertStatusFile(
   paths: Paths,
   patch: {
     phase?: FeaturePhase;
+    /** Phase an interruption suspended; `none` clears it. See `resumePhase`. */
+    phasePrev?: string;
     activeTask?: string;
     missionId?: string;
     workerRunId?: string;
@@ -2430,6 +2434,15 @@ export function upsertStatusFile(
       // waiter handshake, and a line per poll would bury the moves that matter.
       // What changed on a self-transition is `next_action`, which is written.
       appendTransitionLog(paths, from, patch.phase, patch.nextAction ?? "");
+      // An interruption records what it suspended, so `resume` can put the
+      // Feature back rather than re-deriving a phase from the Task list — which
+      // is wrong for exactly the Features whose work is not a Task any more.
+      // Leaving one clears it: a stale `phase_prev` is worse than none.
+      if (isInterruption(patch.phase) && !isInterruption(from)) {
+        patch = { ...patch, phasePrev: from ?? "none" };
+      } else if (!isInterruption(patch.phase)) {
+        patch = { ...patch, phasePrev: "none" };
+      }
     }
   }
   if (!text.trim()) {
@@ -2444,6 +2457,7 @@ export function upsertStatusFile(
       "branch: pending",
       "worktree: none",
       "phase: planning",
+      "phase_prev: none",
       "active_task: none",
       "mission_id: none",
       "worker_run_id: none",
@@ -2479,6 +2493,7 @@ export function upsertStatusFile(
   if (patch.branch !== undefined) setField("branch", patch.branch);
   if (patch.worktree !== undefined) setField("worktree", patch.worktree);
   if (patch.phase) setField("phase", patch.phase);
+  if (patch.phasePrev !== undefined) setField("phase_prev", patch.phasePrev);
   if (patch.activeTask !== undefined) setField("active_task", patch.activeTask);
   if (patch.missionId !== undefined) setField("mission_id", patch.missionId);
   if (patch.workerRunId !== undefined) setField("worker_run_id", patch.workerRunId);
@@ -6629,8 +6644,29 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       if (verb === "resume") {
         const feat = selectFeature(paths, ctx, rest, "resume");
         if (!feat) return;
+        // Where the interruption suspended this Feature, when it recorded it.
+        // Read before `pause: off`, which does not move the phase but is the
+        // kind of write that makes ordering easy to get wrong later.
+        const restore = resumePhase(readText(feat.statusFile));
         upsertStatusFile(feat, { pause: "off" });
-        uiNotify(ctx, `Resuming auto loop (Tasks → git-workflow PR)`, "info");
+
+        // A Feature interrupted at `pr` has every Task done, so deriving its
+        // phase from the plan sends it back through the implementation chain
+        // — past a PR that is already open. The PR phase has an owner; hand it
+        // back to that owner instead.
+        if (restore === "pr") {
+          uiNotify(ctx, `Resuming ${basename(feat.featureDir)} at its open PR`, "info");
+          upsertStatusFile(feat, { phase: "pr", nextAction: "resumed — reconciling the PR" });
+          await reconcileLiveFeaturePrs(pi, ctx);
+          return;
+        }
+        uiNotify(
+          ctx,
+          restore
+            ? `Resuming ${basename(feat.featureDir)} at ${restore} (Tasks → git-workflow PR)`
+            : `Resuming auto loop (Tasks → git-workflow PR)`,
+          "info",
+        );
         await beginImplementation(pi, ctx, feat);
         return;
       }

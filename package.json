@@ -2,7 +2,7 @@
   "name": "pi-orchestrate",
   "version": "0.0.0",
   "private": true,
-  "description": "Pi /orchestrate — Feature → Tasks, one Feature PR, git-workflow latch.",
+  "description": "Pi /orchestrate \u2014 Feature \u2192 Tasks, one Feature PR, git-workflow latch.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -11,7 +11,9 @@
   ],
   "type": "module",
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
   },
   "pi": {
     "extensions": [
@@ -28,6 +30,7 @@
     "@earendil-works/pi-coding-agent": "^0.84.4",
     "@earendil-works/pi-tui": "^0.84.4",
     "@types/node": "^26.4.0",
-    "fast-check": "^4.9.0"
+    "fast-check": "^4.9.0",
+    "typescript": "^7.0.2"
   }
 }

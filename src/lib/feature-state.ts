@@ -138,6 +138,43 @@ export function readPhase(status: string): FeaturePhase | undefined {
 export const TERMINAL_PHASES: ReadonlySet<FeaturePhase> = new Set<FeaturePhase>(["done"]);
 
 /**
+ * Interruptions rather than stages: a Feature in one of these is not doing
+ * anything, and the interesting question is where it was when it stopped.
+ */
+export const INTERRUPTION_PHASES: ReadonlySet<FeaturePhase> = new Set<FeaturePhase>([
+	"paused",
+	"blocked",
+]);
+
+export function isInterruption(phase: FeaturePhase | undefined): boolean {
+	return phase !== undefined && INTERRUPTION_PHASES.has(phase);
+}
+
+/** status.md field holding the phase an interruption suspended. */
+export const PHASE_PREV_FIELD = "phase_prev";
+
+/**
+ * Where a paused or blocked Feature should go back to.
+ *
+ * `resume` used to re-derive this from the plan — walk the Tasks, see what is
+ * unfinished, and infer a phase. That works while the answer is a Task, and
+ * quietly does the wrong thing when it is not: a Feature interrupted at `pr`
+ * has every Task done, so re-derivation sends it back through the
+ * implementation chain instead of to the PR it already has open.
+ *
+ * `undefined` means the record is missing, unparseable, or names a move that
+ * is no longer legal — in which case the caller should fall back to deriving,
+ * not trust a stale value.
+ */
+export function resumePhase(status: string): FeaturePhase | undefined {
+	const current = readPhase(status);
+	if (!isInterruption(current)) return undefined;
+	const prev = parsePhase(statusValue(status, PHASE_PREV_FIELD));
+	if (!prev || isInterruption(prev)) return undefined;
+	return canTransition(current, prev) ? prev : undefined;
+}
+
+/**
  * Which moves are legal, and only those.
  *
  * Self-transitions are legal wherever the phase is a loop the chain really runs
