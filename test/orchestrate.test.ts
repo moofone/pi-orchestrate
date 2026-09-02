@@ -22,6 +22,7 @@ import * as orch from "../src/orchestrate.ts";
 import { registerLatchArm } from "../src/lib/pr-await-core.ts";
 
 const ORCH_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/orchestrate.ts");
+const LIFECYCLE_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/lib/lifecycle.ts");
 
 const RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
@@ -5279,7 +5280,7 @@ test("P3 F12: the QA cap is two passes, so QA's own remediation Tasks get review
   assert.equal(orch.clampedQaPassCap(9), 2, "MAX_QA_PASS_CAP still bounds it");
   assert.equal(orch.clampedQaPassCap(0), 0, "an explicit 0 opts out of QA entirely");
   assert.match(
-    readFileSync(ORCH_SRC, "utf8"),
+    readFileSync(LIFECYCLE_SRC, "utf8"),
     /const DEFAULT_QA_PASS_CAP = 2;/,
     "the seeded qa_pass_cap in a new status.md follows the default",
   );

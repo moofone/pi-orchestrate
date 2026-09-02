@@ -51,7 +51,7 @@ import {
   landFailedAlreadyMerged,
   listFeaturePrOwners,
   MECHANICAL,
-  parseKeyedTokens,
+  parseKeyedField,
   printedLandCommand,
   repoKey,
   spendWaiterVerdict,
@@ -71,12 +71,49 @@ import {
   type FeaturePhase,
   type FeaturePhase as Phase,
 } from "./lib/feature-state.ts";
+import {
+  DEFAULT_QA_PASS_CAP,
+  needsFeatureQa,
+  needsPlanReview,
+  planReviewReconcile,
+  planReviewState,
+  qaPassState,
+  writerBlockedByPlanReview,
+} from "./lib/lifecycle.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
 import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
+import { projectOverlayTodos, type OverlayTodoState } from "./lib/overlay.ts";
+import {
+  classifyFeaturePrNext,
+  fixSpawnCount,
+  fixerPushState,
+  fixerSettleAction,
+  type FeaturePrAction,
+} from "./lib/feature-pr.ts";
+import {
+  featureTitle,
+  isApproved,
+  isDraft,
+  isPendingToken,
+  MAX_TASKS,
+  parseTasks,
+  PENDING_TOKEN,
+  planHeaderField,
+  planHeaderStatus,
+  planRepoName,
+  reopenTasksThatNeverStarted,
+  setTaskHandoffInPlan,
+  setTaskStatusInPlan,
+  taskCountError,
+  taskGateCommand,
+  taskSection,
+  type Task,
+} from "./lib/plan-tasks.ts";
 
 // The latch reads Feature ownership from the same helper; re-exported here so
 // the dispatcher has one public surface and the latch never imports this file.
 export { findFeatureOwningPr };
+export { parseKeyedField };
 export type { FeaturePrOwner } from "./lib/pr-await-core.ts";
 
 const ORCH_ROOT = join(homedir(), "orchestrator");
@@ -122,14 +159,6 @@ interface Paths {
 }
 
 const RESERVED_NAMES = new Set(["current", "archive", "pending"]);
-
-interface Task {
-  id: string;
-  title: string;
-  status: string;
-  /** Planner/parent judgment. Most Tasks are simple. critical = extra risk. */
-  complexity?: "simple" | "critical";
-}
 
 const WORKERS = {
   simple: {
@@ -250,7 +279,6 @@ function utcStamp(): string {
 const NAME_MAX = 36;
 const PLACEHOLDER_TITLE =
   /^(?:\(planning\)|planning|untitled|\(untitled\)|\(draft\)|draft)$/i;
-const PENDING_TOKEN = /^(?:pending|none|tbd|todo|)$/i;
 
 function slug(text: string, max = NAME_MAX): string {
   const s = text
@@ -262,10 +290,6 @@ function slug(text: string, max = NAME_MAX): string {
   const cut = s.slice(0, max);
   const i = cut.lastIndexOf("-");
   return (i >= 12 ? cut.slice(0, i) : cut).replace(/-+$/g, "") || "feature";
-}
-
-function isPendingToken(value: string): boolean {
-  return PENDING_TOKEN.test(value.trim());
 }
 
 /**
@@ -437,12 +461,6 @@ function isPaused(status: string): boolean {
   return v === "after-task" || v === "on" || v === "yes" || v === "paused";
 }
 
-/**
- * QA → fix → QA → fix → PR. Cap 1 meant the remediation Tasks QA itself asked
- * for were implemented and then never looked at again; the second pass is what
- * checks QA's own fixes (F12). `MAX_QA_PASS_CAP` is the ceiling.
- */
-const DEFAULT_QA_PASS_CAP = 2;
 const DEFAULT_AUTO_ADVANCE_ON_LANDED = true;
 const SIDECAR_PATH = join(dirname(fileURLToPath(import.meta.url)), "orchestrate.json");
 
@@ -855,92 +873,6 @@ function presentDraftApproveCards(
   }
 }
 
-export function clampedQaPassCap(raw: number): number {
-  if (!Number.isFinite(raw) || raw < 0) return DEFAULT_QA_PASS_CAP;
-  return Math.min(MAX_QA_PASS_CAP, Math.floor(raw));
-}
-
-function qaPassState(status: string): { pass: number; cap: number } {
-  const pass = Number.parseInt(statusField(status, "qa_pass") || "0", 10);
-  const rawCap = Number.parseInt(
-    statusField(status, "qa_pass_cap") || String(DEFAULT_QA_PASS_CAP),
-    10,
-  );
-  return {
-    pass: Number.isFinite(pass) && pass > 0 ? pass : 0,
-    cap: clampedQaPassCap(Number.isFinite(rawCap) ? rawCap : DEFAULT_QA_PASS_CAP),
-  };
-}
-
-export function taskCountError(n: number): string | undefined {
-  if (n > MAX_TASKS) return `Plan has ${n} Tasks; cap is ${MAX_TASKS}. Split the Feature.`;
-  return undefined;
-}
-
-function needsFeatureQa(status: string): boolean {
-  const { pass, cap } = qaPassState(status);
-  return pass < cap;
-}
-
-export type PlanReviewState = "none" | "running" | "done" | "failed";
-
-/** Durable plan-reviewer gate. Missing field on old status.md is `none`. */
-export function planReviewState(status: string): PlanReviewState {
-  const raw = statusField(status, "plan_review").toLowerCase();
-  if (raw === "running" || raw === "in_progress") return "running";
-  if (raw === "done" || raw === "complete" || raw === "completed") return "done";
-  if (raw === "failed" || raw === "error") return "failed";
-  return "none";
-}
-
-/**
- * True when implementation must not start yet: plan-reviewer has not finished,
- * and this Feature has not already passed that gate (a Task is in flight / done,
- * or the chain is already implementing).
- */
-export function needsPlanReview(plan: string, status: string): boolean {
-  if (planReviewState(status) === "done") return false;
-  const tasks = parseTasks(plan);
-  if (tasks.some((t) => t.status !== "pending")) return false;
-  const phase = statusField(status, "phase").toLowerCase();
-  if (phase === "implementing" || phase === "feature-qa" || phase === "pr") {
-    return false;
-  }
-  return true;
-}
-
-/** Hard overlap guard: a writer must not spawn while plan-reviewer is live. */
-export function writerBlockedByPlanReview(status: string): string | undefined {
-  if (planReviewState(status) === "running") {
-    return "plan-reviewer still running; refusing writer";
-  }
-  return undefined;
-}
-
-export type PlanReviewReconcile = "keep" | "wait" | "done" | "failed";
-
-/**
- * What to do with a `plan_review: running` whose session may be gone (F14).
- *
- * Tasks got orphan recovery; the reviewer did not, so a plan-reviewer that
- * died with its session left the field at `running` forever — and
- * `writerBlockedByPlanReview` then refused every approve and resume, while
- * `draftApproveCards` hid the card. The Feature could not be reached at all.
- *
- * No run artifact at all is `failed`, not `wait`: this is only consulted under
- * the chain lock, so a genuinely live review is one this process is running
- * and would have recorded. A missing record means nobody is home.
- */
-export function planReviewReconcile(
-  state: PlanReviewState,
-  snapshot: RunSnapshot | undefined,
-): PlanReviewReconcile {
-  if (state !== "running") return "keep";
-  if (!snapshot) return "failed";
-  if (!snapshot.terminal) return "wait";
-  return snapshot.ok ? "done" : "failed";
-}
-
 export function worktreePathFor(branch: string, repo = "icemining"): string {
   return join(worktreeFarmFor(repo), branch.replace(/\//g, "-"));
 }
@@ -1209,7 +1141,7 @@ function discoverFeatures(paths: Paths): FeatureRow[] {
 }
 
 /** Levenshtein. Used so `failure` still binds a unique live `failover` Feature. */
-export function editDistance(a: string, b: string): number {
+function editDistance(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
@@ -1950,96 +1882,6 @@ function migrateLegacyCurrent(repoDir: string): void {
   if (!existsSync(finalDest)) renameSync(current, finalDest);
 }
 
-function planHeaderField(plan: string, name: string): string {
-  const re = new RegExp(`^>\\s*${name}:\\s*(.+)$`, "im");
-  return (plan.match(re)?.[1] ?? "").trim();
-}
-
-function planHeaderStatus(plan: string): string {
-  return planHeaderField(plan, "Status");
-}
-
-function featureTitle(plan: string, fallback: string): string {
-  const labeled = plan.match(/^#\s+(?:Feature|Plan):\s*(.+)$/m);
-  if (labeled?.[1]) return labeled[1].trim();
-  const bare = plan.match(/^#\s+(?!#{1,}|Status\b)(.+)$/m);
-  return (bare?.[1] ?? fallback).trim();
-}
-
-function isApproved(plan: string): boolean {
-  const s = planHeaderStatus(plan).toLowerCase();
-  return s.startsWith("approved") || s.includes("approved");
-}
-
-function isDraft(plan: string): boolean {
-  const s = planHeaderStatus(plan).toLowerCase();
-  return !s || s.startsWith("draft") || s.includes("awaiting");
-}
-
-/**
- * Separator after `Task N`. The planner template uses an em dash; models
- * often write a colon (`### Task 1: title`). Hyphen, en dash, and a trailing
- * period are the other forms that have shown up. A numbered list under
- * `## Tasks` is still not a heading.
- */
-const TASK_SEP = "[—–:.-]";
-
-export function parseTasks(plan: string): Task[] {
-  const tasks: Task[] = [];
-  const header = new RegExp(
-    `^###\\s+(?:Task|Slice)\\s+(\\d+)\\s*${TASK_SEP}\\s*(.+)$`,
-    "gim",
-  );
-  const headers: Array<{ id: string; title: string; index: number }> = [];
-  let match: RegExpExecArray | null;
-  while ((match = header.exec(plan))) {
-    headers.push({ id: match[1] ?? "", title: (match[2] ?? "").trim(), index: match.index });
-  }
-  for (let i = 0; i < headers.length; i++) {
-    const header = headers[i];
-    if (!header) continue;
-    const start = header.index;
-    const end = headers[i + 1]?.index ?? plan.length;
-    const body = plan.slice(start, end);
-    const st = body.match(/-\s*Status:\s*(\w+)/i);
-    const cx = body.match(/-\s*Complexity:\s*(simple|critical|complex)\b/i);
-    const rawCx = cx?.[1]?.toLowerCase();
-    tasks.push({
-      id: header.id,
-      title: header.title,
-      status: (st?.[1] ?? "pending").toLowerCase(),
-      complexity:
-        rawCx === "critical" || rawCx === "complex"
-          ? "critical"
-          : rawCx === "simple"
-            ? "simple"
-            : undefined,
-    });
-  }
-  return tasks;
-}
-
-export type OverlayTodoStatus = "pending" | "in_progress" | "completed";
-export type OverlayTodoKind = "planner" | "plan-reviewer" | "task" | "qa";
-
-/** Reserved overlay ids so Task N keeps id N. */
-export const OVERLAY_PLANNER_ID = 1001;
-export const OVERLAY_REVIEWER_ID = 1002;
-
-export interface OverlayTodo {
-  id: number;
-  subject: string;
-  status: OverlayTodoStatus;
-  activeForm?: string;
-  blockedBy?: number[];
-  metadata?: { kind: OverlayTodoKind; taskId?: string; qaPass?: number };
-}
-
-export interface OverlayTodoState {
-  tasks: OverlayTodo[];
-  nextId: number;
-}
-
 export interface OverlayTodoSink {
   replaceState(sessionId: string, state: OverlayTodoState): void;
   getActiveRenderSession(): string;
@@ -2047,159 +1889,6 @@ export interface OverlayTodoSink {
 
 let overlaySink: OverlayTodoSink | undefined;
 let overlayPi: ExtensionAPI | undefined;
-
-function planStatusToOverlay(status: string): OverlayTodoStatus {
-  if (status === "done") return "completed";
-  if (status === "in_progress") return "in_progress";
-  return "pending";
-}
-
-function plannerOverlayStatus(
-  plan: string,
-  status: string,
-  tasks: Task[],
-  review: PlanReviewState,
-  phase: string,
-): OverlayTodoStatus {
-  if (review !== "none") return "completed";
-  if (
-    phase === "reviewing" ||
-    phase === "implementing" ||
-    phase === "feature-qa" ||
-    phase === "pr" ||
-    phase === "blocked" ||
-    phase === "paused"
-  ) {
-    return "completed";
-  }
-  if (isApproved(plan)) return "completed";
-  if (tasks.length > 0) return "completed";
-  const name = planHeaderField(plan, "Name") || statusField(status, "name");
-  if (!isPendingToken(name)) return "completed";
-  if (phase === "planning" || phase === "") return "in_progress";
-  return "pending";
-}
-
-function reviewerOverlayStatus(
-  plan: string,
-  tasks: Task[],
-  review: PlanReviewState,
-  phase: string,
-): OverlayTodoStatus {
-  if (review === "done") return "completed";
-  if (review === "running") return "in_progress";
-  if (review === "failed") return "pending";
-  if (phase === "reviewing") return "in_progress";
-  if (isApproved(plan)) return "completed";
-  if (
-    phase === "implementing" ||
-    phase === "feature-qa" ||
-    phase === "pr" ||
-    phase === "blocked" ||
-    phase === "paused"
-  ) {
-    return "completed";
-  }
-  if (tasks.some((t) => t.status === "done" || t.status === "in_progress")) return "completed";
-  return "pending";
-}
-
-/**
- * Deterministic rpiv-todo snapshot from plan.md + status.md.
- * Pipeline prefix: planner (1001), plan-reviewer (1002).
- * Task N keeps id N; feature-qa pass i is max(task id)+i. No clocks, no prompts.
- */
-export function overlayTodosFromFeature(plan: string, status: string): OverlayTodo[] {
-  const todos: OverlayTodo[] = [];
-  const used = new Set<number>();
-  const phase = statusField(status, "phase").toLowerCase();
-  const review = planReviewState(status);
-  const tasks = parseTasks(plan);
-  const hasFeature = plan.trim().length > 0;
-
-  if (hasFeature) {
-    const plannerStatus = plannerOverlayStatus(plan, status, tasks, review, phase);
-    const planner: OverlayTodo = {
-      id: OVERLAY_PLANNER_ID,
-      subject: "Planner",
-      status: plannerStatus,
-      metadata: { kind: "planner" },
-    };
-    if (plannerStatus === "in_progress") planner.activeForm = "writing Feature plan";
-    todos.push(planner);
-    used.add(OVERLAY_PLANNER_ID);
-
-    const reviewerStatus = reviewerOverlayStatus(plan, tasks, review, phase);
-    const reviewer: OverlayTodo = {
-      id: OVERLAY_REVIEWER_ID,
-      subject: "Plan reviewer",
-      status: reviewerStatus,
-      blockedBy: [OVERLAY_PLANNER_ID],
-      metadata: { kind: "plan-reviewer" },
-    };
-    if (reviewerStatus === "in_progress") reviewer.activeForm = "reviewing Feature plan";
-    todos.push(reviewer);
-    used.add(OVERLAY_REVIEWER_ID);
-  }
-
-  let prevId: number | undefined = hasFeature ? OVERLAY_REVIEWER_ID : undefined;
-  let anyTaskInProgress = false;
-
-  for (const task of tasks) {
-    const id = Number.parseInt(task.id, 10);
-    if (!Number.isInteger(id) || id < 1 || used.has(id)) continue;
-    used.add(id);
-    const overlayStatus = planStatusToOverlay(task.status);
-    if (overlayStatus === "in_progress") anyTaskInProgress = true;
-    const todo: OverlayTodo = {
-      id,
-      subject: `Task ${task.id} — ${task.title}`,
-      status: overlayStatus,
-      metadata: { kind: "task", taskId: task.id },
-    };
-    if (overlayStatus === "in_progress") todo.activeForm = `implementing Task ${task.id}`;
-    if (prevId !== undefined) todo.blockedBy = [prevId];
-    todos.push(todo);
-    prevId = id;
-  }
-
-  const { pass, cap } = qaPassState(status);
-  const maxTaskId = tasks.reduce((max, task) => {
-    const id = Number.parseInt(task.id, 10);
-    return Number.isInteger(id) && id > max ? id : max;
-  }, 0);
-  let qaPrev = prevId;
-  for (let i = 1; i <= cap; i++) {
-    const id = maxTaskId + i;
-    if (used.has(id)) continue;
-    used.add(id);
-    let overlayStatus: OverlayTodoStatus = "pending";
-    if (pass >= i) overlayStatus = "completed";
-    else if (!anyTaskInProgress && phase === "feature-qa" && pass + 1 === i) {
-      overlayStatus = "in_progress";
-    }
-    const label = cap === 1 ? "feature-qa" : `feature-qa ${i}/${cap}`;
-    const todo: OverlayTodo = {
-      id,
-      subject: label,
-      status: overlayStatus,
-      metadata: { kind: "qa", qaPass: i },
-    };
-    if (overlayStatus === "in_progress") {
-      todo.activeForm = cap === 1 ? "running feature-qa" : `running feature-qa ${i}/${cap}`;
-    }
-    if (qaPrev !== undefined) todo.blockedBy = [qaPrev];
-    todos.push(todo);
-    qaPrev = id;
-  }
-  return todos;
-}
-
-export function projectOverlayTodos(plan: string, status: string): OverlayTodoState {
-  const tasks = overlayTodosFromFeature(plan, status);
-  const maxId = tasks.reduce((max, todo) => Math.max(max, todo.id), 0);
-  return { tasks, nextId: maxId + 1 };
-}
 
 export function setOverlayTodoSink(sink: OverlayTodoSink | undefined): void {
   overlaySink = sink;
@@ -2263,29 +1952,23 @@ function syncLiveFeatureOverlay(): void {
   syncOverlayTodos(row.plan, row.status);
 }
 
-export function setTaskStatusInPlan(plan: string, id: string, status: string): string {
-  const header = new RegExp(
-    `(###\\s+(?:Task|Slice)\\s+${id}\\s*${TASK_SEP}[\\s\\S]*?-\\s*Status:\\s*)(\\w+)`,
-    "i",
-  );
-  if (!header.test(plan)) return plan;
-  return plan.replace(header, `$1${status}`);
-}
-
 /**
- * A spawn that dies before the worker starts (model parked, RPC fail) still
- * writes Status: blocked and no handoff. `/orchestrate resume` then hits the
- * blocked guard and refuses forever. No handoff = it never ran — reopen.
+ * Plan/Task parsing and mutation lives in `lib/plan-tasks.ts`: the
+ * `### Task N` parser, the status/handoff writers, the `- Command:` gate, and
+ * the plan-header readers. Re-exported here because that is where every
+ * caller already looks.
  */
-export function reopenTasksThatNeverStarted(plan: string, handoffsDir: string): string {
-  let next = plan;
-  for (const task of parseTasks(plan)) {
-    if (task.status !== "blocked") continue;
-    if (existsSync(join(handoffsDir, `task-${task.id}.md`))) continue;
-    next = setTaskStatusInPlan(next, task.id, "pending");
-  }
-  return next;
-}
+export {
+  MAX_TASKS,
+  parseTasks,
+  planRepoName,
+  reopenTasksThatNeverStarted,
+  setTaskHandoffInPlan,
+  setTaskStatusInPlan,
+  taskCountError,
+  taskGateCommand,
+  taskSection,
+} from "./lib/plan-tasks.ts";
 
 /**
  * The Feature lifecycle lives in `lib/feature-state.ts`: the phase vocabulary,
@@ -2308,6 +1991,57 @@ export {
   transitionRefusal,
   type FeaturePhase,
 } from "./lib/feature-state.ts";
+
+/**
+ * The plan-reviewer / QA-pass gates live in `lib/lifecycle.ts`: the durable
+ * `plan_review` field, the QA pass counter, and the reconcile rule for a
+ * reviewer that died with its session. Re-exported here because that is
+ * where every caller already looks.
+ */
+export {
+  MAX_QA_PASS_CAP,
+  approveBlockedByPlanReview,
+  clampedQaPassCap,
+  needsPlanReview,
+  planReviewReconcile,
+  planReviewState,
+  writerBlockedByPlanReview,
+  type PlanReviewReconcile,
+  type PlanReviewState,
+} from "./lib/lifecycle.ts";
+
+/**
+ * The deterministic rpiv-todo mapper lives in `lib/overlay.ts`: the plan.md +
+ * status.md → todo-board projection. The sink binding stays here because it
+ * needs the extension API. Re-exported here because that is where every
+ * caller already looks.
+ */
+export {
+  OVERLAY_PLANNER_ID,
+  OVERLAY_REVIEWER_ID,
+  overlayTodosFromFeature,
+  projectOverlayTodos,
+  type OverlayTodo,
+  type OverlayTodoKind,
+  type OverlayTodoState,
+  type OverlayTodoStatus,
+} from "./lib/overlay.ts";
+
+/**
+ * The Feature-PR verdict policy lives in `lib/feature-pr.ts`: the judgment
+ * `next=` → action table and the fixer-settle decision. Dispatch, branch-head
+ * reads and latch wiring stay here because they need the extension API and
+ * git. Re-exported here because that is where every caller already looks.
+ */
+export {
+  FIX_ROUND_CAP,
+  classifyFeaturePrNext,
+  fixerPushState,
+  fixerSettleAction,
+  type FeaturePrAction,
+  type FixerPushState,
+  type FixerSettle,
+} from "./lib/feature-pr.ts";
 
 /**
  * Append one line to `handoffs/transitions.log`.
@@ -2589,8 +2323,6 @@ const PLANNER_TURN_BUDGET = { maxTurns: 80, graceTurns: 15 };
 const WRITER_MAX_CONCURRENCY = 2;
 const PLANNER_MODEL = "xai/grok-4.6:high";
 export const MAX_QA_FINDINGS = 8;
-export const MAX_TASKS = 12;
-export const MAX_QA_PASS_CAP = 2;
 
 export function isAllowedPlannerModel(model: string): boolean {
   if (typeof model !== "string") return false;
@@ -3194,70 +2926,6 @@ async function runChildInPhase(
   }
 }
 
-/** The `### Task N — …` (or `### Task N: …`) block, verbatim, as the child's contract. */
-export function taskSection(plan: string, id: string): string {
-  const start = plan.search(
-    new RegExp(`^###\\s+(?:Task|Slice)\\s+${id}\\s*${TASK_SEP}`, "im"),
-  );
-  if (start < 0) return "";
-  const rest = plan.slice(start);
-  // Search from the end of this Task's own header line: trimming a single
-  // character instead would turn `### Task N` into `## Task N` and match the
-  // H2 alternative immediately.
-  const headerEnd = rest.indexOf("\n");
-  if (headerEnd < 0) return rest.trimEnd();
-  // Stop at the next Task *or* the next H2 — the last Task is followed by
-  // `## Design Decisions` / `## Out of Scope`, which are not its contract.
-  const next = rest
-    .slice(headerEnd)
-    .search(
-      new RegExp(
-        `^(?:###\\s+(?:Task|Slice)\\s+\\d+\\s*${TASK_SEP}|##\\s+(?!#))`,
-        "im",
-      ),
-    );
-  return (next < 0 ? rest : rest.slice(0, headerEnd + next)).trimEnd();
-}
-
-/**
- * A Task's own `- Command:` is its red/green command. It is handed to
- * pi-subagents as a runtime acceptance check, which runs it on the host under
- * `/bin/sh -c` and records the result as evidence, so green becomes a verified
- * fact instead of the worker's claim about itself.
- *
- * Planners write this field as prose at least as often as they write a command
- * ("red public curls first. Then:", "standalone gtest PearlGpuHotPath.* …").
- * Prose reaching the host fails the Task even when the work was correct, and
- * prose containing backticks is worse: the shell runs those spans as command
- * substitution. So only a value that is *entirely* one fenced code span counts
- * as a gate; everything else falls back to evidence-based acceptance.
- */
-const GATE_NOT_A_COMMAND = /[…]|\.\.\.|\*\*|^[([]|^[.…]+$/;
-
-export function taskGateCommand(body: string): string {
-  const line = body.match(/^-\s*Command:[ \t]*(.*)$/im);
-  if (!line) return "";
-  const raw = (line[1] ?? "").trim();
-  let cmd = "";
-  if (raw && !isPendingToken(raw)) {
-    cmd = raw.match(/^(`+)([^`]+)\1$/)?.[2]?.trim() ?? "";
-  } else {
-    // Planner template: `- Command:` then a fenced block. Missing that skipped
-    // the host gate and injected "Write your findings" — Luna then reread + git status.
-    const after = body.slice((line.index ?? 0) + line[0].length);
-    cmd = (after.match(/^\s*```[^\n]*\n([\s\S]*?)\n```/)?.[1] ?? "").trim().replace(/\n+/g, " ");
-  }
-  if (!cmd || cmd.includes("`")) return "";
-  if (GATE_NOT_A_COMMAND.test(cmd)) return "";
-  if (!/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*[A-Za-z0-9_./-]+(?:\s|$)/.test(cmd)) return "";
-  return cmd;
-}
-
-/** Plan header `> Repo: coins-minimal` — not the orchestrator folder name. */
-export function planRepoName(plan: string): string {
-  return (plan.match(/^>\s*Repo:\s*([A-Za-z0-9._-]+)\s*$/m)?.[1] ?? "").trim();
-}
-
 function taskScalar(body: string, name: string): string {
   const raw = (body.match(new RegExp(`^-\\s*${name}:\\s*(.+)\\s*$`, "im"))?.[1] ?? "").trim();
   if (!raw || isPendingToken(raw)) return "";
@@ -3659,26 +3327,6 @@ export const PR_AWAIT_CALL_TIMEOUT_MS = 60_000;
  */
 export const AWAIT_DISPATCH_MAX_DEPTH = 2;
 
-/**
- * The **last** `key=` in the text, matched case-insensitively.
- *
- * Deliberately not `parseField`, which takes the first and is case-sensitive.
- * A `git pr-await` handshake prints its top-level fields and then, on an
- * actionable verdict, the reviewer body beneath them — which repeats `next=`.
- * The dispatcher wants the verdict the waiter just reached, so it reads the
- * last one. Both now tokenise with `parseKeyedTokens`, so they agree about
- * where a token starts and ends; only the choice of occurrence differs, and
- * that difference is the point.
- */
-export function parseKeyedField(text: string, key: string): string {
-  const want = key.toLowerCase();
-  let found = "";
-  for (const [k, v] of parseKeyedTokens(text)) {
-    if (k.toLowerCase() === want) found = v;
-  }
-  return found.trim();
-}
-
 interface PrAwaitOutcome {
   done: boolean;
   next: string;
@@ -3788,27 +3436,6 @@ export async function drivePrAwait(
  * dispatch: what the verdict means, and the contract the writer receives.
  * ------------------------------------------------------------------ */
 
-/** What a finished fixer round means for the Feature PR. */
-export type FixerSettle = "await" | "push_then_await" | "pause" | "fail" | "disagree";
-
-/**
- * What the branch says the fixer did. `unknown` means git could not answer and
- * is never evidence of inaction — see `worktreeFingerprint` for the same rule
- * on the Task path.
- */
-export type FixerPushState = "pushed" | "committed" | "none" | "unknown";
-
-export function fixerPushState(heads: {
-  remoteBefore: string;
-  remoteAfter: string;
-  localAfter: string;
-}): FixerPushState {
-  if (!heads.remoteBefore || !heads.remoteAfter || !heads.localAfter) return "unknown";
-  if (heads.remoteAfter !== heads.remoteBefore) return "pushed";
-  if (heads.localAfter !== heads.remoteAfter) return "committed";
-  return "none";
-}
-
 /**
  * `branch`, `origin/<branch>` and `HEAD` for a worktree; `""` for anything git
  * cannot answer.
@@ -3844,59 +3471,6 @@ export async function branchHeads(
     return empty;
   }
 }
-
-/**
- * What a finished fixer round means.
- *
- * The branch is the evidence, not the child's own report: a fixer that pushed
- * and then hit its turn budget is `ok: false` with a handoff, and the old table
- * told the user it "answered without a push" — which was false and stopped the
- * loop on a PR that had just moved (F5). `push` absent or `unknown` falls back
- * to that table, because an unreadable head must not invent a verdict.
- */
-export function fixerSettleAction(input: {
-  ok: boolean;
-  stopped?: boolean;
-  handoffWritten: boolean;
-  push?: FixerPushState;
-}): FixerSettle {
-  // A stop is the user's decision; the branch does not overrule it.
-  if (input.stopped) return "pause";
-  if (input.push === "pushed") return "await";
-  if (input.push === "committed") return "push_then_await";
-  if (input.push === "none") return input.handoffWritten ? "disagree" : "fail";
-  if (input.ok) return "await";
-  if (input.handoffWritten) return "disagree";
-  return "fail";
-}
-
-/** What code does about a judgment `next=` on a Feature-owned PR. */
-export type FeaturePrAction =
-  /** `yield` / `poll_again` / no verdict — the waiter owns the rest, 0 tokens. */
-  | "idle"
-  /** Dispatch one `fixer` to fix current-head findings. */
-  | "spawn_writer"
-  /** No writer: run `git pr-await` once more. */
-  | "reawait"
-  /** Tell the user; nothing is dispatched. */
-  | "notify"
-  /** The waiter lands the PR. */
-  | "land"
-  | "archive"
-  | "confirm"
-  /** The loop is over: code says so on the PR and stops. */
-  | "disagree"
-  /** A writer already holds this Feature; a second one would race it. */
-  | "refuse";
-
-/**
- * Fix-writers one Feature PR may spend before code stops arguing.
- *
- * PR 275 consumed seven fixers and PR 2178 consumed seven; nothing implemented
- * the spec's "until the orchestrator disagrees with the reviewers" (F6), so the
- * loop only ever ended when the bots gave up or something else broke.
- */
-export const FIX_ROUND_CAP = 6;
 
 /**
  * The reviewers' finding set, from the waiter's own `brief_finding` lines.
@@ -3941,54 +3515,6 @@ export function findingsTag(findings: string[]): string {
 export function verdictHead(body: string): string {
   const own = String(body ?? "").match(/^head=(\S+)\s*$/m)?.[1];
   return (own ?? parseKeyedField(body, "head")).trim();
-}
-
-/** Fix-spawns already spent on this PR. `pr_round: none` counts as zero. */
-function fixSpawnCount(value: number | string | undefined): number {
-  const n = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
-/**
- * The one place a waiter verdict becomes an action.
- *
- * Pure, so the table is testable without a PR, a worktree, or a spawn. The
- * quiet verdicts are answered before anything else: a held lock must not turn
- * `next=yield` — which the model is never supposed to see — into a notice.
- */
-export function classifyFeaturePrNext(
-  next: string,
-  state: {
-    /** status.md `pr_round`: fix-writers already spawned for this PR. */
-    prRound?: number | string;
-    /** A Feature chain is in flight (`withChainLock`). */
-    chainLocked?: boolean;
-    /** The recorded `worker_run_id` snapshot is not terminal yet. */
-    workerLive?: boolean;
-    /** The same `brief_finding` set already came back on an earlier head. */
-    findingsRepeated?: boolean;
-  } = {},
-): FeaturePrAction {
-  const verdict = String(next ?? "").trim().toLowerCase();
-  if (!verdict || verdict === "yield" || verdict === "poll_again") return "idle";
-  if (verdict === "done") return "archive";
-  if (verdict === "stop") return "confirm";
-  if (MECHANICAL.has(verdict)) return "land";
-  if (verdict === "read_comments_and_fix") {
-    // One writer per Feature. A second fixer pushing onto the same branch is
-    // how two children clobber each other's commits. This outranks the
-    // termination rules below: a held Feature queues the verdict for retry,
-    // and spending it on a disagreement would throw the round away.
-    if (state.chainLocked || state.workerLive) return "refuse";
-    // The loop ends at merge or at disagreement, and nothing else (F6).
-    if (state.findingsRepeated) return "disagree";
-    if (fixSpawnCount(state.prRound) >= FIX_ROUND_CAP) return "disagree";
-    return "spawn_writer";
-  }
-  if (verdict === "investigate_dead_reviewers") return "reawait";
-  // `fix_command_or_environment` and anything the waiter grows later: report it
-  // rather than guess at a writer contract for it.
-  return "notify";
 }
 
 /**
@@ -4871,15 +4397,6 @@ export async function withChainLock(
       // The drain is best-effort; never fail a finished chain over it.
     }
   }
-}
-
-export function setTaskHandoffInPlan(plan: string, id: string, handoff: string): string {
-  const re = new RegExp(
-    `(###\\s+(?:Task|Slice)\\s+${id}\\s*${TASK_SEP}[\\s\\S]*?-\\s*Handoff:\\s*).*$`,
-    "im",
-  );
-  if (!re.test(plan)) return plan;
-  return plan.replace(re, `$1${handoff}`);
 }
 
 /** Persisted structured-output artifacts named by the completion notification. */
