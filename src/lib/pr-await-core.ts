@@ -742,12 +742,92 @@ export function adoptableLatch(
 	return best?.state;
 }
 
+/**
+ * The waiter's own state files, under every spelling it has used.
+ *
+ * `ghl-pr-await` built 2026-09-01 writes `manual-<repo>-<pr>.json` and
+ * `drive-<repo>-<pr>.pid`; every earlier build wrote `manual-<pr>.json` and
+ * `drive-<pr>.pid`, and the checked-in Rust source still does. This extension
+ * has to read both, because which one exists depends on which binary is
+ * installed — and reading only the old one is why verdicts written by the
+ * handshake-spawned waiter were invisible while `isDriverRunning` stayed false
+ * forever, so every settle forked another daemon (F2, F3).
+ *
+ * Repo-qualified first: it is the current binary's spelling, so it is the one
+ * a fresh wait will have written. This is a *read* contract — nothing in this
+ * extension creates `manual-*` or `drive-*.pid`; the waiter owns them.
+ */
+export type WaiterPaths = { manual: string[]; pid: string[]; log: string[] };
+
+export function waiterPaths(
+	repo: string | undefined,
+	pr: string,
+	dir = stateDir(),
+): WaiterPaths {
+	const number = String(pr ?? "").trim();
+	const slug = (repo ?? "").trim();
+	const spellings = (stem: string, ext: string): string[] => {
+		const out: string[] = [];
+		if (slug) out.push(join(dir, `${stem}-${slug}-${number}.${ext}`));
+		out.push(join(dir, `${stem}-${number}.${ext}`));
+		return out;
+	};
+	return {
+		manual: spellings("manual", "json"),
+		pid: spellings("drive", "pid"),
+		log: spellings("drive", "log"),
+	};
+}
+
+/**
+ * Every waiter file in `dir` for this PR, whatever repo token it carries.
+ *
+ * A caller that holds only a PR number — the latch, which is keyed by PR —
+ * cannot build the repo-qualified name, so the directory is the index instead.
+ *
+ * The suffix test is string arithmetic, deliberately not a regex: `drive-.*-232`
+ * matches `drive-icemining-2232.pid`, and answering "#232 already has a waiter"
+ * because #2232 does would leave #232 with none at all. Repo names contain
+ * digits and hyphens (`icemining-devops`), so only an exact `-<pr>` tail counts.
+ */
+function waiterFilesFor(pr: string, stem: string, ext: string, dir: string): string[] {
+	const number = String(pr ?? "").trim();
+	if (!number) return [];
+	const prefix = `${stem}-`;
+	const suffix = `.${ext}`;
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch {
+		// No state directory yet means no waiter has ever run. That is an
+		// answer, not a failure: throwing here would take the session down.
+		return [];
+	}
+	const out: string[] = [];
+	for (const name of names) {
+		if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue;
+		const middle = name.slice(prefix.length, name.length - suffix.length);
+		if (middle === number || middle.endsWith(`-${number}`)) out.push(join(dir, name));
+	}
+	// Repo-qualified before legacy, so the current binary's file is read first.
+	return out.sort((a, b) => b.length - a.length || a.localeCompare(b));
+}
+
+export function waiterPidFiles(pr: string, dir = stateDir()): string[] {
+	return waiterFilesFor(pr, "drive", "pid", dir);
+}
+
+export function waiterManualFiles(pr: string, dir = stateDir()): string[] {
+	return waiterFilesFor(pr, "manual", "json", dir);
+}
+
+/** Legacy spelling. Kept for callers that write nothing and know no repo. */
 export function pidFile(pr: string, dir = stateDir()): string {
 	return join(dir, `drive-${pr}.pid`);
 }
 
-export function logFile(pr: string, dir = stateDir()): string {
-	return join(dir, `drive-${pr}.log`);
+export function logFile(pr: string, dir = stateDir(), repo?: string): string {
+	return waiterPaths(repo, pr, dir).log[0]!;
 }
 
 export function pidAlive(pid: number): boolean {
@@ -762,18 +842,37 @@ export function pidAlive(pid: number): boolean {
 	}
 }
 
-export function readPid(pr: string, dir = stateDir()): number | undefined {
-	try {
-		const n = Number(readFileSync(pidFile(pr, dir), "utf8").trim());
-		return Number.isInteger(n) && n > 0 ? n : undefined;
-	} catch {
-		return undefined;
+/** Every pid recorded for this PR, under any spelling. */
+export function readPids(pr: string, dir = stateDir()): number[] {
+	const out: number[] = [];
+	for (const path of waiterPidFiles(pr, dir)) {
+		try {
+			const n = Number(readFileSync(path, "utf8").trim());
+			if (Number.isInteger(n) && n > 0) out.push(n);
+		} catch {
+			// A pid file that vanished between listing and reading is not a waiter.
+		}
 	}
+	return out;
 }
 
-export function isDriverRunning(pr: string, dir = stateDir(), alive: (pid: number) => boolean = pidAlive): boolean {
-	const pid = readPid(pr, dir);
-	return pid !== undefined && alive(pid);
+export function readPid(pr: string, dir = stateDir()): number | undefined {
+	return readPids(pr, dir)[0];
+}
+
+/**
+ * Is any waiter for this PR alive?
+ *
+ * "Any", across both spellings: the question this answers is only ever asked to
+ * decide whether to fork another daemon, and a false negative is what produced
+ * 25 concurrent waiters on one PR.
+ */
+export function isDriverRunning(
+	pr: string,
+	dir = stateDir(),
+	alive: (pid: number) => boolean = pidAlive,
+): boolean {
+	return readPids(pr, dir).some((pid) => alive(pid));
 }
 
 export function writePid(pr: string, pid: number, dir = stateDir()): void {
