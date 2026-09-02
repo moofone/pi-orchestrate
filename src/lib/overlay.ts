@@ -24,11 +24,12 @@ import {
 } from "./plan-tasks.ts";
 
 export type OverlayTodoStatus = "pending" | "in_progress" | "completed";
-export type OverlayTodoKind = "planner" | "plan-reviewer" | "task" | "qa";
+export type OverlayTodoKind = "planner" | "plan-reviewer" | "approve" | "task" | "qa";
 
 /** Reserved overlay ids so Task N keeps id N. */
 export const OVERLAY_PLANNER_ID = 1001;
 export const OVERLAY_REVIEWER_ID = 1002;
+export const OVERLAY_APPROVE_ID = 1003;
 
 export interface OverlayTodo {
   id: number;
@@ -100,9 +101,31 @@ function reviewerOverlayStatus(
   return "pending";
 }
 
+function approveOverlayStatus(
+  plan: string,
+  tasks: Task[],
+  review: PlanReviewState,
+  phase: string,
+): OverlayTodoStatus {
+  if (isApproved(plan)) return "completed";
+  if (
+    phase === "implementing" ||
+    phase === "feature-qa" ||
+    phase === "pr" ||
+    phase === "blocked" ||
+    phase === "paused" ||
+    phase === "done"
+  ) {
+    return "completed";
+  }
+  if (tasks.some((t) => t.status === "done" || t.status === "in_progress")) return "completed";
+  if (review === "done") return "in_progress";
+  return "pending";
+}
+
 /**
  * Deterministic rpiv-todo snapshot from plan.md + status.md.
- * Pipeline prefix: planner (1001), plan-reviewer (1002).
+ * Pipeline prefix: planner (1001), plan-reviewer (1002), approve (1003).
  * Task N keeps id N; feature-qa pass i is max(task id)+i. No clocks, no prompts.
  */
 export function overlayTodosFromFeature(plan: string, status: string): OverlayTodo[] {
@@ -136,10 +159,33 @@ export function overlayTodosFromFeature(plan: string, status: string): OverlayTo
     if (reviewerStatus === "in_progress") reviewer.activeForm = "reviewing Feature plan";
     todos.push(reviewer);
     used.add(OVERLAY_REVIEWER_ID);
+
+    const approveStatus = approveOverlayStatus(plan, tasks, review, phase);
+    const approve: OverlayTodo = {
+      id: OVERLAY_APPROVE_ID,
+      subject: "Approve",
+      status: approveStatus,
+      blockedBy: [OVERLAY_REVIEWER_ID],
+      metadata: { kind: "approve" },
+    };
+    if (approveStatus === "in_progress") approve.activeForm = "waiting for /orchestrate approve";
+    todos.push(approve);
+    used.add(OVERLAY_APPROVE_ID);
   }
 
-  let prevId: number | undefined = hasFeature ? OVERLAY_REVIEWER_ID : undefined;
+  let prevId: number | undefined = hasFeature ? OVERLAY_APPROVE_ID : undefined;
   let anyTaskInProgress = false;
+  const showWork =
+    review === "done" ||
+    isApproved(plan) ||
+    phase === "implementing" ||
+    phase === "feature-qa" ||
+    phase === "pr" ||
+    phase === "blocked" ||
+    phase === "paused" ||
+    phase === "done" ||
+    tasks.some((t) => t.status === "done" || t.status === "in_progress");
+  if (!showWork) return todos;
 
   for (const task of tasks) {
     const id = Number.parseInt(task.id, 10);

@@ -68,6 +68,7 @@ import {
 	readLatchFile,
 	readWaiterVerdict,
 	readLiveRound,
+	waiterLogSaysTerminal,
 	referenceCheckoutFor,
 	repoKey,
 	resolveQueryCwd,
@@ -630,7 +631,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			const next = readWaiterVerdict(path)?.lastNext;
 			if (next && (TERMINAL_NEXT.has(next) || MECHANICAL.has(next))) return true;
 		}
-		return false;
+		return latch ? waiterLogSaysTerminal(latch.pr) : false;
 	}
 
 	/**

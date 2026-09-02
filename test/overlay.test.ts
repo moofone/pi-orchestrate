@@ -33,14 +33,16 @@ test("overlay: Task N keeps plan id and blocked maps to pending", () => {
     [
       [1001, "Planner", "completed", "planner"],
       [1002, "Plan reviewer", "completed", "plan-reviewer"],
+      [1003, "Approve", "completed", "approve"],
       [1, "Task 1 — one", "completed", "task"],
       [2, "Task 2 — two", "pending", "task"],
       [3, "Task 3 — three", "pending", "task"],
     ],
   );
   assert.deepEqual(todos[1]?.blockedBy, [1001], "reviewer waits on the planner");
-  assert.deepEqual(todos[2]?.blockedBy, [1002], "Task 1 waits on the reviewer");
-  assert.deepEqual(todos[3]?.blockedBy, [1], "Task N waits on Task N-1");
+  assert.deepEqual(todos[2]?.blockedBy, [1002], "Approve waits on the reviewer");
+  assert.deepEqual(todos[3]?.blockedBy, [1003], "Task 1 waits on Approve");
+  assert.deepEqual(todos[4]?.blockedBy, [1], "Task N waits on Task N-1");
 });
 
 test("overlay: plan-reviewer in_progress never shares the board with a Task", () => {
@@ -59,8 +61,7 @@ test("overlay: plan-reviewer in_progress never shares the board with a Task", ()
     [
       ["planner", "completed"],
       ["plan-reviewer", "in_progress"],
-      ["task", "pending"],
-      ["qa", "pending"],
+      ["approve", "pending"],
     ],
   );
   assert.equal(

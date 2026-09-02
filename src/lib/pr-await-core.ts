@@ -1045,6 +1045,25 @@ export function waiterPidFiles(pr: string, dir = stateDir()): string[] {
 	return waiterFilesFor(pr, "drive", "pid", dir);
 }
 
+export function waiterLogFiles(pr: string, dir = stateDir()): string[] {
+	return waiterFilesFor(pr, "drive", "log", dir);
+}
+
+export function waiterLogSaysTerminal(pr: string, dir = stateDir()): boolean {
+	for (const path of waiterLogFiles(pr, dir)) {
+		let text = "";
+		try {
+			text = readFileSync(path, "utf8");
+		} catch {
+			continue;
+		}
+		if (/^status=landed$/m.test(text)) return true;
+		if (/^next=(done|stop)$/m.test(text)) return true;
+		if (/^pr_state=(MERGED|CLOSED)$/m.test(text)) return true;
+	}
+	return false;
+}
+
 export function waiterManualFiles(pr: string, dir = stateDir()): string[] {
 	return waiterFilesFor(pr, "manual", "json", dir);
 }
