@@ -83,7 +83,14 @@ type FeatureDispatch = { owner: any; verdict: { pr: string; next: string; output
 function harness(
 	execImpl: ExecFn,
 	cwd = REPO,
-	extraHooks: { watchMs?: number; chromeMs?: number; featureOwnedPr?: any; onFeatureActionable?: any } = {},
+	extraHooks: {
+		watchMs?: number;
+		chromeMs?: number;
+		featureOwnedPr?: any;
+		onFeatureActionable?: any;
+		/** Present-and-undefined selects the production pid probe. */
+		driverRunning?: any;
+	} = {},
 ) {
 	const handlers: Record<string, any> = {};
 	const commands: Record<string, any> = {};
@@ -128,7 +135,9 @@ function harness(
 			}
 			return { pid: 4242 };
 		},
-		driverRunning: (pr) => running.has(pr),
+		driverRunning: "driverRunning" in extraHooks
+			? extraHooks.driverRunning
+			: (pr) => running.has(pr),
 		watchMs: extraHooks.watchMs ?? 0,
 		chromeMs: extraHooks.chromeMs ?? 0,
 		featureOwnedPr: extraHooks.featureOwnedPr,
@@ -1341,6 +1350,111 @@ test("a Feature-owned ACTIONABLE is dispatched by code, never woken into this se
 			h.calls.filter((c) => c.includes("pr-await")).length,
 			0,
 			"the latch must not re-await; the dispatcher does that after the writer",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a verdict written only under the repo-qualified waiter name is still dispatched", async () => {
+	// The 2026-09-01 ghl-pr-await writes `manual-icemining-2142.json`. Nothing
+	// writes the legacy `manual-2142.json`, and the session's own `pi-<id>.json`
+	// carries no verdict — so the old single-spelling read saw nothing and the
+	// Feature sat on `next=yield` with a fixer owed (F2).
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	const featureDir = writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeFileSync(
+			join(h.dir, "manual-icemining-2142.json"),
+			JSON.stringify({
+				pr: "2142",
+				lastNext: "read_comments_and_fix",
+				verdict: ACTIONABLE_VERDICT,
+				verdictDelivered: false,
+			}),
+		);
+		assert.equal(existsSync(join(h.dir, "manual-2142.json")), false, "legacy name must be absent");
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, `got ${h.wakes.join(" | ")}`);
+		assert.equal(h.dispatches.length, 1, "the repo-qualified verdict must reach the dispatcher");
+		assert.equal(h.dispatches[0].owner.dir, featureDir);
+		assert.equal(h.dispatches[0].verdict.next, "read_comments_and_fix");
+		const spent = JSON.parse(readFileSync(join(h.dir, "manual-icemining-2142.json"), "utf8"));
+		assert.equal(spent.verdictDelivered, true, "an accepted dispatch spends the verdict");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a Feature-owned PR does not get a second waiter on settle", async () => {
+	// Three spawners raced here (F3): the handshake, this settle, and ghl-monitor.
+	// The reconciler owns Feature waiters now, so settle must not fork one.
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-owned");
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		featureOwnedPr: (pr: string) => ({
+			dir: "/tmp/feat-owned",
+			statusFile: "/tmp/feat-owned/status.md",
+			repo: "icemining",
+			name: "feat-owned",
+			pr,
+			worktree: WT,
+		}),
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(60);
+		assert.equal(
+			h.spawns.length,
+			0,
+			`a Feature waiter is the reconciler's job; got ${JSON.stringify(h.spawns)}`,
+		);
+		// The session still watches and still drains a pending verdict.
+		assert.ok(
+			h.notifies.some((n) => /2142/.test(n)),
+			`the session must still report the PR; got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a solo PR still gets its waiter ensured on settle", async () => {
+	// The no-spawn rule above is scoped to Feature-owned PRs. A plain session has
+	// no reconciler behind it, so removing its waiter would strand the PR.
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(60);
+		assert.equal(h.spawns.length, 1, "solo latches still ensure a detached waiter");
+		assert.ok(h.spawns[0].includes("--daemon"));
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a live waiter under the repo-qualified pid stops a duplicate spawn", async () => {
+	// `isDriverRunning` defaults to the real pid probe here, so this is the
+	// production path: a pid file only the new binary writes must be believed.
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		driverRunning: undefined,
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeFileSync(join(h.dir, "drive-icemining-2142.pid"), String(process.pid));
+		await h.settle();
+		await sleep(60);
+		assert.equal(
+			h.spawns.length,
+			0,
+			`a live repo-qualified waiter must suppress the spawn; got ${JSON.stringify(h.spawns)}`,
 		);
 	} finally {
 		h.cleanup();

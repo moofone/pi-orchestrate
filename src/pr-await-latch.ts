@@ -68,6 +68,9 @@ import {
 	formatWaitLine,
 	originSlug,
 	prUrl,
+	waiterManualFiles,
+	waiterPaths,
+	waiterPidFiles,
 	waitProgressSequence,
 	type FeaturePrOwner,
 	type LatchState,
@@ -103,7 +106,9 @@ export function defaultSpawnDriver(stateFile: string, known?: LatchState): { pid
 	// No checkout, no daemon. `ghl-pr-await` resolves owner/repo from its own
 	// cwd, so spawning anyway just burns a process on a resolve-error loop.
 	if (!spawnCwd) return {};
-	const log = latch ? logFile(latch.pr) : join(stateDir(), "drive-unknown.log");
+	const log = latch
+		? logFile(latch.pr, stateDir(), repoKey(latch.cwd))
+		: join(stateDir(), "drive-unknown.log");
 	const fd = openSync(log, "a");
 	const child = spawn(DRIVE_BIN, ["--state", stateFile, "--daemon"], {
 		detached: true,
@@ -288,11 +293,27 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 	}
 
+	/**
+	 * Every file that may carry waiter state for the latched PR, newest naming
+	 * scheme first. `stateFile` is this session's `--state` path; the rest are
+	 * the waiter's own bookkeeping under both spellings it has used.
+	 *
+	 * `latchFile` is deliberately absent: `pi-<id>.latch.json` is the
+	 * extension's private copy, and treating it as waiter state is the mistake
+	 * ghl-monitor makes when it respawns drivers from it (F3, F20).
+	 */
+	function waiterStateFiles(): string[] {
+		const files: string[] = [];
+		if (stateFile) files.push(stateFile);
+		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
+		return [...new Set(files)];
+	}
+
 	function waiterRound(): { round?: string; roundTotal?: string } {
 		const files: string[] = [];
 		if (stateFile) files.push(stateFile);
 		if (latchFile) files.push(latchFile);
-		if (latch?.pr) files.push(join(stateDir(), `manual-${latch.pr}.json`));
+		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
 		for (const path of files) {
 			const v = readLiveRound(path);
 			if (v?.round) return v;
@@ -462,10 +483,12 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		// PR for the next 24h; `manual-2162.json` was still being picked up hours
 		// after that PR merged.
 		if (s.source === "manual") {
-			try {
-				rmSync(join(stateDir(), `manual-${s.pr}.json`), { force: true });
-			} catch {
-				// Cleanup is best-effort; never take the session down over it.
+			for (const path of waiterManualFiles(s.pr, stateDir())) {
+				try {
+					rmSync(path, { force: true });
+				} catch {
+					// Cleanup is best-effort; never take the session down over it.
+				}
 			}
 		}
 		status(ctx);
@@ -556,7 +579,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	async function checkActionable(ctx: ExtensionContext): Promise<void> {
 		if (disabled || !latch || !stateFile) return;
 		const pr = latch.pr;
-		const candidates = [stateFile, join(stateDir(), `manual-${pr}.json`)];
+		const candidates = waiterStateFiles();
 		let hit:
 			| { path: string; lastNext: string; verdict?: string; round?: string }
 			| undefined;
@@ -714,9 +737,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 
 	function stripStaleWaiterRound(): void {
 		if (!latch) return;
-		const files = [stateFile, latchFile, join(stateDir(), `manual-${latch.pr}.json`)].filter(
-			(p): p is string => Boolean(p),
-		);
+		const files = [
+			stateFile,
+			latchFile,
+			...waiterManualFiles(latch.pr, stateDir()),
+		].filter((p): p is string => Boolean(p));
 		for (const path of files) {
 			try {
 				if (!existsSync(path)) continue;
@@ -747,6 +772,32 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			}
 
 			persist();
+
+			// A PR a live Feature owns has a durable owner: the reconciler
+			// ensures exactly one waiter for it. Forking one here too is the
+			// second of the three uncoordinated spawners that put 25 daemons on
+			// one PR and rate-limited GitHub (F3). Watch and drain a pending
+			// verdict, but start nothing.
+			let owned = false;
+			try {
+				owned = Boolean(featureOwnedPr(latch.pr, latch));
+			} catch {
+				// Ownership could not be established; treat it as solo, which is
+				// the behaviour that keeps a plain session's PR moving.
+				owned = false;
+			}
+			if (owned) {
+				status(ctx, `pr-await ${prLabel(latch)} · Feature-owned`);
+				notify(
+					ctx,
+					`pr-latch: ${prLinkLabel(latch)} belongs to a live /orchestrate Feature — ` +
+						`/orchestrate owns its waiter. This session watches only.`,
+				);
+				startWatch(ctx);
+				await checkActionable(ctx);
+				return;
+			}
+
 			const running = driverRunning(latch.pr);
 			if (!running && !spawnCwdFor(latch)) {
 				// An open PR with no waiter and nowhere to start one. Say so loudly:
@@ -782,8 +833,16 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	function killDriver(pr: string): void {
-		const pid = readPid(pr);
-		if (pid && pidAlive(pid)) {
+		// Both spellings: `/pr-latch clear` promises the waiter is stopped, and
+		// leaving the repo-qualified daemon alive would keep polling GitHub.
+		for (const path of waiterPidFiles(pr, stateDir())) {
+			let pid = 0;
+			try {
+				pid = Number(readFileSync(path, "utf8").trim());
+			} catch {
+				continue;
+			}
+			if (!Number.isInteger(pid) || pid <= 0 || !pidAlive(pid)) continue;
 			try {
 				process.kill(pid, "SIGTERM");
 			} catch {
