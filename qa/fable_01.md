@@ -313,7 +313,39 @@ Original plan, as written before implementation:
 
 Acceptance: kill pi mid-review with a verdict pending → start pi anywhere in the repo → a fixer is spawned within 60 s; no second waiter appears; merged PR closes the Feature within 60 s with no session latch involved; `github rate limited` no longer appears in waiter logs over 24 h.
 
-### Phase 2 — Deterministic fix loop (F5, F6, F7, F9, F10)
+### Phase 2 — Deterministic fix loop — **DONE 2026-09-02**
+
+Five Tasks, one commit each, TDD throughout. The suite went from 284 to 309 passing, all green; `tsc --noEmit` clean.
+
+| Task | Commit | What landed |
+|---|---|---|
+| 1 | `e403fa0` | `branchHeads` + `fixerPushState`; the fixer settle is read off `origin/<branch>`, and code pushes what a fixer only committed. |
+| 2 | `72b800d` | `parseBriefFindings` / `findingsTag` / `verdictHead`; `FIX_ROUND_CAP = 6`; the `disagree` action and `recordFeatureDisagreement`. |
+| 3 | `182e899` | `WRITER_CONTRACT` in the task text of both writer paths; `classifyForRole` / `isWriterRole` in the guard; `fixer.md` and `tdd-worker.md` updated. |
+| 4 | `1628590` | `AWAIT_DISPATCH_MAX_DEPTH = 2`; handshake timeout 30 min → 60 s; land timeout 30 min → 10 min. |
+| 5 | `8fa88e0` | `openFeaturePr` pre-flight, verbatim stderr, `defaultBaseBranch`, `featurePrBody`. |
+
+**F5 — the branch is the evidence.** `runReviewFixWriter` records `origin/<branch>` before the child and re-reads it after (with a fetch, or the comparison is against whatever the last fetch left behind). `fixerPushState` turns the pair into `pushed` / `committed` / `none` / `unknown`. A fixer that pushed and then hit its turn budget now re-awaits instead of being told it "answered without a push" — which was false, and stopped the loop on a PR that had just moved. A fixer reported `ok` that pushed nothing is a disagreement, not another identical re-await. `unknown` falls back to the old `ok` + handoff table: an unreadable head must never invent a verdict, the same rule `worktreeFingerprint` already follows on the Task path.
+
+**F6 — the loop now ends at a disagreement.** `classifyFeaturePrNext` took `prRound` and ignored it. The reviewers' own `brief_finding` lines are parsed into a sorted, head-independent set and tagged; the same tag arriving on a head the last fixer *moved* is the disagreement the spec asks for, and `FIX_ROUND_CAP = 6` is the backstop. Either way code posts one `gh pr comment` naming the open findings and parks the Feature with `next_action: disagreed at <head>`. A Feature a writer already holds outranks both: that verdict is queued for retry, not spent on a disagreement. `disagree` joins `ACCEPTED_FEATURE_PR_ACTIONS`, or the reconciler would re-raise it every 60 seconds.
+
+**F7 — writers commit; code does everything else.** The `skill` / `skills` / `reads` of the solo `SKILL.md` are gone from `reviewFixLaunchParams`, and `skills:` / `defaultReads:` from `fixer.md`. Both worker paths now carry `WRITER_CONTRACT` in their task text. The enforcement is mechanical: `classifyForRole(command, { writer })` blocks `git pr-await` / `pr-land` / `wt` / `wt-rm`, `gh pr create|comment|merge`, and `git push` for a writer child, while the solo session keeps every one of them.
+
+> Implemented differently from the plan, and better: the plan said to spawn children with `env: { ORCHESTRATE_ROLE: "writer" }`. pi-subagents' async spawn takes no `env` parameter — the runner inherits `process.env` — so that flag would never have arrived. But `runs/shared/pi-args.ts` already sets `PI_SUBAGENT_CHILD_AGENT=<agent>` in every child's environment, so `isWriterRole` reads that. The role needs no cooperation from the spawn site at all, and it is correct for children this extension did not spawn. `ORCHESTRATE_ROLE=writer` is still honoured as an explicit override.
+
+**F9 — the recursion had no bound, and it was real.** `reawait` → `awaitAndDispatch` → dispatch → `reawait` recursed forever against a waiter that keeps answering `investigate_dead_reviewers`; the test written for it hung the whole suite until the bound went in. `AWAIT_DISPATCH_MAX_DEPTH = 2` handshakes per chain, after which the waiter still owns the PR and the reconciler picks up whatever it says next — nothing is dropped. A completed fix round starts a fresh chain; what bounds *that* loop is F6's cap.
+
+**F19, taken with F9.** The `git pr-await` handshake timeout drops from 30 minutes to 60 seconds. It forks a daemon and prints; half an hour of it only ever meant the chain lock was held while nothing happened, and a timeout is read as `yield` either way. `git pr-land` drops from 30 to 10 minutes.
+
+**F10 — the PR open says what went wrong.** Push errors were ignored and `gh pr create` stderr was discarded, so an empty branch failed with "No commits between …" and the user was told "no PR number returned". Now: base branch from `gh repo view`, a dirty worktree refuses naming the files, a branch with nothing ahead of `origin/<base>` refuses naming the branch, and a failed push or create returns its stderr verbatim into both the toast and `next_action`. A check git cannot answer never blocks — it falls through to `gh`, whose error is now readable. The PR body is built from the plan's `## Context` plus the Task titles; `--body-file plan.md` had been posting `/Users/greg/orchestrator/…` paths and `> Worker:` model routing as the public body of a PR.
+
+**Two stale tests were rewritten rather than worked around** (F21 in miniature). One asserted `classify("read_comments_and_fix", { prRound: 99 }) === "spawn_writer"` — "no fixer-round cap" — which is exactly the behaviour F6 exists to reverse. The other asserted the handshake timeout was 30 minutes. Both now state the new contract and say why.
+
+**Still open after Phase 2.** The four Features parked in `phase: pr` with `pr: none` are F10 casualties from before this fix; they will not self-heal, since there is no PR for the reconciler to ask about. Clearing them is bookkeeping, not code. `git push` is now blocked for writers, so every path to `origin` runs through code: `openFeaturePr` for the first push and `pushFeatureBranch` for a fix round. If a repo needs a push from somewhere else, that path does not exist yet.
+
+Original plan, as written before implementation:
+
+#### Phase 2 — Deterministic fix loop (F5, F6, F7, F9, F10)
 
 2.1 `runReviewFixWriter`: record `origin/<branch>` head before; after the child, `git fetch` and compare. `pushed` → push if the fixer only committed (code pushes), then one `git pr-await`; `!pushed && handoff` → disagreement path; neither → fail. Replace `fixerSettleAction` inputs accordingly.
 
