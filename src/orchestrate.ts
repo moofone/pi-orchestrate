@@ -66,6 +66,7 @@ import {
   resumePhase,
   statusField as readStatusField,
   transitionRefusal as phaseTransitionRefusal,
+  type FeaturePhase,
   type FeaturePhase as Phase,
 } from "./lib/feature-state.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
@@ -214,13 +215,13 @@ export function qaModelFor(agent: string, thinking?: string, jsonText?: string):
 
 export function isAllowedQaModel(model: string, jsonText?: string): boolean {
   if (typeof model !== "string") return false;
-  return model.split(":")[0].trim().toLowerCase() === qaModelBase(jsonText);
+  return (model.split(":")[0] ?? "").trim().toLowerCase() === qaModelBase(jsonText);
 }
 
 /** Writers may not inherit the parent Cursor Grok session. */
 export function isAllowedWriterModel(model: string): boolean {
   if (typeof model !== "string") return false;
-  const base = model.split(":")[0].trim().toLowerCase();
+  const base = (model.split(":")[0] ?? "").trim().toLowerCase();
   return (
     base === "zai/glm-5.3-flash" ||
     base === "cursor/grok-4.6" ||
@@ -1520,10 +1521,9 @@ export function isManagementInvocation(
   if (liveNames.length === 0) return false;
   // Multi-token management is only `<feature> <task>` or a bare Task selector.
   const names = liveNames.map((n) => n.toLowerCase());
-  return (
-    TASK_SELECTOR_RE.test(tokens[0]) ||
-    names.some((n) => n === tokens[0] || n.includes(tokens[0]))
-  );
+  const first = tokens[0];
+  if (first === undefined) return false;
+  return TASK_SELECTOR_RE.test(first) || names.some((n) => n === first || n.includes(first));
 }
 
 /** Verbs that force the objective reading of a line that starts with a verb. */
@@ -1743,7 +1743,7 @@ export function orchestrateArgumentCompletions(
     const p = raw.toLowerCase();
     if (NAMED_VERBS.has(p)) return featureNameCompletions(p, "", cwd);
     const items = VERB_COMPLETIONS.filter((c) => !p || c.value.startsWith(p));
-    if (items.length === 1 && items[0].value === p) return null;
+    if (items.length === 1 && items[0]?.value === p) return null;
     return items.length ? items : null;
   }
   const head = raw.slice(0, space).trim().toLowerCase();
@@ -1765,7 +1765,7 @@ function featureNameCompletions(
       n.toLowerCase().includes(needle),
   );
   if (matched.length === 0) return null;
-  if (needle && matched.length === 1 && matched[0].toLowerCase() === needle) {
+  if (needle && matched.length === 1 && matched[0]?.toLowerCase() === needle) {
     return null;
   }
   return matched.map((n) => ({
@@ -2031,18 +2031,20 @@ export function parseTasks(plan: string): Task[] {
   const headers: Array<{ id: string; title: string; index: number }> = [];
   let match: RegExpExecArray | null;
   while ((match = header.exec(plan))) {
-    headers.push({ id: match[1], title: match[2].trim(), index: match.index });
+    headers.push({ id: match[1] ?? "", title: (match[2] ?? "").trim(), index: match.index });
   }
   for (let i = 0; i < headers.length; i++) {
-    const start = headers[i].index;
-    const end = i + 1 < headers.length ? headers[i + 1].index : plan.length;
+    const header = headers[i];
+    if (!header) continue;
+    const start = header.index;
+    const end = headers[i + 1]?.index ?? plan.length;
     const body = plan.slice(start, end);
     const st = body.match(/-\s*Status:\s*(\w+)/i);
     const cx = body.match(/-\s*Complexity:\s*(simple|critical|complex)\b/i);
     const rawCx = cx?.[1]?.toLowerCase();
     tasks.push({
-      id: headers[i].id,
-      title: headers[i].title,
+      id: header.id,
+      title: header.title,
       status: (st?.[1] ?? "pending").toLowerCase(),
       complexity:
         rawCx === "critical" || rawCx === "complex"
@@ -2634,7 +2636,7 @@ export function isAllowedPlannerModel(model: string): boolean {
 /** Cursor-billed ids that burned 1k–7k turn workers. Native `xai/grok-4.6` is not this. */
 export function isForbiddenBillingModel(model: string): boolean {
   if (typeof model !== "string") return true;
-  const base = model.split(":")[0].trim().toLowerCase();
+  const base = (model.split(":")[0] ?? "").trim().toLowerCase();
   if (!base || base === "inherit") return true;
   if (base.startsWith("cursor/")) return true;
   if (base.includes("composer")) return true;
@@ -2990,7 +2992,7 @@ export function isExcludedModelFailure(reason: string | undefined): boolean {
 
 function isSimpleWriterModel(model: unknown): boolean {
   if (typeof model !== "string") return false;
-  return model.split(":")[0].trim().toLowerCase() === WORKERS.simple.model;
+  return (model.split(":")[0] ?? "").trim().toLowerCase() === WORKERS.simple.model;
 }
 
 function shouldRetryExcludedSimpleWriter(
@@ -3287,7 +3289,7 @@ const GATE_NOT_A_COMMAND = /[…]|\.\.\.|\*\*|^[([]|^[.…]+$/;
 export function taskGateCommand(body: string): string {
   const line = body.match(/^-\s*Command:[ \t]*(.*)$/im);
   if (!line) return "";
-  const raw = line[1].trim();
+  const raw = (line[1] ?? "").trim();
   let cmd = "";
   if (raw && !isPendingToken(raw)) {
     cmd = raw.match(/^(`+)([^`]+)\1$/)?.[2]?.trim() ?? "";
@@ -3711,7 +3713,7 @@ export const AWAIT_DISPATCH_MAX_DEPTH = 2;
 
 export function parseKeyedField(text: string, key: string): string {
   const matches = [...text.matchAll(new RegExp(`\\b${key}=([^\\s]+)`, "gi"))];
-  return matches.length ? (matches[matches.length - 1][1] ?? "").trim() : "";
+  return matches.length ? (matches[matches.length - 1]?.[1] ?? "").trim() : "";
 }
 
 interface PrAwaitOutcome {
@@ -3945,7 +3947,7 @@ export function parseBriefFindings(body: string): string[] {
   for (const line of String(body ?? "").split("\n")) {
     const m = line.match(/^\s*brief_finding\s+(.*)$/);
     if (!m) continue;
-    const rest = m[1];
+    const rest = m[1] ?? "";
     const path = rest.match(/\bpath=(\S+)/)?.[1] ?? "";
     const at = rest.match(/\bline=(\d+)/)?.[1] ?? "";
     const sev = rest.match(/\bsev=(\S+)/)?.[1] ?? "";
@@ -4620,10 +4622,10 @@ export async function dispatchFeaturePrVerdict(
       pr,
       nextAction: `pr-await next=${result.next || "(none)"} — ${action} (fixer round ${spent})`,
     });
-    uiNotify(ctx, 
-      featurePrVerdictNotice(action, pr, result.next, spent),
-      action === "refuse" ? "warning" : "info",
-    );
+    // `refuse` returns above, so only `confirm`/`notify` reach here. The
+    // ternary that used to test for it was dead: a refusal is warned about at
+    // its own branch, which is where F4's "the finding vanished" note lives.
+    uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
     return action;
   }
 
@@ -4739,7 +4741,7 @@ async function featurePrState(
   owner: FeaturePrOwner,
 ): Promise<{ state: "open" | "merged" | "closed" | "unknown"; head?: string }> {
   const candidates = [owner.worktree, join(REF_ROOT, owner.repo)].filter(
-    (dir): dir is string => Boolean(dir) && existsSync(dir),
+    (dir): dir is string => typeof dir === "string" && dir.length > 0 && existsSync(dir),
   );
   for (const cwd of candidates) {
     try {
@@ -5697,7 +5699,10 @@ export async function openFeaturePr(
   pi: ExtensionAPI,
   worktree: string,
   input: { title: string; body?: string; base?: string },
-): Promise<{ pr: string; url?: string; reason?: string } | undefined> {
+): Promise<{ pr?: string; url?: string; reason?: string } | undefined> {
+  // `pr` is optional because every pre-flight refusal returns a `reason` and no
+  // PR — that is the whole point of F10's pre-flight. The caller reads
+  // `opened?.pr ?? ""` and branches on the empty string.
   const title = input.title.trim();
   if (!title) return { reason: "missing PR title" };
   const base = input.base?.trim() || (await defaultBaseBranch(pi, worktree));
@@ -6458,7 +6463,9 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerEntryRenderer<ApproveCardData>(APPROVE_ENTRY, (entry, options, theme) =>
-    renderApproveEntry(entry, options, theme),
+    // pi's `Theme` carries more than the card uses; `ApproveTheme` is the three
+    // functions it actually calls, so the renderer stays testable with a stub.
+    renderApproveEntry(entry, options, theme as unknown as ApproveTheme),
   );
   pi.registerMarkdownTransformer((markdown, { messageType }) => {
     if (messageType !== "assistant") return markdown;

@@ -412,7 +412,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		// Footer already has MCP/model. The Loader widget is the wait chrome.
 		status(ctx);
 		try {
-			ctx.ui.setTitle(text);
+			ctx.ui.setTitle(text ?? "");
 		} catch {
 			/* no UI */
 		}

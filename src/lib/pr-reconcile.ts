@@ -24,6 +24,7 @@
  * to GitHub directly. That keeps the decisions testable without a PR, a
  * worktree, or a spawn.
  */
+import type { FeaturePhase } from "./feature-state.ts";
 import {
 	ACCEPTED_FEATURE_PR_ACTIONS,
 	isAcceptedFeaturePrAction,
@@ -40,7 +41,8 @@ export type ReconcileVerdict = {
 };
 
 export type ReconcileStatusPatch = {
-	phase?: string;
+	/** Typed, so the reconciler cannot write a phase the readers do not know. */
+	phase?: FeaturePhase;
 	nextAction?: string;
 	prHead?: string;
 	pendingVerdict?: string;

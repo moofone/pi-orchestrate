@@ -374,19 +374,24 @@ export function parseField(text: string, field: string): string | undefined {
 export function parseAwaitCall(command: string): { pr: string; cursor?: string } | undefined {
 	const m = command.match(/\bgit\s+pr-(?:await|land)\s+([^\n;|&]*)/);
 	if (!m) return undefined;
-	const tokens = m[1].trim().split(/\s+/).filter(Boolean);
+	const tokens = (m[1] ?? "").trim().split(/\s+/).filter(Boolean);
 	let pr: string | undefined;
 	let cursor: string | undefined;
 	for (let i = 0; i < tokens.length; i++) {
-		if (tokens[i] === "--cursor") {
+		// Bound by `tokens.length`, but read once into a local: `tokens[++i]`
+		// below can walk past the end, and indexing again after that is how a
+		// flag with no value would have been read as the next flag's name.
+		const token = tokens[i];
+		if (token === undefined) break;
+		if (token === "--cursor") {
 			cursor = tokens[++i];
 			continue;
 		}
-		if (tokens[i].startsWith("-")) {
-			if (tokens[i] === "--bot" || tokens[i] === "--timeout-secs") i++;
+		if (token.startsWith("-")) {
+			if (token === "--bot" || token === "--timeout-secs") i++;
 			continue;
 		}
-		if (!pr && /^\d+$/.test(tokens[i])) pr = tokens[i];
+		if (!pr && /^\d+$/.test(token)) pr = token;
 	}
 	return pr ? { pr, cursor } : undefined;
 }
@@ -396,7 +401,7 @@ export function trailingCd(command: string, upTo?: RegExp): string | undefined {
 	let cwd: string | undefined;
 	for (const m of before.matchAll(/\bcd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g)) {
 		const candidate = m[1] ?? m[2] ?? m[3];
-		if (candidate.startsWith(REPO_ROOT) && existsSync(candidate)) cwd = candidate;
+		if (candidate && candidate.startsWith(REPO_ROOT) && existsSync(candidate)) cwd = candidate;
 	}
 	return cwd;
 }
