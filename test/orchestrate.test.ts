@@ -2890,10 +2890,12 @@ test("D1: classifyFeaturePrNext routes every judgment next= without asking the p
   assert.equal(classify("done", { prRound: 0 }), "archive");
   assert.equal(classify("stop", { prRound: 0 }), "confirm");
 
+  // F6 reversed the old "no cap" rule: the loop ends at a merge or at a
+  // disagreement, and 99 rounds is neither.
   assert.equal(
     classify("read_comments_and_fix", { prRound: 99 }),
-    "spawn_writer",
-    "no fixer-round cap — keep spawning until the waiter lands or the user merges",
+    "disagree",
+    "past the cap code stops arguing and says so on the PR",
   );
   assert.equal(
     classify("read_comments_and_fix", { prRound: 0, chainLocked: true }),
@@ -4669,5 +4671,147 @@ test("P2 F5: runReviewFixWriter decides from the branch and pushes what the fixe
   assert.ok(
     body.indexOf("branchHeads(") < body.indexOf("runChildInPhase"),
     "the before-head must be read before the fixer runs, not after",
+  );
+});
+
+const BRIEF_TWO = [
+  "status=action_required",
+  "next=read_comments_and_fix",
+  "round=3",
+  "head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "brief repo=moofone/icemining pr=99 head=aaaaaaaa",
+  "coverage path=src/pay.rs",
+  "brief_finding path=src/pay.rs line=88 sev=P1 title=credit_share overflows",
+  "brief_finding path=src/fee.rs sev=P2 title=fee rounds toward the pool",
+].join("\n");
+
+test("P2 F6: brief_finding lines parse into a stable, head-independent finding set", () => {
+  const parse = orch.parseBriefFindings;
+  assert.equal(typeof parse, "function", "parseBriefFindings must be exported");
+  assert.deepEqual(parse(BRIEF_TWO), [
+    "src/fee.rs P2 fee rounds toward the pool",
+    "src/pay.rs:88 P1 credit_share overflows",
+  ]);
+  assert.deepEqual(parse("next=yield\nround=2\n"), [], "no findings is an empty set, not a throw");
+  assert.deepEqual(
+    parse("brief repo=x pr=1 head=deadbeef\ncoverage path=a.rs"),
+    [],
+    "`brief` and `coverage` lines are not findings",
+  );
+
+  const tag = orch.findingsTag;
+  assert.equal(typeof tag, "function", "findingsTag must be exported");
+  assert.equal(tag([]), "", "an empty set has no tag — it can never look like a repeat");
+  assert.equal(
+    tag(parse(BRIEF_TWO)),
+    tag(parse(BRIEF_TWO.replace("round=3", "round=9").replace(/aaaa/g, "bbbb"))),
+    "the same findings against a different head and round must tag identically",
+  );
+  assert.notEqual(
+    tag(parse(BRIEF_TWO)),
+    tag(parse(BRIEF_TWO.replace("line=88", "line=91"))),
+    "a finding that moved is a different finding",
+  );
+});
+
+test("P2 F6: the same findings on a second head, or the round cap, is a disagreement", () => {
+  const classify = orch.classifyFeaturePrNext;
+  assert.equal(
+    classify("read_comments_and_fix", { prRound: 1 }),
+    "spawn_writer",
+    "the ordinary round is untouched",
+  );
+  assert.equal(
+    classify("read_comments_and_fix", { prRound: 1, findingsRepeated: true }),
+    "disagree",
+    "the fixer pushed and the reviewers repeated themselves: stop, do not spend another round",
+  );
+  assert.equal(orch.FIX_ROUND_CAP, 6);
+  assert.equal(
+    classify("read_comments_and_fix", { prRound: 5 }),
+    "spawn_writer",
+    "one round below the cap still gets a fixer",
+  );
+  assert.equal(
+    classify("read_comments_and_fix", { prRound: 6 }),
+    "disagree",
+    "PRs consumed seven fixers each; the cap is what stops that",
+  );
+  assert.equal(
+    classify("read_comments_and_fix", { prRound: 9, chainLocked: true }),
+    "refuse",
+    "a writer that holds the Feature outranks the cap: the verdict is queued, not disagreed",
+  );
+  assert.equal(
+    classify("read_comments_and_fix", { prRound: 9, workerLive: true }),
+    "refuse",
+  );
+  assert.equal(
+    classify("git_pr_land", { prRound: 9 }),
+    "land",
+    "the cap never blocks a land",
+  );
+});
+
+test("P2 F6: a disagreement is spent, commented on the PR, and spawns nothing", async () => {
+  const { dir, paths } = prFeatureFixture(6);
+  const { pi, execs } = execRecorder("");
+  const spawn = autoSettleSpawn(pi, "run-disagree-1");
+  const { ctx, notices } = makeFakeCtx();
+
+  const action = await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      { done: false, next: "read_comments_and_fix", output: BRIEF_TWO, round: "3" },
+    ),
+    6000,
+  );
+
+  assert.equal(action, "disagree", "the round cap stops the loop");
+  assert.equal(spawn.count, 0, "no seventh fixer");
+  const comment = execs.find((e) => e.startsWith("gh pr comment 99"));
+  assert.ok(comment, `one gh pr comment from code: ${execs.join(" | ")}`);
+  assert.match(comment!, /credit_share overflows/, "the open findings belong in the comment");
+  for (const argv of execs) assert.doesNotMatch(argv, /git pr-await|git pr-land|gh pr merge/);
+  const status = readFileSync(paths.statusFile, "utf8");
+  assert.match(status, /^phase: pr$/m, "a disagreement leaves the PR open, not done");
+  assert.match(status, /^next_action: disagreed at /m);
+  assert.equal(parentTurns(pi).length, 0, "the parent is not asked to argue with the reviewers");
+  assert.ok(notices.some((n) => /99/.test(n)));
+});
+
+test("P2 F6: dispatch records the finding set so the next round can see a repeat", async () => {
+  const { dir, paths } = prFeatureFixture(0);
+  const { pi } = execRecorder("status=handed_off\nnext=yield\n");
+  autoSettleSpawn(pi, "run-record-1");
+  const { ctx } = makeFakeCtx();
+
+  await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      { done: false, next: "read_comments_and_fix", output: BRIEF_TWO, round: "3" },
+    ),
+    6000,
+  );
+
+  const status = readFileSync(paths.statusFile, "utf8");
+  const tag = orch.findingsTag(orch.parseBriefFindings(BRIEF_TWO));
+  assert.match(
+    status,
+    new RegExp(`^last_findings: ${tag}$`, "m"),
+    `the finding set must survive a reload: ${status}`,
+  );
+  assert.match(
+    status,
+    /^pr_head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$/m,
+    "the head the findings were raised against is recorded with them",
   );
 });

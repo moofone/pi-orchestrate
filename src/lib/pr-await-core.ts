@@ -36,14 +36,19 @@ export const MECHANICAL = new Set(["git_pr_land", "git_pr_land_continue"]);
  * A verdict is one delivery. Marking it spent before the dispatch ran meant a
  * `refuse` — which is the normal answer while a fixer holds the chain lock for
  * half an hour — threw the finding away, and the waiter does not re-emit
- * (F4). Only these four actually did something with it; `refuse`, `notify`,
+ * (F4). Only these actually did something with it; `refuse`, `notify`,
  * `confirm` and `idle` leave it on disk to be retried.
+ *
+ * `disagree` is an answer too: code posted the disagreement on the PR and the
+ * loop is over. Leaving it undelivered would have the reconciler re-raise the
+ * same disagreement every 60 seconds (F6).
  */
 export const ACCEPTED_FEATURE_PR_ACTIONS = new Set([
 	"spawn_writer",
 	"reawait",
 	"land",
 	"archive",
+	"disagree",
 ]);
 
 export function isAcceptedFeaturePrAction(action: unknown): boolean {

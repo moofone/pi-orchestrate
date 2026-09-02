@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import {
+	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	readPid,
 	waiterManualFiles,
@@ -196,4 +197,15 @@ test("a missing state directory answers 'no waiter' instead of throwing", () => 
 		isDriverRunning("2232", dir, () => true),
 		false,
 	);
+});
+
+test("P2 F6: a disagreement consumes the verdict — the loop must not restart it every 60s", () => {
+	assert.equal(isAcceptedFeaturePrAction("disagree"), true);
+	for (const refused of ["refuse", "notify", "confirm", "idle"]) {
+		assert.equal(
+			isAcceptedFeaturePrAction(refused),
+			false,
+			`${refused} did nothing with the verdict; it stays on disk for retry`,
+		);
+	}
 });

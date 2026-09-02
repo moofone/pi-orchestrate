@@ -2216,6 +2216,8 @@ function upsertStatusFile(
     pendingVerdict?: string;
     /** Head the current verdict was raised against. */
     prHead?: string;
+    /** Tag of the `brief_finding` set last dispatched; `none` clears it. */
+    lastFindings?: string;
     verdictFingerprint?: string;
     tasks?: Task[];
   },
@@ -2279,6 +2281,7 @@ function upsertStatusFile(
   if (patch.planReview !== undefined) setField("plan_review", patch.planReview);
   if (patch.pendingVerdict !== undefined) setField("pending_verdict", patch.pendingVerdict);
   if (patch.prHead !== undefined) setField("pr_head", patch.prHead);
+  if (patch.lastFindings !== undefined) setField("last_findings", patch.lastFindings);
   if (patch.verdictFingerprint !== undefined) {
     setField("verdict_fingerprint", patch.verdictFingerprint);
   }
@@ -3566,8 +3569,64 @@ export type FeaturePrAction =
   | "land"
   | "archive"
   | "confirm"
+  /** The loop is over: code says so on the PR and stops. */
+  | "disagree"
   /** A writer already holds this Feature; a second one would race it. */
   | "refuse";
+
+/**
+ * Fix-writers one Feature PR may spend before code stops arguing.
+ *
+ * PR 275 consumed seven fixers and PR 2178 consumed seven; nothing implemented
+ * the spec's "until the orchestrator disagrees with the reviewers" (F6), so the
+ * loop only ever ended when the bots gave up or something else broke.
+ */
+export const FIX_ROUND_CAP = 6;
+
+/**
+ * The reviewers' finding set, from the waiter's own `brief_finding` lines.
+ *
+ * Sorted and stripped of head, round and elapsed noise, so the same complaints
+ * against two different heads produce the same list — which is the signal that
+ * a fixer pushed and changed nobody's mind.
+ */
+export function parseBriefFindings(body: string): string[] {
+  const out = new Set<string>();
+  for (const line of String(body ?? "").split("\n")) {
+    const m = line.match(/^\s*brief_finding\s+(.*)$/);
+    if (!m) continue;
+    const rest = m[1];
+    const path = rest.match(/\bpath=(\S+)/)?.[1] ?? "";
+    const at = rest.match(/\bline=(\d+)/)?.[1] ?? "";
+    const sev = rest.match(/\bsev=(\S+)/)?.[1] ?? "";
+    // `title=` runs to the end of the line — it is free text with spaces.
+    const title = rest.match(/\btitle=(.*)$/)?.[1]?.trim() ?? "";
+    if (!path && !title) continue;
+    out.add(`${path}${at ? `:${at}` : ""}${sev ? ` ${sev}` : ""}${title ? ` ${title}` : ""}`);
+  }
+  return [...out].sort();
+}
+
+/**
+ * A comparable tag for a finding set. Empty for an empty set: "no findings" must
+ * never match "no findings" and read as a repeat.
+ */
+export function findingsTag(findings: string[]): string {
+  if (!findings.length) return "";
+  return fingerprintTag(findings.join("\n"));
+}
+
+/**
+ * The head a verdict was raised against.
+ *
+ * The waiter prints `head=<sha>` on its own line, and again inside the `brief`
+ * and `comment` lines. `parseKeyedField` takes the last match, which is one of
+ * those — so read the standalone line first and only fall back to a scan.
+ */
+export function verdictHead(body: string): string {
+  const own = String(body ?? "").match(/^head=(\S+)\s*$/m)?.[1];
+  return (own ?? parseKeyedField(body, "head")).trim();
+}
 
 /** Fix-spawns already spent on this PR. `pr_round: none` counts as zero. */
 function fixSpawnCount(value: number | string | undefined): number {
@@ -3591,6 +3650,8 @@ export function classifyFeaturePrNext(
     chainLocked?: boolean;
     /** The recorded `worker_run_id` snapshot is not terminal yet. */
     workerLive?: boolean;
+    /** The same `brief_finding` set already came back on an earlier head. */
+    findingsRepeated?: boolean;
   } = {},
 ): FeaturePrAction {
   const verdict = String(next ?? "").trim().toLowerCase();
@@ -3600,8 +3661,13 @@ export function classifyFeaturePrNext(
   if (MECHANICAL.has(verdict)) return "land";
   if (verdict === "read_comments_and_fix") {
     // One writer per Feature. A second fixer pushing onto the same branch is
-    // how two children clobber each other's commits.
+    // how two children clobber each other's commits. This outranks the
+    // termination rules below: a held Feature queues the verdict for retry,
+    // and spending it on a disagreement would throw the round away.
     if (state.chainLocked || state.workerLive) return "refuse";
+    // The loop ends at merge or at disagreement, and nothing else (F6).
+    if (state.findingsRepeated) return "disagree";
+    if (fixSpawnCount(state.prRound) >= FIX_ROUND_CAP) return "disagree";
     return "spawn_writer";
   }
   if (verdict === "investigate_dead_reviewers") return "reawait";
@@ -4028,10 +4094,30 @@ export async function dispatchFeaturePrVerdict(
 ): Promise<FeaturePrAction> {
   sweepStaleWorkerRecord(paths);
   const status = readText(paths.statusFile);
+
+  // The reviewers' own finding set, and the head they raised it against. The
+  // same set on a *different* head means a fixer pushed and changed nobody's
+  // mind — the disagreement the spec asks for, and the only thing that ends
+  // the loop short of a merge (F6). The same set on the *same* head is just
+  // the verdict arriving twice and must not stop anything.
+  const head = verdictHead(result.output);
+  const findings = parseBriefFindings(result.output);
+  const findingsTagNow = findingsTag(findings);
+  const lastFindings = statusField(status, "last_findings");
+  const lastHead = statusField(status, "pr_head");
+  const findingsRepeated = Boolean(
+    findingsTagNow &&
+      findingsTagNow === lastFindings &&
+      head &&
+      !isPendingToken(lastHead) &&
+      head !== lastHead,
+  );
+
   const action = classifyFeaturePrNext(result.next, {
     prRound: statusField(status, "pr_round"),
     chainLocked: opts.holdsChainLock ? false : RUNNING_CHAINS.has(paths.featureDir),
     workerLive: featureWorkerLive(status),
+    findingsRepeated,
   });
 
   // The waiter owns the rest: no status write, no toast, no model turn.
@@ -4084,6 +4170,20 @@ export async function dispatchFeaturePrVerdict(
   };
 
   const spent = fixSpawnCount(statusField(status, "pr_round"));
+
+  if (action === "disagree") {
+    // Spend the verdict: the loop is over, and leaving it undelivered would
+    // have the reconciler re-raise the same disagreement every 60 seconds.
+    accept();
+    await recordFeatureDisagreement(pi, ctx, paths, pr, worktree, {
+      reason: findingsRepeated
+        ? `the same ${findings.length} finding${findings.length === 1 ? "" : "s"} came back on a new head after fixer round ${spent}`
+        : `${spent} fixer rounds is the cap`,
+      head: head || undefined,
+      findings,
+    });
+    return action;
+  }
 
   if (action === "reawait") {
     // A reviewer that never answered leaves nothing to fix, so no writer is
@@ -4141,6 +4241,12 @@ export async function dispatchFeaturePrVerdict(
   // fixer holds the Feature for the better part of an hour.
   const fix = async () => {
     accept();
+    // What this round was sent to fix, so the next one can recognise the same
+    // complaints coming back against a head this fixer moved.
+    upsertStatusFile(paths, {
+      ...(findingsTagNow ? { lastFindings: findingsTagNow } : {}),
+      ...(head ? { prHead: head } : {}),
+    });
     await runReviewFixWriter(pi, ctx, paths, pr, worktree, result);
   };
   if (opts.holdsChainLock) {
