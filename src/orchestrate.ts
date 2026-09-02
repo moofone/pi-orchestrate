@@ -71,6 +71,16 @@ import {
   type FeaturePhase,
   type FeaturePhase as Phase,
 } from "./lib/feature-state.ts";
+import {
+  DEFAULT_QA_PASS_CAP,
+  needsFeatureQa,
+  needsPlanReview,
+  planReviewReconcile,
+  planReviewState,
+  qaPassState,
+  writerBlockedByPlanReview,
+  type PlanReviewState,
+} from "./lib/lifecycle.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
 import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
 import {
@@ -443,12 +453,6 @@ function isPaused(status: string): boolean {
   return v === "after-task" || v === "on" || v === "yes" || v === "paused";
 }
 
-/**
- * QA → fix → QA → fix → PR. Cap 1 meant the remediation Tasks QA itself asked
- * for were implemented and then never looked at again; the second pass is what
- * checks QA's own fixes (F12). `MAX_QA_PASS_CAP` is the ceiling.
- */
-const DEFAULT_QA_PASS_CAP = 2;
 const DEFAULT_AUTO_ADVANCE_ON_LANDED = true;
 const SIDECAR_PATH = join(dirname(fileURLToPath(import.meta.url)), "orchestrate.json");
 
@@ -859,87 +863,6 @@ function presentDraftApproveCards(
   } catch (error) {
     if (!isStaleCtxError(error)) throw error;
   }
-}
-
-export function clampedQaPassCap(raw: number): number {
-  if (!Number.isFinite(raw) || raw < 0) return DEFAULT_QA_PASS_CAP;
-  return Math.min(MAX_QA_PASS_CAP, Math.floor(raw));
-}
-
-function qaPassState(status: string): { pass: number; cap: number } {
-  const pass = Number.parseInt(statusField(status, "qa_pass") || "0", 10);
-  const rawCap = Number.parseInt(
-    statusField(status, "qa_pass_cap") || String(DEFAULT_QA_PASS_CAP),
-    10,
-  );
-  return {
-    pass: Number.isFinite(pass) && pass > 0 ? pass : 0,
-    cap: clampedQaPassCap(Number.isFinite(rawCap) ? rawCap : DEFAULT_QA_PASS_CAP),
-  };
-}
-
-function needsFeatureQa(status: string): boolean {
-  const { pass, cap } = qaPassState(status);
-  return pass < cap;
-}
-
-export type PlanReviewState = "none" | "running" | "done" | "failed";
-
-/** Durable plan-reviewer gate. Missing field on old status.md is `none`. */
-export function planReviewState(status: string): PlanReviewState {
-  const raw = statusField(status, "plan_review").toLowerCase();
-  if (raw === "running" || raw === "in_progress") return "running";
-  if (raw === "done" || raw === "complete" || raw === "completed") return "done";
-  if (raw === "failed" || raw === "error") return "failed";
-  return "none";
-}
-
-/**
- * True when implementation must not start yet: plan-reviewer has not finished,
- * and this Feature has not already passed that gate (a Task is in flight / done,
- * or the chain is already implementing).
- */
-export function needsPlanReview(plan: string, status: string): boolean {
-  if (planReviewState(status) === "done") return false;
-  const tasks = parseTasks(plan);
-  if (tasks.some((t) => t.status !== "pending")) return false;
-  const phase = statusField(status, "phase").toLowerCase();
-  if (phase === "implementing" || phase === "feature-qa" || phase === "pr") {
-    return false;
-  }
-  return true;
-}
-
-/** Hard overlap guard: a writer must not spawn while plan-reviewer is live. */
-export function writerBlockedByPlanReview(status: string): string | undefined {
-  if (planReviewState(status) === "running") {
-    return "plan-reviewer still running; refusing writer";
-  }
-  return undefined;
-}
-
-export type PlanReviewReconcile = "keep" | "wait" | "done" | "failed";
-
-/**
- * What to do with a `plan_review: running` whose session may be gone (F14).
- *
- * Tasks got orphan recovery; the reviewer did not, so a plan-reviewer that
- * died with its session left the field at `running` forever — and
- * `writerBlockedByPlanReview` then refused every approve and resume, while
- * `draftApproveCards` hid the card. The Feature could not be reached at all.
- *
- * No run artifact at all is `failed`, not `wait`: this is only consulted under
- * the chain lock, so a genuinely live review is one this process is running
- * and would have recorded. A missing record means nobody is home.
- */
-export function planReviewReconcile(
-  state: PlanReviewState,
-  snapshot: RunSnapshot | undefined,
-): PlanReviewReconcile {
-  if (state !== "running") return "keep";
-  if (!snapshot) return "failed";
-  if (!snapshot.terminal) return "wait";
-  return snapshot.ok ? "done" : "failed";
 }
 
 export function worktreePathFor(branch: string, repo = "icemining"): string {
@@ -2236,6 +2159,24 @@ export {
 } from "./lib/feature-state.ts";
 
 /**
+ * The plan-reviewer / QA-pass gates live in `lib/lifecycle.ts`: the durable
+ * `plan_review` field, the QA pass counter, and the reconcile rule for a
+ * reviewer that died with its session. Re-exported here because that is
+ * where every caller already looks.
+ */
+export {
+  MAX_QA_PASS_CAP,
+  approveBlockedByPlanReview,
+  clampedQaPassCap,
+  needsPlanReview,
+  planReviewReconcile,
+  planReviewState,
+  writerBlockedByPlanReview,
+  type PlanReviewReconcile,
+  type PlanReviewState,
+} from "./lib/lifecycle.ts";
+
+/**
  * Append one line to `handoffs/transitions.log`.
  *
  * Best-effort by design: the log is a record of what happened, and failing to
@@ -2515,7 +2456,6 @@ const PLANNER_TURN_BUDGET = { maxTurns: 80, graceTurns: 15 };
 const WRITER_MAX_CONCURRENCY = 2;
 const PLANNER_MODEL = "xai/grok-4.6:high";
 export const MAX_QA_FINDINGS = 8;
-export const MAX_QA_PASS_CAP = 2;
 
 export function isAllowedPlannerModel(model: string): boolean {
   if (typeof model !== "string") return false;
