@@ -5610,3 +5610,103 @@ test("P4 F22: the worktree failure leads with git's own words", () => {
     "a silent failure still has to render",
   );
 });
+
+/* ---------------------------------------------------------------- *
+ * Phase 5 — the status.md phase schema (F21).
+ *
+ * `phase` is free text in a text file, matched by regexes and Sets spread
+ * across three modules. Nothing kept the writers and the readers in agreement,
+ * and they were not: `liveFeatureNeedsIdleParent` tested `^(implement|pr|qa)$`
+ * against a file that says `implementing` and `feature-qa`, and stayed wrong
+ * for days in every session in the repo (F8).
+ *
+ * `FeaturePhase` closes one direction at compile time — a write of a phase not
+ * in the list will not typecheck. These tests close the other: a reader that
+ * matches a name no writer produces is dead code that looks like coverage.
+ * ---------------------------------------------------------------- */
+
+const PHASE_READERS = [
+  "src/orchestrate.ts",
+  "src/lib/pr-await-core.ts",
+  "src/lib/pr-reconcile.ts",
+] as const;
+
+function readRepoFile(rel: string): string {
+  return readFileSync(new URL(`../${rel}`, import.meta.url), "utf8");
+}
+
+test("P5 F21: every phase written is one of the declared phases", () => {
+  const declared = new Set<string>(orch.FEATURE_PHASES as readonly string[]);
+  assert.ok(declared.size > 0);
+
+  const written = new Set<string>();
+  for (const rel of PHASE_READERS) {
+    for (const m of readRepoFile(rel).matchAll(/\bphase:\s*"([a-z][a-z-]*)"/g)) {
+      written.add(m[1]!);
+    }
+  }
+  assert.ok(written.size >= 6, `expected to find the phase writes; found ${[...written]}`);
+  assert.deepEqual(
+    [...written].filter((p) => !declared.has(p)).sort(),
+    [],
+    "a phase written but not declared is a value no reader was taught",
+  );
+});
+
+test("P5 F21: every phase a reader matches is one a writer produces", () => {
+  const known = new Set<string>([
+    ...(orch.FEATURE_PHASES as readonly string[]),
+    ...(orch.LEGACY_FEATURE_PHASES as readonly string[]),
+  ]);
+
+  const matched = new Set<string>();
+  for (const rel of PHASE_READERS) {
+    const src = readRepoFile(rel);
+    // `phase === "x"` comparisons.
+    for (const m of src.matchAll(/\bphase\s*[!=]==\s*"([a-z][a-z-]*)"/g)) matched.add(m[1]!);
+    // Named phase sets: IDLE_PARENT_PHASES, BRANCH_OWNER_PHASES, and any later one.
+    for (const m of src.matchAll(/PHASES\s*=\s*new Set\(\[([^\]]*)\]\)/g)) {
+      for (const s of m[1]!.matchAll(/"([a-z][a-z-]*)"/g)) matched.add(s[1]!);
+    }
+  }
+  assert.ok(matched.size >= 6, `expected to find the phase readers; found ${[...matched]}`);
+  assert.deepEqual(
+    [...matched].filter((p) => !known.has(p)).sort(),
+    [],
+    "a reader matching a phase nobody writes is the F8 bug, which read for days as coverage",
+  );
+});
+
+test("P5 F21: the legacy spellings are read-only", () => {
+  const legacy = orch.LEGACY_FEATURE_PHASES as readonly string[];
+  assert.ok(legacy.length > 0, "there is at least one, and it is documented as such");
+  for (const rel of PHASE_READERS) {
+    const src = readRepoFile(rel);
+    for (const name of legacy) {
+      assert.equal(
+        new RegExp(String.raw`\bphase:\s*"${name}"`).test(src),
+        false,
+        `${rel} writes the legacy phase "${name}"; legacy spellings are accepted, never produced`,
+      );
+    }
+  }
+  assert.equal(
+    orch.isFeaturePhase("qa"),
+    false,
+    "and the type guard agrees: a legacy spelling is not part of the schema",
+  );
+  assert.equal(orch.isFeaturePhase("feature-qa"), true);
+});
+
+test("P5 F21: the idle-parent gate covers exactly the phases that own a writer", () => {
+  const src = readRepoFile("src/orchestrate.ts");
+  const set = src.match(/IDLE_PARENT_PHASES\s*=\s*new Set\(\[([^\]]*)\]\)/)?.[1] ?? "";
+  const phases = [...set.matchAll(/"([a-z][a-z-]*)"/g)].map((m) => m[1]!).sort();
+  assert.deepEqual(
+    phases,
+    ["feature-qa", "implementing", "pr"],
+    "these are the phases in which a Feature holds a writer and a branch; " +
+      "`planning` and `reviewing` own no worktree, and a `paused` or `blocked` " +
+      "Feature is not running anything for the parent to stay out of the way of",
+  );
+});

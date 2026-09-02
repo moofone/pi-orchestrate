@@ -2306,10 +2306,45 @@ export function reopenTasksThatNeverStarted(plan: string, handoffsDir: string): 
   return next;
 }
 
+/**
+ * Every value `phase:` may take in status.md.
+ *
+ * `phase` was free text matched by five different regexes in four files, and
+ * the regexes disagreed with the writers: `liveFeatureNeedsIdleParent` tested
+ * `^(implement|pr|qa)$` against a file that says `implementing` and
+ * `feature-qa`, and was wrong for days in every session in the repo (F8). The
+ * type below makes a phase nobody reads a compile error at the write site;
+ * `test/orchestrate.test.ts` closes the other direction — a reader matching a
+ * name nobody writes.
+ */
+export const FEATURE_PHASES = [
+  "planning",
+  "reviewing",
+  "implementing",
+  "feature-qa",
+  "pr",
+  "done",
+  "paused",
+  "blocked",
+] as const;
+
+export type FeaturePhase = (typeof FEATURE_PHASES)[number];
+
+/**
+ * Spellings that appear only in readers, kept so a Feature parked under an
+ * older build stays visible. Nothing writes these; a reader that accepts one
+ * is being backwards-compatible, not describing the schema.
+ */
+export const LEGACY_FEATURE_PHASES = ["qa"] as const;
+
+export function isFeaturePhase(value: string): value is FeaturePhase {
+  return (FEATURE_PHASES as readonly string[]).includes(value);
+}
+
 function upsertStatusFile(
   paths: Paths,
   patch: {
-    phase?: string;
+    phase?: FeaturePhase;
     activeTask?: string;
     missionId?: string;
     workerRunId?: string;
