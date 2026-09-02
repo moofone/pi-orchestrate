@@ -6,6 +6,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
+import { statusValue as sharedStatusValue } from "./feature-state.ts";
+
 export const ACTIONABLE = new Set([
 	"read_comments_and_fix",
 	"investigate_dead_reviewers",
@@ -471,10 +473,17 @@ export type FeaturePrOwner = {
 	phase?: string;
 };
 
+/**
+ * One status.md field, or `undefined` (with `none` counting as absent).
+ *
+ * Was a second `new RegExp` built per call, and it disagreed with
+ * orchestrate's copy: case-sensitive where that one was not, and requiring a
+ * non-empty value where that one returned `""`. Both now call the one parser
+ * in `feature-state.ts`, so a field cannot mean two things depending on which
+ * module asked.
+ */
 function statusValue(text: string, key: string): string | undefined {
-	const m = text.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-	const v = m?.[1]?.trim();
-	return v && v !== "none" ? v : undefined;
+	return sharedStatusValue(text, key);
 }
 
 /** `pr: 2142` and `pr: https://github.com/o/r/pull/2142` name the same PR. */

@@ -5654,33 +5654,46 @@ test("P5 F21: every phase written is one of the declared phases", () => {
 });
 
 test("P5 F21: every phase a reader matches is one a writer produces", () => {
+  // Scraping the source for `phase === "x"` literals is how this used to be
+  // checked, because there was nothing else to check against. There is now:
+  // every reader canonicalises through `parsePhase`, so the question is
+  // whether the vocabulary it accepts is the vocabulary that gets written.
   const known = new Set<string>([
     ...(orch.FEATURE_PHASES as readonly string[]),
-    ...(orch.LEGACY_FEATURE_PHASES as readonly string[]),
+    ...Object.keys(orch.LEGACY_PHASE_ALIASES as Record<string, string>),
   ]);
 
   const matched = new Set<string>();
   for (const rel of PHASE_READERS) {
     const src = readRepoFile(rel);
-    // `phase === "x"` comparisons.
     for (const m of src.matchAll(/\bphase\s*[!=]==\s*"([a-z][a-z-]*)"/g)) matched.add(m[1]!);
-    // Named phase sets: IDLE_PARENT_PHASES, BRANCH_OWNER_PHASES, and any later one.
     for (const m of src.matchAll(/PHASES\s*=\s*new Set\(\[([^\]]*)\]\)/g)) {
       for (const s of m[1]!.matchAll(/"([a-z][a-z-]*)"/g)) matched.add(s[1]!);
     }
   }
-  assert.ok(matched.size >= 6, `expected to find the phase readers; found ${[...matched]}`);
   assert.deepEqual(
     [...matched].filter((p) => !known.has(p)).sort(),
     [],
     "a reader matching a phase nobody writes is the F8 bug, which read for days as coverage",
   );
+
+  // And every legacy spelling a reader may still meet resolves to a real phase
+  // rather than to `undefined`, which is what would hide the Feature.
+  for (const [legacy, canonical] of Object.entries(
+    orch.LEGACY_PHASE_ALIASES as Record<string, string>,
+  )) {
+    assert.equal(
+      orch.parsePhase(legacy),
+      canonical,
+      `the legacy spelling "${legacy}" must resolve, not disappear`,
+    );
+  }
 });
 
 test("P5 F21: the legacy spellings are read-only", () => {
-  const legacy = orch.LEGACY_FEATURE_PHASES as readonly string[];
+  const legacy = Object.keys(orch.LEGACY_PHASE_ALIASES as Record<string, string>);
   assert.ok(legacy.length > 0, "there is at least one, and it is documented as such");
-  for (const rel of PHASE_READERS) {
+  for (const rel of [...PHASE_READERS, "src/lib/feature-state.ts"]) {
     const src = readRepoFile(rel);
     for (const name of legacy) {
       assert.equal(
@@ -5690,12 +5703,126 @@ test("P5 F21: the legacy spellings are read-only", () => {
       );
     }
   }
-  assert.equal(
-    orch.isFeaturePhase("qa"),
-    false,
-    "and the type guard agrees: a legacy spelling is not part of the schema",
-  );
+  for (const name of legacy) {
+    assert.equal(
+      orch.isFeaturePhase(name),
+      false,
+      `the type guard must not admit the legacy spelling "${name}" into the schema`,
+    );
+  }
   assert.equal(orch.isFeaturePhase("feature-qa"), true);
+});
+
+/* ---------------------------------------------------------------- *
+ * §5 — the state machine, wired.
+ *
+ * `lib/feature-state.ts` is exercised under fast-check in
+ * `test/feature-state.test.ts`. These cover the wiring: every phase write in
+ * the extension goes through `upsertStatusFile`, which is therefore the one
+ * place the lifecycle can be enforced rather than merely described.
+ * ---------------------------------------------------------------- */
+
+function statusFixture(lines: string[]): {
+  dir: string;
+  paths: Record<string, string>;
+  read: () => string;
+  log: () => string;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "orch-sm-"));
+  const paths = {
+    repo: "icemining",
+    gitRoot: dir,
+    repoDir: dir,
+    featureDir: dir,
+    planFile: join(dir, "plan.md"),
+    statusFile: join(dir, "status.md"),
+    handoffsDir: join(dir, "handoffs"),
+    archiveDir: join(dir, "archive"),
+  };
+  writeFileSync(paths.statusFile, ["# Status", "", ...lines, ""].join("\n"));
+  return {
+    dir,
+    paths,
+    read: () => readFileSync(paths.statusFile, "utf8"),
+    log: () => {
+      const p = join(paths.handoffsDir, "transitions.log");
+      return existsSync(p) ? readFileSync(p, "utf8") : "";
+    },
+  };
+}
+
+test("§5: a legal move is written and recorded in transitions.log", () => {
+  const f = statusFixture(["phase: implementing", "pr: none"]);
+  (orch.upsertStatusFile as Function)(f.paths, {
+    phase: "feature-qa",
+    nextAction: "all Tasks done",
+  });
+
+  assert.match(f.read(), /^phase: feature-qa$/m);
+  const line = f.log().trim().split("\n").at(-1)!;
+  const [when, from, to, reason] = line.split("\t");
+  assert.ok(!Number.isNaN(Date.parse(when!)), `timestamp must parse: ${when}`);
+  assert.equal(from, "implementing");
+  assert.equal(to, "feature-qa");
+  assert.equal(reason, "all Tasks done", "the reason is the next_action that caused the move");
+});
+
+test("§5: an illegal move is refused, leaves the phase alone, and says so", () => {
+  // done is terminal. Before the machine, a stray write here would silently
+  // re-open a finished Feature — the F16 shape, where a Feature ends up in a
+  // phase no path can recover it from.
+  const f = statusFixture(["phase: done", "pr: 42"]);
+  (orch.upsertStatusFile as Function)(f.paths, {
+    phase: "implementing",
+    nextAction: "resume",
+  });
+
+  assert.match(f.read(), /^phase: done$/m, "the phase on disk must not move");
+  assert.match(f.read(), /next_action:.*phase move refused/, "and the refusal is visible");
+  assert.match(f.log(), /REFUSED/, "and recorded");
+  assert.match(f.log(), /done\timplementing/, "with both ends of the attempted move");
+});
+
+test("§5: a refused move still applies the rest of the patch", () => {
+  // The fields around `phase` are usually the evidence for why the move was
+  // attempted; dropping them would make the refusal harder to diagnose.
+  const f = statusFixture(["phase: done", "pr: none"]);
+  (orch.upsertStatusFile as Function)(f.paths, { phase: "pr", pr: "77" });
+  assert.match(f.read(), /^pr: 77$/m);
+  assert.match(f.read(), /^phase: done$/m);
+});
+
+test("§5: a self-transition is legal but does not flood the log", () => {
+  // `pr → pr` happens on every waiter handshake. What changed is next_action.
+  const f = statusFixture(["phase: pr", "pr: 42"]);
+  for (let i = 0; i < 5; i++) {
+    (orch.upsertStatusFile as Function)(f.paths, {
+      phase: "pr",
+      nextAction: `pr-await round ${i}`,
+    });
+  }
+  assert.match(f.read(), /^phase: pr$/m);
+  assert.match(f.read(), /next_action: pr-await round 4/);
+  assert.equal(f.log().trim(), "", "five handshakes must not be five history entries");
+});
+
+test("§5: a Feature with no phase yet may only start at the entry phase", () => {
+  const fresh = statusFixture(["pr: none"]);
+  (orch.upsertStatusFile as Function)(fresh.paths, { phase: "pr", nextAction: "skip ahead" });
+  assert.doesNotMatch(fresh.read(), /^phase: pr$/m, "a Feature cannot begin mid-lifecycle");
+
+  const seeded = statusFixture(["pr: none"]);
+  (orch.upsertStatusFile as Function)(seeded.paths, { phase: "planning", nextAction: "seed" });
+  assert.match(seeded.read(), /^phase: planning$/m);
+});
+
+test("§5: a legacy phase on disk is understood, not treated as unset", () => {
+  // A Feature parked by an older build says `qa`. It must resolve to
+  // feature-qa, so the moves legal from feature-qa are legal from it — not be
+  // read as "no phase", which would only permit planning.
+  const f = statusFixture(["phase: qa", "pr: none"]);
+  (orch.upsertStatusFile as Function)(f.paths, { phase: "pr", nextAction: "opening the PR" });
+  assert.match(f.read(), /^phase: pr$/m, "qa → pr is feature-qa → pr, which is legal");
 });
 
 test("P5 F21: the idle-parent gate covers exactly the phases that own a writer", () => {

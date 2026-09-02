@@ -23,6 +23,7 @@
 
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   cpSync,
   existsSync,
   lstatSync,
@@ -57,6 +58,14 @@ import {
   waiterPaths,
   type FeaturePrOwner,
 } from "./lib/pr-await-core.ts";
+import {
+  TRANSITIONS_LOG as TRANSITIONS_LOG_NAME,
+  formatTransitionLogLine,
+  readPhase as readFeaturePhase,
+  statusField as readStatusField,
+  transitionRefusal as phaseTransitionRefusal,
+  type FeaturePhase as Phase,
+} from "./lib/feature-state.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
 import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
 
@@ -444,9 +453,17 @@ function featureDisplayName(plan: string): string {
   return "unnamed";
 }
 
+/**
+ * One `key: value` from a status.md.
+ *
+ * The body moved to `lib/feature-state.ts` and stopped being a regex. It used
+ * to build `new RegExp("^" + key + ":\\s*(.*)$", "im")` on every call — an
+ * unescaped key interpolated into a pattern, a fresh compile per field, and a
+ * definition that disagreed with pr-await-core's copy about case, about empty
+ * values, and about `none`. Both now call the same parser.
+ */
 function statusField(text: string, key: string): string {
-  const re = new RegExp(`^${key}:\\s*(.*)$`, "im");
-  return (text.match(re)?.[1] ?? "").trim();
+  return readStatusField(text, key);
 }
 
 function isPaused(status: string): boolean {
@@ -2307,41 +2324,53 @@ export function reopenTasksThatNeverStarted(plan: string, handoffsDir: string): 
 }
 
 /**
- * Every value `phase:` may take in status.md.
- *
- * `phase` was free text matched by five different regexes in four files, and
- * the regexes disagreed with the writers: `liveFeatureNeedsIdleParent` tested
- * `^(implement|pr|qa)$` against a file that says `implementing` and
- * `feature-qa`, and was wrong for days in every session in the repo (F8). The
- * type below makes a phase nobody reads a compile error at the write site;
- * `test/orchestrate.test.ts` closes the other direction — a reader matching a
- * name nobody writes.
+ * The Feature lifecycle lives in `lib/feature-state.ts`: the phase vocabulary,
+ * the legal moves between phases, and the one line-based status.md parser that
+ * replaced the per-call `new RegExp` readers. Re-exported here because that is
+ * where every caller already looks.
  */
-export const FEATURE_PHASES = [
-  "planning",
-  "reviewing",
-  "implementing",
-  "feature-qa",
-  "pr",
-  "done",
-  "paused",
-  "blocked",
-] as const;
-
-export type FeaturePhase = (typeof FEATURE_PHASES)[number];
+export {
+  FEATURE_PHASES,
+  INITIAL_PHASE,
+  LEGACY_PHASE_ALIASES,
+  PHASE_TRANSITIONS,
+  TERMINAL_PHASES,
+  TRANSITIONS_LOG,
+  canTransition,
+  formatTransitionLogLine,
+  isFeaturePhase,
+  parsePhase,
+  parseStatusFields,
+  readPhase,
+  transitionRefusal,
+  type FeaturePhase,
+} from "./lib/feature-state.ts";
 
 /**
- * Spellings that appear only in readers, kept so a Feature parked under an
- * older build stays visible. Nothing writes these; a reader that accepts one
- * is being backwards-compatible, not describing the schema.
+ * Append one line to `handoffs/transitions.log`.
+ *
+ * Best-effort by design: the log is a record of what happened, and failing to
+ * write history must never stop the thing that was happening. Append-only, so
+ * two chains touching one Feature cannot lose each other's lines.
  */
-export const LEGACY_FEATURE_PHASES = ["qa"] as const;
-
-export function isFeaturePhase(value: string): value is FeaturePhase {
-  return (FEATURE_PHASES as readonly string[]).includes(value);
+function appendTransitionLog(
+  paths: Paths,
+  from: Phase | undefined,
+  to: Phase,
+  reason: string,
+): void {
+  try {
+    mkdirSync(paths.handoffsDir, { recursive: true });
+    appendFileSync(
+      join(paths.handoffsDir, TRANSITIONS_LOG_NAME),
+      formatTransitionLogLine({ at: new Date(), from, to, reason }),
+    );
+  } catch {
+    /* history is not worth a crash */
+  }
 }
 
-function upsertStatusFile(
+export function upsertStatusFile(
   paths: Paths,
   patch: {
     phase?: FeaturePhase;
@@ -2377,6 +2406,32 @@ function upsertStatusFile(
   },
 ): void {
   let text = readText(paths.statusFile);
+  // Every phase write in this extension arrives here, which makes this the one
+  // place the lifecycle can be enforced rather than described. An illegal move
+  // is refused and recorded; the rest of the patch still applies, because the
+  // fields around `phase` are usually the evidence for why the move was
+  // attempted and dropping them would make the refusal harder to diagnose.
+  // Nothing throws: a wrong transition table must not be able to take down a
+  // chain that was otherwise working.
+  if (patch.phase) {
+    const from = readFeaturePhase(text);
+    const refusal = phaseTransitionRefusal(from, patch.phase);
+    if (refusal) {
+      appendTransitionLog(paths, from, patch.phase, `REFUSED ${refusal}`);
+      patch = {
+        ...patch,
+        phase: undefined,
+        // Visible where a user already looks. A refusal nobody can see is the
+        // same wedged Feature as before, with extra machinery.
+        nextAction: `${patch.nextAction ?? ""} [phase move refused: ${refusal}]`.trim(),
+      };
+    } else if (from !== patch.phase) {
+      // Self-transitions are legal but unlogged: `pr → pr` happens on every
+      // waiter handshake, and a line per poll would bury the moves that matter.
+      // What changed on a self-transition is `next_action`, which is written.
+      appendTransitionLog(paths, from, patch.phase, patch.nextAction ?? "");
+    }
+  }
   if (!text.trim()) {
     text = [
       "# Status",
