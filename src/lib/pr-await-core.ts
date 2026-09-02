@@ -575,6 +575,100 @@ export function findFeatureOwningPr(
 	return undefined;
 }
 
+/**
+ * Every live Feature sitting in one of `phases` with a PR number recorded.
+ *
+ * The same walk as `findFeatureOwningPr`, asking the opposite question: not
+ * "who owns this PR?" but "which Features are waiting on one?". That is the
+ * list the durable reconciler works from, and it comes from `status.md` rather
+ * than from any session's memory — which is the whole point. A latch lives and
+ * dies with a pi process; these files do not (F1).
+ *
+ * `archive/` is skipped: a finished Feature is not reconciled.
+ */
+export function listFeaturePrOwners(
+	opts: { root?: string; phases?: Iterable<string> } = {},
+): FeaturePrOwner[] {
+	const root = opts.root ?? process.env.GHL_ORCH_ROOT ?? join(homedir(), "orchestrator");
+	const phases = new Set(
+		[...(opts.phases ?? ["pr"])].map((p) => p.trim().toLowerCase()),
+	);
+	const out: FeaturePrOwner[] = [];
+	for (const repoDir of childDirs(root)) {
+		if (NOT_A_FEATURE_DIR.has(repoDir)) continue;
+		for (const name of childDirs(join(root, repoDir))) {
+			if (NOT_A_FEATURE_DIR.has(name)) continue;
+			const dir = join(root, repoDir, name);
+			const statusFile = join(dir, "status.md");
+			let text: string;
+			try {
+				text = readFileSync(statusFile, "utf8");
+			} catch {
+				continue;
+			}
+			const phase = (statusValue(text, "phase") ?? "").toLowerCase();
+			if (!phases.has(phase)) continue;
+			const pr = statusPrNumber(text);
+			if (!pr) continue;
+			const owner = featureOwnerFromStatus(dir, statusFile, text, pr);
+			if (owner) out.push(owner);
+		}
+	}
+	return out;
+}
+
+/** One undelivered ACTIONABLE verdict found on disk. */
+export type UndeliveredVerdict = {
+	path: string;
+	next: string;
+	verdict?: string;
+	round?: string;
+};
+
+/**
+ * Undelivered ACTIONABLE verdicts for a PR, from every file that may hold one.
+ *
+ * Both waiter spellings plus any session `pi-<id>.json` the waiter has
+ * rewritten — the verdict outlives the session that asked for it, which is
+ * what makes recovery after a reload possible at all.
+ *
+ * `pi-<id>.latch.json` is excluded: it is the extension's private copy of the
+ * latch, and reading it as waiter state is the confusion behind the duplicate
+ * respawns (F3, F20). A session file that does not name a PR is skipped rather
+ * than guessed at — #475 means different things in different repos.
+ */
+export function undeliveredWaiterVerdicts(
+	pr: string,
+	dir = stateDir(),
+): UndeliveredVerdict[] {
+	const want = String(pr ?? "").trim();
+	if (!want) return [];
+	const paths: string[] = [...waiterManualFiles(want, dir)];
+	let names: string[] = [];
+	try {
+		names = readdirSync(dir);
+	} catch {
+		names = [];
+	}
+	for (const name of names) {
+		if (!name.startsWith("pi-") || !name.endsWith(".json")) continue;
+		if (name.endsWith(".latch.json")) continue;
+		paths.push(join(dir, name));
+	}
+	const out: UndeliveredVerdict[] = [];
+	const seen = new Set<string>();
+	for (const path of paths) {
+		if (seen.has(path)) continue;
+		seen.add(path);
+		const v = readWaiterVerdict(path);
+		if (!v?.lastNext || !ACTIONABLE.has(v.lastNext) || v.verdictDelivered) continue;
+		// A manual file is named for its PR; a session file must say so itself.
+		if (v.pr ? v.pr !== want : basename(path).startsWith("pi-")) continue;
+		out.push({ path, next: v.lastNext, verdict: v.verdict, round: v.round });
+	}
+	return out;
+}
+
 export function referenceCheckoutFor(cwd: string): string | undefined {
 	if (!cwd) return undefined;
 	if (existsSync(join(cwd, ".git"))) return cwd;
