@@ -359,7 +359,34 @@ Original plan, as written before implementation:
 
 Acceptance: a fixer that pushes then times out → re-await, not "merge yourself"; a fixer that pushes nothing → disagreement comment posted, loop stops; a fixer cannot run `git pr-await` (guard test); same-findings-twice stops the loop.
 
-### Phase 3 — Task and QA lifecycle (F11, F12, F13, F14)
+### Phase 3 — Task and QA lifecycle — **DONE 2026-09-02**
+
+One commit, `14c2967`. The four findings all touch the same function, `runFeatureChain`, so splitting them across commits would have split single edits. The suite went from 309 to 322 passing, all green; `tsc --noEmit` clean.
+
+| Finding | What landed |
+|---|---|
+| F11 | `porcelainStatus`, `firstTaskBlockedByDirtyTree`, `ensureWriterCommit`; the gate is closed after every writer, Task and fixer. |
+| F12 | `DEFAULT_QA_PASS_CAP` 1 → 2; one automatic retry of a failed QA child. |
+| F13 | `settleTaskOutcome` gains `gated`; `taskGateResult`; `orphanDecision` follows the same rule; `gate:` on the handoff line. |
+| F14 | `reviewer_run_id` / `reviewer_run_dir` in status.md; `planReviewReconcile` + `reconcilePlanReview`. |
+
+**F11 — the commit gate is code's, not the worker's.** A writer's only git operation is `git commit`, and it was the one they skipped most. `worktreeFingerprint` is HEAD plus porcelain, so unstaged edits counted as a land: the Task went `done`, the next worker started on a dirty tree, feature-qa reviewed uncommitted code, and `openFeaturePr` pushed a HEAD that did not contain the work. Now `ensureWriterCommit` runs after every writer — `git add -A` (a worker's new files are as much of the Task as its edits) then a deterministic `Task N — title` or `fix: review round N` — and re-reads porcelain to confirm the tree actually cleared. A commit that fails blocks the Task with git's own stderr rather than advancing over work that is not on the branch. On the fixer path the gate runs *before* `branchHeads`, or an uncommitted fix would read as `push: "none"` and F6 would post a disagreement over a round that had done its job.
+
+Before Task 1 the rule is the opposite: `firstTaskBlockedByDirtyTree` refuses. Nothing has run yet, so uncommitted changes are not this Feature's, and committing them under a Task message would attribute a stranger's edits to this plan — which is exactly what `ice-wt/feat-per-coin-mining-claim` was accumulating. The refusal names up to eight files. Git that cannot answer is inconclusive at both ends: it never blocks the Feature and never counts as clean.
+
+**F12 — the second QA pass is the one that checks QA's own fixes.** With cap 1, the remediation Tasks feature-qa asked for were implemented and then never looked at again; the PR opened on unreviewed fixes. Cap is now 2 — QA → fix → QA → fix → PR — still bounded by `MAX_QA_PASS_CAP`, and an explicit `qa_pass_cap: 0` still opts out. A QA child that dies in transport or misses its schema is retried once before the Feature parks; that failure mode had been costing whole Features a manual `/orchestrate resume`.
+
+**F13 — a red gate is a fact, and facts do not auto-advance.** `failed_but_landed` was written for the 39% of Tasks with no runnable `- Command:`, where a harness failure plus a changed worktree usually means only the child's self-report failed. Applied to a Task whose gate actually ran and came back red, it marked the Task done and built the next one on top of it. `settleTaskOutcome` now takes `gated`, and a gated failure returns `blocked` / `failed_gate` regardless of what landed. `orphanDecision` takes the same flag: recovery must decide what the live chain would have decided, or it becomes the softer path. plan.md records `gate: red|green|none` on the Task's `- Handoff:` line, so the next reader does not re-derive it.
+
+**F14 — a dead reviewer is no longer a wedge.** `reviewPlan` wrote `plan_review: running` and recorded nothing else, so a session that died mid-review left a field that `writerBlockedByPlanReview` read forever: every approve and resume refused, and the approve card hidden. It now records `reviewer_run_id` / `reviewer_run_dir`, and `reconcilePlanReview` reads that run's own `status.json` before either gate consults the field — terminal-ok → `done`, terminal-fail or no artifact at all → `failed` (review re-runs), non-terminal → wait, exactly as Tasks do. "No artifact" is safe to call dead here because this runs under the chain lock: a genuinely live review is one this process started and would have recorded.
+
+> One thing the plan implies that this does not do: `draftApproveCards` still requires `plan_review: done`, so a wedged Feature's card stays hidden until something reconciles it. Reconciliation happens inside `beginImplementation`, under the chain lock, which is the right place for a write — doing it while rendering cards would put a status.md write on every redraw. So the recovery path for such a Feature is to type `/orchestrate approve <name>` rather than to click the card. Phase 4 rewrites that card path (F15/F16) and is where this belongs.
+
+**Still open after Phase 3.** Everything carried forward from Phase 2 — the four Features parked at `phase: pr` with `pr: none`, the cross-repo residuals (`ghl-monitor.sh` respawn, the Rust per-PR lock, the naming change unlanded in `gh-pr-reviewer` main) — plus this repo still having no `origin`, so nothing here can exercise the PR lifecycle end to end.
+
+Original plan, as written before implementation:
+
+#### Phase 3 — Task and QA lifecycle (F11, F12, F13, F14)
 
 3.1 Commit gate after every writer: porcelain empty and HEAD advanced, else code commits (`Task N — title` / `fix: review round N`) or blocks with `reason: dirty worktree`. Refuse to start Task 1 on a dirty tree. `tdd-worker.md`: "commit this Task; never push".
 
