@@ -28,7 +28,18 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, openSync, closeSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	openSync,
+	closeSync,
+	readFileSync,
+	rmSync,
+	watch,
+	writeFileSync,
+	writeSync,
+	type FSWatcher,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -89,6 +100,22 @@ const DRIVE_BIN =
 export type SpawnDriver = (argv: string[]) => { pid?: number };
 
 /**
+ * How long a wait may go without asking GitHub anything at all.
+ *
+ * The wake-up is `fs.watch` on the state directory; this is only the backstop
+ * for a waiter that died without writing a verdict. Ten minutes of latency on
+ * that case buys back a `gh pr view` every fifteen seconds, per latched
+ * session, forever (F18).
+ */
+export const WATCH_BACKSTOP_MS = 10 * 60_000;
+
+/** Waiter verdicts that mean the PR is over, so the `gh` check is worth its cost. */
+const TERMINAL_NEXT = new Set(["done", "stop"]);
+
+/** Settle window for a burst of waiter writes. One `gh` call, not one per event. */
+const WATCH_DEBOUNCE_MS = 250;
+
+/**
  * `known` is the extension's in-memory latch. It is passed in because
  * `stateFile` is handed to the Rust waiter as `--state` and rewritten wholesale
  * by it; reading the cwd back out of that file races the waiter, and losing
@@ -136,14 +163,31 @@ function resultText(result: unknown): string {
 export type LatchHooks = {
 	spawnDriver?: SpawnDriver;
 	driverRunning?: (pr: string) => boolean;
-	/** Poll interval while a live session waits on a handed-off PR. 0 disables. */
+	/**
+	 * Backstop interval for the `gh pr view` check. 0 disables.
+	 *
+	 * This was 15s, and it was the third poller on the same PR behind the
+	 * waiter and the monitor — a `gh pr view` per session per 15 seconds, for
+	 * however many sessions held a latch, which is a large share of what
+	 * rate-limited GitHub (F18). The wake-up is `fs.watch` on the state
+	 * directory now: the waiter writes its verdict there, so the event is
+	 * exactly as timely and costs nothing. What remains on a timer is the case
+	 * `fs.watch` cannot cover — a waiter that died without writing anything —
+	 * and ten minutes is soon enough for that.
+	 */
 	watchMs?: number;
 	/**
 	 * Cheap chrome refresh (elapsed + live `round=` from the waiter JSON).
-	 * Separate from `watchMs` so GitHub `gh pr view` stays at 15s.
-	 * 0 disables. Default 1s when `watchMs` is left at its production default.
+	 * Local file reads only, never `gh`, which is why it can run at 1s while
+	 * `watchMs` is minutes. 0 disables. Default 1s when `watchMs` is left at
+	 * its production default.
 	 */
 	chromeMs?: number;
+	/**
+	 * Watch the state directory for waiter writes. Default on; tests that drive
+	 * the tick by hand turn it off so a stray write cannot race the assertion.
+	 */
+	watchStateDir?: boolean;
 	/**
 	 * The live `/orchestrate` Feature that owns this PR, or `undefined` for a solo
 	 * latch. Injectable so tests never walk the real `~/orchestrator`, whose
@@ -185,6 +229,8 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	let latchFile: string | undefined;
 	let watchTimer: ReturnType<typeof setInterval> | undefined;
 	let chromeTimer: ReturnType<typeof setInterval> | undefined;
+	let stateWatcher: FSWatcher | undefined;
+	let watchDebounce: ReturnType<typeof setTimeout> | undefined;
 	let waitStartedAt = 0;
 	let waitCtx: ExtensionContext | undefined;
 	/** Pi's `Loader` — same braille frames and 80ms tick as the working spinner. */
@@ -204,8 +250,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * has moved on (icemining#2150 into an unrelated git-workflow conversation).
 	 */
 	let deferralActive = false;
-	const watchMs = hooks.watchMs ?? 15_000;
+	const watchMs = hooks.watchMs ?? WATCH_BACKSTOP_MS;
 	const chromeMs = hooks.chromeMs ?? (hooks.watchMs === undefined ? 1_000 : 0);
+	const watchStateDir = hooks.watchStateDir ?? true;
 
 	const spawnDriver: SpawnDriver =
 		hooks.spawnDriver ?? ((argv) => defaultSpawnDriver(argv[argv.indexOf("--state") + 1] ?? "", latch));
@@ -349,7 +396,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (!latch || !waitStartedAt) return undefined;
 		// No spinner glyph here. `Loader` owns the frames and the 80ms timer;
 		// baking a character into this string is why the chrome used to freeze
-		// on the 15s poll tick. OSC 8 only on the widget — not the tab title.
+		// on the chrome tick. OSC 8 only on the widget — not the tab title.
 		const { round, roundTotal } = waiterRound();
 		return formatWaitLine({
 			label: prLabel(latch),
@@ -411,6 +458,18 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (chromeTimer) {
 			clearInterval(chromeTimer);
 			chromeTimer = undefined;
+		}
+		if (watchDebounce) {
+			clearTimeout(watchDebounce);
+			watchDebounce = undefined;
+		}
+		if (stateWatcher) {
+			try {
+				stateWatcher.close();
+			} catch {
+				/* already gone */
+			}
+			stateWatcher = undefined;
 		}
 		writeWaitProgress(false);
 		waitLoader?.stop();
@@ -558,6 +617,44 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		await reportTerminal(ctx, s, state, opts);
 	}
 
+	/**
+	 * Does the waiter's own state say this PR is finished?
+	 *
+	 * Asked before spending a `gh pr view`. A waiter that has landed or seen the
+	 * PR closed says so in the file it just wrote — and it deletes that file
+	 * once the PR is terminal, so a state path that has vanished under a live
+	 * latch is the same news by another route.
+	 */
+	function waiterSaysTerminal(): boolean {
+		const own = waiterState();
+		if (own && !existsSync(own)) return true;
+		for (const path of waiterStateFiles()) {
+			const next = readWaiterVerdict(path)?.lastNext;
+			if (next && (TERMINAL_NEXT.has(next) || MECHANICAL.has(next))) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * A waiter write landed in the state directory. Everything this does is
+	 * local file reads except the `gh` call, which is spent only when the
+	 * waiter's own state already says the PR is over — the whole point of F18
+	 * is that GitHub is asked by one process, not by every session watching.
+	 */
+	function onStateDirChange(ctx: ExtensionContext): void {
+		if (watchDebounce || disabled || !latch) return;
+		watchDebounce = setTimeout(() => {
+			watchDebounce = undefined;
+			if (disabled || !latch) return;
+			paintWaitChrome(ctx, waitLine());
+			void (async () => {
+				await checkActionable(ctx);
+				if (waiterSaysTerminal()) await checkTerminal(ctx);
+			})();
+		}, WATCH_DEBOUNCE_MS);
+		watchDebounce.unref?.();
+	}
+
 	function startWatch(ctx: ExtensionContext): void {
 		if (watchMs <= 0 || disabled || !latch) {
 			stopWatch();
@@ -575,11 +672,28 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					await checkActionable(ctx);
 				})();
 			}, watchMs);
+			watchTimer.unref?.();
 		}
 		if (!chromeTimer && chromeMs > 0) {
 			chromeTimer = setInterval(() => {
 				paintWaitChrome(ctx, waitLine());
 			}, chromeMs);
+			chromeTimer.unref?.();
+		}
+		if (!stateWatcher && watchStateDir) {
+			try {
+				mkdirSync(stateDir(), { recursive: true });
+				stateWatcher = watch(stateDir(), { persistent: false }, () => {
+					onStateDirChange(ctx);
+				});
+				// A directory that cannot be watched is not a reason to stop
+				// waiting: the backstop timer still runs.
+				stateWatcher.on("error", () => {
+					stateWatcher = undefined;
+				});
+			} catch {
+				stateWatcher = undefined;
+			}
 		}
 	}
 
@@ -883,7 +997,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			);
 			startWatch(ctx);
 			// Immediate: `/rreload` and settle-with-a-waiting-verdict must not
-			// wait for the 15s watch tick. No-op when lastNext is yield/poll_again.
+			// wait for a state-dir event. No-op when lastNext is yield/poll_again.
 			await checkActionable(ctx);
 		} finally {
 			ensuring = false;

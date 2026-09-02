@@ -141,7 +141,7 @@ export function readLiveRound(
  *
  * Called by the dispatcher the moment it accepts an action, not when the fixer
  * finishes: a writer holds the Feature for 30-60 minutes, and leaving the file
- * undelivered for that long makes the 15s watch and the reconciler re-dispatch
+ * undelivered for that long makes the watch and the reconciler re-dispatch
  * the same verdict and refuse it over and over.
  */
 export function spendWaiterVerdict(

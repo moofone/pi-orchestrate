@@ -52,6 +52,7 @@ process.env.GHL_ORCH_ROOT = mkdtempSync(join(tmpdir(), "ghl-orch-test-"));
 const {
 	default: latch,
 	ACTIONABLE,
+	WATCH_BACKSTOP_MS,
 	defaultSpawnDriver,
 	parseAwaitCall,
 	parseField,
@@ -1996,6 +1997,90 @@ test("P5 F20: a waiter rewrite is not a latch, even after a reload under the sam
 		await sleep(80);
 		const own = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.latch.json`), "utf8"));
 		assert.equal(own.pr, "2142", "the latch is this session's record, not the waiter's");
+	} finally {
+		h.cleanup();
+	}
+});
+
+/* ---------------------------------------------------------------- *
+ * Phase 5 — one poller (F18).
+ *
+ * Every latched session used to run `gh pr view` every 15 seconds, on top of
+ * the waiter and the monitor doing the same. The waiter is the poller; a
+ * session learns what it needs from the file the waiter writes. `fs.watch` on
+ * the state directory is the wake-up, and the timer is only a backstop for a
+ * waiter that died silently.
+ * ---------------------------------------------------------------- */
+
+/** A live wait with fs.watch armed and a backstop far too slow to be the cause. */
+const watchOnly = { watchMs: 600_000, chromeMs: 0 } as const;
+
+test("P5 F18: the GitHub backstop is minutes, not the old 15s poll", () => {
+	assert.equal(WATCH_BACKSTOP_MS, 600_000);
+	const src = readFileSync(new URL("../src/pr-await-latch.ts", import.meta.url), "utf8");
+	assert.equal(
+		/watchMs\s*\?\?\s*15_000/.test(src),
+		false,
+		"the 15s gh pr view default is what F18 removes",
+	);
+});
+
+test("P5 F18: a waiter verdict wakes the session with no poll in between", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "nothing to say yet");
+
+		writeActionable(h.dir, h.sessionId);
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`fs.watch must deliver the verdict; the 10-minute timer cannot have fired`,
+		);
+		assert.match(h.wakes[0], /read_comments_and_fix/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("P5 F18: an ordinary waiter write costs no GitHub call", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		const ghCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+		const before = ghCalls();
+
+		// The waiter's per-round progress write: the only thing it changes is
+		// the spinner, and asking GitHub about it is the poll F18 deletes.
+		const path = waiterState(h.dir);
+		const cur = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		writeFileSync(path, JSON.stringify({ ...cur, round: "2", roundTotal: "5" }));
+		await sleep(500);
+		assert.equal(ghCalls(), before, "a round= write is read off disk, not re-asked of GitHub");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("P5 F18: a waiter that says the PR is over does get the gh check, and the wake", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		const path = waiterState(h.dir);
+		writeFileSync(path, JSON.stringify({ pr: "2142", cwd: REPO, lastNext: "done" }));
+		await sleep(500);
+		assert.equal(h.wakes.length, 1, `expected one merge wake; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wakes[0], /merged/);
 	} finally {
 		h.cleanup();
 	}

@@ -4432,7 +4432,8 @@ export async function dispatchFeaturePrVerdict(
               `queued for retry`,
           }),
     });
-    // The same refusal arrives on every 15s watch tick while the writer runs.
+    // The same refusal arrives on every waiter write and reconciler tick while
+    // the writer runs.
     // Saying so once is information; saying it 120 times is noise.
     if (already !== fingerprint) {
       uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next), "warning");
