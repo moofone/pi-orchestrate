@@ -408,6 +408,26 @@ export function parseField(text: string, field: string): string | undefined {
 	return undefined;
 }
 
+/**
+ * The **last** `key=` in the text, matched case-insensitively.
+ *
+ * Deliberately not `parseField`, which takes the first and is case-sensitive.
+ * A `git pr-await` handshake prints its top-level fields and then, on an
+ * actionable verdict, the reviewer body beneath them — which repeats `next=`.
+ * The dispatcher wants the verdict the waiter just reached, so it reads the
+ * last one. Both tokenise with `parseKeyedTokens`, so they agree about where a
+ * token starts and ends; only the choice of occurrence differs, and that
+ * difference is the point.
+ */
+export function parseKeyedField(text: string, key: string): string {
+	const want = key.toLowerCase();
+	let found = "";
+	for (const [k, v] of parseKeyedTokens(text)) {
+		if (k.toLowerCase() === want) found = v;
+	}
+	return found.trim();
+}
+
 export function parseAwaitCall(command: string): { pr: string; cursor?: string } | undefined {
 	const m = command.match(/\bgit\s+pr-(?:await|land)\s+([^\n;|&]*)/);
 	if (!m) return undefined;

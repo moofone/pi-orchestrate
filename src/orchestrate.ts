@@ -51,7 +51,7 @@ import {
   landFailedAlreadyMerged,
   listFeaturePrOwners,
   MECHANICAL,
-  parseKeyedTokens,
+  parseKeyedField,
   printedLandCommand,
   repoKey,
   spendWaiterVerdict,
@@ -113,6 +113,7 @@ import {
 // The latch reads Feature ownership from the same helper; re-exported here so
 // the dispatcher has one public surface and the latch never imports this file.
 export { findFeatureOwningPr };
+export { parseKeyedField };
 export type { FeaturePrOwner } from "./lib/pr-await-core.ts";
 
 const ORCH_ROOT = join(homedir(), "orchestrator");
@@ -1140,7 +1141,7 @@ function discoverFeatures(paths: Paths): FeatureRow[] {
 }
 
 /** Levenshtein. Used so `failure` still binds a unique live `failover` Feature. */
-export function editDistance(a: string, b: string): number {
+function editDistance(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
@@ -3325,26 +3326,6 @@ export const PR_AWAIT_CALL_TIMEOUT_MS = 60_000;
  * the first one.
  */
 export const AWAIT_DISPATCH_MAX_DEPTH = 2;
-
-/**
- * The **last** `key=` in the text, matched case-insensitively.
- *
- * Deliberately not `parseField`, which takes the first and is case-sensitive.
- * A `git pr-await` handshake prints its top-level fields and then, on an
- * actionable verdict, the reviewer body beneath them — which repeats `next=`.
- * The dispatcher wants the verdict the waiter just reached, so it reads the
- * last one. Both now tokenise with `parseKeyedTokens`, so they agree about
- * where a token starts and ends; only the choice of occurrence differs, and
- * that difference is the point.
- */
-export function parseKeyedField(text: string, key: string): string {
-  const want = key.toLowerCase();
-  let found = "";
-  for (const [k, v] of parseKeyedTokens(text)) {
-    if (k.toLowerCase() === want) found = v;
-  }
-  return found.trim();
-}
 
 interface PrAwaitOutcome {
   done: boolean;
