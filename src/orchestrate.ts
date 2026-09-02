@@ -6327,6 +6327,14 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   });
   pi.on("session_compact", republishOverlay);
   pi.on("session_tree", republishOverlay);
+  // F17 proposed deleting this along with `before_agent_start`. It stays, for a
+  // reason worth writing down: `~/.pi/agent/settings.json` registers only
+  // `skill-author`, so this line is the *only* thing that publishes
+  // git-workflow to a pi session at all. Removing it would not stop the skill
+  // leaking into orchestration — it would make it unavailable to the solo
+  // sessions the skill was just rescoped for. What it publishes is a path, not
+  // prompt text, and the `/orchestrate` section that made that path a policy
+  // document is gone.
   pi.on("resources_discover", async () => ({
     skillPaths: [dirname(GIT_WORKFLOW_SKILL)],
   }));

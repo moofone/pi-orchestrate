@@ -2514,45 +2514,77 @@ function skillSection(heading: string): string {
   return end === -1 ? rest : rest.slice(0, end);
 }
 
-test("L4: the skill's /orchestrate section hands a Feature review fix to a writer, not to the parent", () => {
-  const section = skillSection("`/orchestrate`");
+/* ---------------------------------------------------------------- *
+ * P5 F17 — the skill is a solo-session prompt, and only that.
+ *
+ * It used to carry an `## /orchestrate` section: extension internals
+ * (`drivePrAwait`, `armObservedLatch`), one paragraph duplicated verbatim, and
+ * rules that restated the writer contract in a file no writer is given any
+ * more. A git skill is the wrong owner for orchestration policy, and a prompt
+ * is the wrong enforcement for something code already owns — so the policy
+ * lives in `gitWorkflowBlock` and `WRITER_CONTRACT`, which code inlines, and
+ * the enforcement lives in `classifyForRole`, which is mechanical.
+ * ---------------------------------------------------------------- */
 
-  assert.match(section, /read_comments_and_fix/, "the section names the verdict it is about");
-  assert.match(
-    section,
-    /dispatch/i,
-    "a Feature-owned verdict is dispatched by the extension, the same way a Task is",
-  );
-  assert.match(section, /fixer/, "and the thing it is dispatched to is a writer");
-  assert.match(section, /stays? idle/i, "the parent session stays idle through a review fix");
-  assert.match(
-    section,
-    /after (that|the) writer settles/i,
-    "the re-await happens after the writer settles",
-  );
-  assert.match(
-    section,
-    /code runs `git pr-await` once/i,
-    "and it is code that runs it, not the parent and not the writer",
-  );
-  assert.match(
-    section,
-    /no `pr-await`|not `git pr-await`|never `git pr-await`/i,
-    "a Task/fix worker still must not wait on the review itself",
-  );
-  assert.match(
-    section,
-    /another fixer|keeps doing that|Never stop while review data/i,
-    "a later read_comments_and_fix still gets a fixer; one round is not the end",
-  );
+test("P5 F17: the skill no longer documents orchestration, and says whose it is not", () => {
+  const src = readFileSync(GIT_WORKFLOW_SKILL, "utf8");
 
-  for (const re of [/fix current-head findings/i, /follow the `next=` table/i]) {
+  assert.equal(
+    /\n## `?\/orchestrate`?\n/.test(src),
+    false,
+    "the /orchestrate section belongs to code, not to a git skill",
+  );
+  for (const internal of ["drivePrAwait", "armObservedLatch"]) {
     assert.equal(
-      re.test(section),
+      src.includes(internal),
       false,
-      `the /orchestrate section must not make the parent the fixer (matched ${re})`,
+      `${internal} is an extension internal; a skill that names it is documenting the wrong thing`,
     );
   }
+
+  // What must survive the deletion: a session that is *not* solo has to be
+  // told so, or the `next=` table above reads as its instructions.
+  const scope = skillSection("Scope");
+  assert.match(scope, /solo/i, "the skill states which sessions it is for");
+  assert.match(scope, /\/orchestrate/, "and which it is not for");
+  assert.match(scope, /commits?\b/i, "a writer child commits");
+  assert.match(
+    scope,
+    /git-workflow-guard|blocks/i,
+    "and the rest is blocked mechanically, not asked for politely",
+  );
+});
+
+test("P5 F17: the duplicated paragraph is gone", () => {
+  const src = readFileSync(GIT_WORKFLOW_SKILL, "utf8");
+  const seen = new Map<string, number>();
+  for (const line of src.split("\n")) {
+    const text = line.trim();
+    if (text.length < 80) continue;
+    seen.set(text, (seen.get(text) ?? 0) + 1);
+  }
+  const repeated = [...seen].filter(([, n]) => n > 1).map(([text]) => text.slice(0, 60));
+  assert.deepEqual(repeated, [], `a skill that says a thing twice was edited by accident`);
+});
+
+test("P5 F17: the writer contract the skill used to carry is owned by code", () => {
+  const block = (orch.gitWorkflowBlock as Function)(
+    promptContractPaths(),
+    "/Users/greg/Dev/git/ice-wt/feat-x",
+  ) as string;
+
+  assert.match(block, /read_comments_and_fix/, "code names the verdict the skill used to");
+  assert.match(block, /dispatch/i, "and says it is dispatched, not worked by the reader");
+  assert.match(block, /fixer/, "to a writer");
+  assert.match(block, /stays? idle/i, "while the parent stays idle");
+  assert.match(block, /after that writer settles/i);
+  assert.match(block, /code runs `gh pr create`|code runs `git pr-await` once/i);
+  assert.match(
+    block,
+    /must NOT `git pr-await`|never `git pr-await`|not `git pr-await`/i,
+    "a writer never waits on the review",
+  );
+  assert.match(block, /keeps doing that|Never stop while review data/i);
 });
 
 test("L4: the skill still leaves a solo session its own latch, verdict, and fix", () => {
@@ -2608,6 +2640,24 @@ test("L4: orchestrate.ts registers resources_discover and before_agent_start for
   assert.match(src, /before_agent_start/);
   assert.match(src, /parentGitWorkflowAppend/);
   assert.match(src, /skillPaths: \[dirname\(GIT_WORKFLOW_SKILL\)\]/);
+});
+
+test("P5 F17: both hooks are kept deliberately, and the source says why", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  // F17 asked for these to be deleted *or* gated on a correct predicate.
+  // Phase 1 gave `before_agent_start` the correct predicate; this test pins
+  // the other half so a later reader does not delete the only line that
+  // publishes the skill to pi at all.
+  const at = src.indexOf(`pi.on("resources_discover"`);
+  assert.notEqual(at, -1);
+  const why = src.slice(Math.max(0, at - 700), at);
+  assert.match(why, /F17/, "the decision names the finding it answers");
+  assert.match(why, /settings\.json/, "and the fact that settles it");
+  assert.match(
+    src,
+    /liveFeatureNeedsIdleParent\(cwd\)/,
+    "the prompt append is gated on this session's own cwd, not on the repo",
+  );
 });
 
 /* ---------------------------------------------------------------- *
