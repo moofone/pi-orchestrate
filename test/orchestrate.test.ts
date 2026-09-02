@@ -953,8 +953,11 @@ test("L3: openFeaturePr discovers an existing branch PR when create prints nothi
   });
 });
 
-test("L3: handshake timeout is 30 minutes and is not a review deadline", () => {
-  assert.equal(orch.PR_AWAIT_CALL_TIMEOUT_MS, 30 * 60 * 1000);
+test("L3: the handshake timeout is not a review deadline", () => {
+  // F19/F9: `git pr-await` forks the daemon and prints. Thirty minutes of that
+  // only ever held the chain lock while nothing happened, and a timeout here
+  // is read as `yield` anyway — the detached waiter owns the review.
+  assert.equal(orch.PR_AWAIT_CALL_TIMEOUT_MS, 60_000);
 });
 
 test("L3: a hung handshake yields to the waiter and does not fail the Feature", async () => {
@@ -4840,5 +4843,65 @@ test("P2 F6: dispatch records the finding set so the next round can see a repeat
     status,
     /^pr_head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$/m,
     "the head the findings were raised against is recorded with them",
+  );
+});
+
+test("P2 F9: one dispatch chain runs at most two git pr-await handshakes", () => {
+  assert.equal(orch.AWAIT_DISPATCH_MAX_DEPTH, 2);
+});
+
+test("P2 F9: a waiter that keeps saying investigate_dead_reviewers cannot recurse forever", async () => {
+  const { dir, paths } = prFeatureFixture(0);
+  const execs: string[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    execs.push([cmd, ...(args ?? [])].join(" "));
+    // Every handshake asks for another one. Without a bound this is an
+    // unbounded mutual recursion between awaitAndDispatch and dispatch.
+    return {
+      code: 0,
+      stdout: "status=action_required\nnext=investigate_dead_reviewers\nround=4\n",
+      stderr: "",
+    };
+  });
+  const spawn = autoSettleSpawn(pi, "run-depth-1");
+  const { ctx, notices } = makeFakeCtx();
+
+  const action = await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      { done: false, next: "investigate_dead_reviewers", output: "next=investigate_dead_reviewers\n", round: "4" },
+    ),
+    8000,
+  );
+
+  assert.notEqual((action as { reason?: string })?.reason, "TEST_TIMEOUT", "the recursion never ended");
+  assert.equal(action, "reawait");
+  assert.equal(spawn.count, 0, "a dead-reviewer verdict has no writer");
+  assert.equal(
+    prAwaitCalls(execs).length,
+    orch.AWAIT_DISPATCH_MAX_DEPTH,
+    `at most ${orch.AWAIT_DISPATCH_MAX_DEPTH} handshakes per chain: ${execs.join(" | ")}`,
+  );
+  assert.ok(
+    notices.some((n) => /re-await|waiter/i.test(n)),
+    `the user is told the chain stopped: ${notices.join(" | ")}`,
+  );
+  assert.equal(parentTurns(pi).length, 0);
+});
+
+test("P2 F9: the handshake is a handshake, and the land is not a review deadline", () => {
+  assert.equal(
+    orch.PR_AWAIT_CALL_TIMEOUT_MS,
+    60_000,
+    "git pr-await forks a daemon and prints; 30 minutes of that held the chain lock (F19)",
+  );
+  assert.equal(
+    orch.PR_LAND_CALL_TIMEOUT_MS,
+    10 * 60 * 1000,
+    "ghl-pr-land merges and waits for GitHub to agree — minutes, not half an hour",
   );
 });

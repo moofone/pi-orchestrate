@@ -3374,8 +3374,25 @@ export function appendQaTasks(paths: Paths, findings: QaFinding[]): number {
  * On timeout: treat as yield. Do not fail the Feature. Do not prompt.
  * ------------------------------------------------------------------ */
 
-/** Handshake only. Reviews live in `ghl-pr-await --daemon` (unbounded). */
-export const PR_AWAIT_CALL_TIMEOUT_MS = 30 * 60 * 1000;
+/**
+ * Handshake only. Reviews live in `ghl-pr-await --daemon` (unbounded).
+ *
+ * `git pr-await` forks the daemon and prints; that is seconds. Waiting half an
+ * hour for it only ever meant the chain lock was held for half an hour while
+ * nothing happened (F19). A timeout here is read as `yield`, which is the
+ * truth: the detached waiter owns the review either way.
+ */
+export const PR_AWAIT_CALL_TIMEOUT_MS = 60_000;
+
+/**
+ * `git pr-await` handshakes one dispatch chain may run.
+ *
+ * `reawait` calls `awaitAndDispatch`, which dispatches the next verdict, which
+ * can `reawait` again — mutual recursion with no bound (F9). The invariant is
+ * one handshake per round; two is the slack for a verdict that arrives during
+ * the first one.
+ */
+export const AWAIT_DISPATCH_MAX_DEPTH = 2;
 
 export function parseKeyedField(text: string, key: string): string {
   const matches = [...text.matchAll(new RegExp(`\\b${key}=([^\\s]+)`, "gi"))];
@@ -3810,7 +3827,7 @@ function featurePrVerdictNotice(
  * GitHub to report the merge, and cleans the worktree up, so it needs more than
  * a handshake's worth of time.
  */
-const PR_LAND_CALL_TIMEOUT_MS = 30 * 60 * 1000;
+export const PR_LAND_CALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Land the PR through the git-workflow alias — never `gh pr merge`, which
@@ -3876,11 +3893,30 @@ async function awaitAndDispatch(
   paths: Paths,
   pr: string,
   worktree: string,
-  opts: { holdsChainLock?: boolean } = {},
+  opts: { holdsChainLock?: boolean; depth?: number } = {},
 ): Promise<PrAwaitOutcome> {
+  const depth = opts.depth ?? 0;
+  if (depth >= AWAIT_DISPATCH_MAX_DEPTH) {
+    // The chain has had its handshakes. The waiter is still running and still
+    // owns this PR; the reconciler picks up whatever it says next. Recursing
+    // further is the unbounded loop, not progress (F9).
+    upsertStatusFile(paths, {
+      pr,
+      nextAction: `pr-await handshakes spent (${depth}) — ghl-pr-await owns the wait`,
+    });
+    uiNotify(ctx,
+      `PR ${pr}: ${depth} git pr-await handshakes in one chain is the bound. ` +
+        `The waiter owns the review from here; nothing was dropped.`,
+      "info",
+    );
+    return { done: false, next: "", output: "", round: "", silent: true };
+  }
   const follow = await drivePrAwait(pi, ctx, paths, pr, worktree);
   if (follow.paused || follow.done || follow.silent) return follow;
-  await dispatchFeaturePrVerdict(pi, ctx, paths, pr, worktree, follow, opts);
+  await dispatchFeaturePrVerdict(pi, ctx, paths, pr, worktree, follow, {
+    ...opts,
+    depth: depth + 1,
+  });
   return follow;
 }
 
@@ -4085,7 +4121,9 @@ async function runReviewFixWriter(
   // Exactly one `git pr-await`, in code. The writer is forbidden from waiting,
   // and the parent is never handed the review to work through itself. A
   // judgment `next=` here is another round, not the end of the Feature.
-  await awaitAndDispatch(pi, ctx, paths, pr, worktree, { holdsChainLock: true });
+  // depth 0: a completed fix round is a new cycle, not deeper recursion. What
+  // bounds *this* loop is the round cap in `classifyFeaturePrNext` (F6).
+  await awaitAndDispatch(pi, ctx, paths, pr, worktree, { holdsChainLock: true, depth: 0 });
 }
 
 /**
@@ -4106,7 +4144,7 @@ export async function dispatchFeaturePrVerdict(
   pr: string,
   worktree: string,
   result: { next: string; output: string; round?: string },
-  opts: { holdsChainLock?: boolean } = {},
+  opts: { holdsChainLock?: boolean; depth?: number } = {},
 ): Promise<FeaturePrAction> {
   sweepStaleWorkerRecord(paths);
   const status = readText(paths.statusFile);
@@ -4212,6 +4250,7 @@ export async function dispatchFeaturePrVerdict(
     uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
     await awaitAndDispatch(pi, ctx, paths, pr, worktree, {
       holdsChainLock: opts.holdsChainLock,
+      depth: opts.depth ?? 0,
     });
     return action;
   }
