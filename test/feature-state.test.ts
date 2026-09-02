@@ -16,12 +16,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fc from "fast-check";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import {
   FEATURE_PHASES,
   INITIAL_PHASE,
   INTERRUPTION_PHASES,
-  LEGACY_PHASE_ALIASES,
   PHASE_TRANSITIONS,
   TERMINAL_PHASES,
   canTransition,
@@ -96,12 +98,29 @@ test("chaos: `done` is absorbing — no walk of legal moves ever leaves it", () 
   fc.assert(
     fc.property(fc.array(phase(), { maxLength: 100 }), (attempts) => {
       for (const to of attempts) {
+        if (to === "done") continue; // a no-op write, not a move — see below
         assert.equal(
           canTransition("done", to),
           false,
           `done → ${to} was allowed; a finished Feature must be archived, not re-opened`,
         );
       }
+      return true;
+    }),
+    RUNS,
+  );
+});
+
+test("chaos: re-writing the phase a Feature is already in is always a no-op", () => {
+  // A merged Feature has `done` written by runFeaturePrLand, again by the
+  // archive branch of the verdict dispatcher, and again by any reconcile that
+  // re-raises the merge. Refusing those repeats would stamp a refusal onto the
+  // next_action of a Feature that finished correctly — visible, alarming, and
+  // wrong. Found by smoke-testing the machine before a reload, not by a test.
+  fc.assert(
+    fc.property(phase(), (p) => {
+      assert.equal(canTransition(p, p), true, `${p} → ${p} must be a no-op, not a refusal`);
+      assert.equal(transitionRefusal(p, p), undefined);
       return true;
     }),
     RUNS,
@@ -274,10 +293,7 @@ test("chaos: parsePhase accepts exactly the vocabulary, in any casing", () => {
 });
 
 test("chaos: parsePhase rejects everything else rather than guessing", () => {
-  const known = new Set<string>([
-    ...FEATURE_PHASES,
-    ...Object.keys(LEGACY_PHASE_ALIASES),
-  ]);
+  const known = new Set<string>(FEATURE_PHASES);
   fc.assert(
     fc.property(fc.string({ maxLength: 40 }), (raw) => {
       const parsed = parsePhase(raw);
@@ -294,16 +310,39 @@ test("chaos: parsePhase rejects everything else rather than guessing", () => {
   );
 });
 
-test("chaos: every legacy alias resolves to a real phase, and none is itself one", () => {
-  for (const [alias, canonical] of Object.entries(LEGACY_PHASE_ALIASES)) {
-    assert.ok(isFeaturePhase(canonical), `"${alias}" maps to "${canonical}", not a phase`);
-    assert.equal(
-      isFeaturePhase(alias),
-      false,
-      `"${alias}" is both an alias and a phase — one of the two is wrong`,
-    );
-    assert.equal(parsePhase(alias), canonical);
+test("every phase spelling that exists on disk is understood", () => {
+  // The vocabulary was invented from the source, so it covered `qa` and a set
+  // of `pr-*` names that nothing had ever written — and missed five spellings
+  // that real Features actually carry. An unparseable phase reads as "not
+  // started", which makes every move on that Feature illegal: it can never
+  // advance again. This walks the live orchestrator root, so the check is
+  // against reality rather than against what the source implies.
+  const root = process.env.GHL_ORCH_ROOT ?? join(homedir(), "orchestrator");
+  if (!existsSync(root)) return; // CI or a fresh machine has no Features yet.
+
+  const unparseable: string[] = [];
+  let seen = 0;
+  for (const repo of readdirSync(root)) {
+    let names: string[] = [];
+    try {
+      names = readdirSync(join(root, repo));
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const file = join(root, repo, name, "status.md");
+      if (!existsSync(file)) continue;
+      seen++;
+      const raw = statusField(readFileSync(file, "utf8"), "phase");
+      if (raw && !parsePhase(raw)) unparseable.push(`${repo}/${name}: ${raw}`);
+    }
   }
+  assert.deepEqual(
+    unparseable,
+    [],
+    `${seen} status.md files scanned; these carry a phase no reader understands, ` +
+      `so every transition on them would be refused`,
+  );
 });
 
 /* ================================================================== *
@@ -366,8 +405,9 @@ test("chaos: a missing or terminal phase_prev declines rather than guessing", ()
   // `done` is a legal target from an interruption (archiving a paused Feature),
   // so it is offered — the caller decides, and the machine permits the move.
   assert.equal(resumePhase(statusDoc({ phase: "paused", phase_prev: "done" })), "done");
-  // A legacy spelling still resolves.
-  assert.equal(resumePhase(statusDoc({ phase: "paused", phase_prev: "qa" })), "feature-qa");
+  // A phase_prev that is not in the vocabulary declines rather than guessing —
+  // there is no alias table to fall back through any more.
+  assert.equal(resumePhase(statusDoc({ phase: "paused", phase_prev: "qa" })), undefined);
 });
 
 /* ================================================================== *
@@ -435,7 +475,11 @@ test("chaos: a random command sequence keeps the machine and a model in step", (
 
           // Model: consult the table directly.
           const modelAllowed =
-            model === undefined ? to === INITIAL_PHASE : PHASE_TRANSITIONS[model].includes(to);
+            model === undefined
+              ? to === INITIAL_PHASE
+              : // Re-writing the current phase is a no-op, not a move — the
+                // rule the guard applies before consulting the table.
+                model === to || PHASE_TRANSITIONS[model].includes(to);
           assert.equal(
             allowed,
             modelAllowed,

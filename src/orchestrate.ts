@@ -940,7 +940,7 @@ export function needsPlanReview(plan: string, status: string): boolean {
   const tasks = parseTasks(plan);
   if (tasks.some((t) => t.status !== "pending")) return false;
   const phase = statusField(status, "phase").toLowerCase();
-  if (phase === "implementing" || phase === "feature-qa" || phase === "qa" || phase === "pr") {
+  if (phase === "implementing" || phase === "feature-qa" || phase === "pr") {
     return false;
   }
   return true;
@@ -1332,7 +1332,6 @@ function featureIsActive(row: FeaturePick): boolean {
   return (
     phase === "implementing" ||
     phase === "feature-qa" ||
-    phase === "qa" ||
     phase === "reviewing" ||
     phase === "pr" ||
     phase === "planning"
@@ -2104,7 +2103,6 @@ function plannerOverlayStatus(
     phase === "reviewing" ||
     phase === "implementing" ||
     phase === "feature-qa" ||
-    phase === "qa" ||
     phase === "pr" ||
     phase === "blocked" ||
     phase === "paused"
@@ -2133,7 +2131,6 @@ function reviewerOverlayStatus(
   if (
     phase === "implementing" ||
     phase === "feature-qa" ||
-    phase === "qa" ||
     phase === "pr" ||
     phase === "blocked" ||
     phase === "paused"
@@ -2336,7 +2333,6 @@ export function reopenTasksThatNeverStarted(plan: string, handoffsDir: string): 
 export {
   FEATURE_PHASES,
   INITIAL_PHASE,
-  LEGACY_PHASE_ALIASES,
   PHASE_TRANSITIONS,
   TERMINAL_PHASES,
   TRANSITIONS_LOG,

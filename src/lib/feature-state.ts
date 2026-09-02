@@ -13,8 +13,8 @@
  * Three things replace that:
  *
  *   - `parseStatusFields` — one line-based parse, no regex anywhere.
- *   - `FeaturePhase` — the eight values, and the legacy spellings that are
- *     read but never written.
+ *   - `FeaturePhase` — the eight values, and nothing else. Older spellings
+ *     were migrated on disk, not translated at read time.
  *   - `PHASE_TRANSITIONS` — which moves are legal, so an illegal one is
  *     refused at the write instead of discovered as a wedged Feature.
  */
@@ -85,44 +85,25 @@ export const FEATURE_PHASES = [
 
 export type FeaturePhase = (typeof FEATURE_PHASES)[number];
 
-/**
- * Spellings accepted on read and never produced.
- *
- * A Feature parked by an older build still says `qa`; refusing to understand it
- * would hide the Feature rather than migrate it. Each maps to the phase that
- * replaced it, so every reader sees one vocabulary.
- */
-/*
- * Null-prototype, deliberately. This object is indexed by text read off disk,
- * and a plain object literal answers `aliases["__proto__"]` with
- * `Object.prototype` — a truthy value that is not a phase. `parsePhase` would
- * then return it, and every `isFeaturePhase` guard downstream would be looking
- * at an object. Found by the property test, which generated `"__proto__"`
- * before any human did.
- */
-export const LEGACY_PHASE_ALIASES: Readonly<Record<string, FeaturePhase>> = Object.freeze(
-	Object.assign(Object.create(null) as Record<string, FeaturePhase>, {
-		qa: "feature-qa",
-		implement: "implementing",
-		"pr-open": "pr",
-		"pr-opening": "pr",
-		"pr-waiting": "pr",
-		"pr-fixing": "pr",
-	} as const),
-);
-
 const PHASE_SET: ReadonlySet<string> = new Set(FEATURE_PHASES);
 
 export function isFeaturePhase(value: string): value is FeaturePhase {
 	return PHASE_SET.has(value);
 }
 
-/** The phase this text names, canonicalised, or `undefined` if it names none. */
+/**
+ * The phase this text names, or `undefined` if it names none.
+ *
+ * There is no alias table. Five older spellings (`merged`, `superseded`,
+ * `releasing`, `tasks-complete`, `idle`) did exist on disk; they were migrated
+ * to canonical phases once, on evidence from each Feature's own `next_action`,
+ * rather than translated forever at read time. `test/feature-state.test.ts`
+ * walks the live orchestrator root and fails if a non-canonical phase reappears
+ * — which is the signal to migrate again, not to add a mapping.
+ */
 export function parsePhase(raw: string | undefined): FeaturePhase | undefined {
 	const v = (raw ?? "").trim().toLowerCase();
-	if (!v) return undefined;
-	if (isFeaturePhase(v)) return v;
-	return LEGACY_PHASE_ALIASES[v];
+	return isFeaturePhase(v) ? v : undefined;
 }
 
 /** The phase recorded in a status.md. */
@@ -207,6 +188,13 @@ export function canTransition(from: FeaturePhase | undefined, to: FeaturePhase):
 	// predates the field. Only the entry phase may be claimed that way; anything
 	// else would let a corrupt file license any move at all.
 	if (from === undefined) return to === INITIAL_PHASE;
+	// Writing the phase a Feature is already in is a no-op, not a move, and that
+	// includes the terminal one. A merged Feature has `done` written by
+	// `runFeaturePrLand`, again by the archive branch of the verdict dispatcher,
+	// and again by any reconcile that re-raises the merge; refusing the repeats
+	// would stamp "[phase move refused: done is terminal]" onto the next_action
+	// of a Feature that finished correctly.
+	if (from === to) return true;
 	return PHASE_TRANSITIONS[from].includes(to);
 }
 
