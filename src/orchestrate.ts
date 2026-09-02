@@ -3471,15 +3471,83 @@ export async function drivePrAwait(
  * ------------------------------------------------------------------ */
 
 /** What a finished fixer round means for the Feature PR. */
-export type FixerSettle = "await" | "pause" | "fail" | "disagree";
+export type FixerSettle = "await" | "push_then_await" | "pause" | "fail" | "disagree";
 
+/**
+ * What the branch says the fixer did. `unknown` means git could not answer and
+ * is never evidence of inaction — see `worktreeFingerprint` for the same rule
+ * on the Task path.
+ */
+export type FixerPushState = "pushed" | "committed" | "none" | "unknown";
+
+export function fixerPushState(heads: {
+  remoteBefore: string;
+  remoteAfter: string;
+  localAfter: string;
+}): FixerPushState {
+  if (!heads.remoteBefore || !heads.remoteAfter || !heads.localAfter) return "unknown";
+  if (heads.remoteAfter !== heads.remoteBefore) return "pushed";
+  if (heads.localAfter !== heads.remoteAfter) return "committed";
+  return "none";
+}
+
+/**
+ * `branch`, `origin/<branch>` and `HEAD` for a worktree; `""` for anything git
+ * cannot answer.
+ *
+ * `fetch` refreshes the remote ref first. Without it `origin/<branch>` is
+ * whatever the last fetch left behind, and a fixer's push would look like no
+ * push at all.
+ */
+export async function branchHeads(
+  pi: ExtensionAPI,
+  worktree: string,
+  opts: { fetch?: boolean } = {},
+): Promise<{ branch: string; remote: string; local: string }> {
+  const empty = { branch: "", remote: "", local: "" };
+  const run = async (args: string[], timeout: number): Promise<string> => {
+    try {
+      const r = await pi.exec("git", args, { cwd: worktree, timeout });
+      return r.code === 0 ? String(r.stdout ?? "").trim() : "";
+    } catch {
+      return "";
+    }
+  };
+  try {
+    const branch = await run(["rev-parse", "--abbrev-ref", "HEAD"], 15_000);
+    if (!branch || branch === "HEAD") return empty;
+    if (opts.fetch) await run(["fetch", "origin", branch], 120_000);
+    return {
+      branch,
+      remote: await run(["rev-parse", `origin/${branch}`], 15_000),
+      local: await run(["rev-parse", "HEAD"], 15_000),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * What a finished fixer round means.
+ *
+ * The branch is the evidence, not the child's own report: a fixer that pushed
+ * and then hit its turn budget is `ok: false` with a handoff, and the old table
+ * told the user it "answered without a push" — which was false and stopped the
+ * loop on a PR that had just moved (F5). `push` absent or `unknown` falls back
+ * to that table, because an unreadable head must not invent a verdict.
+ */
 export function fixerSettleAction(input: {
   ok: boolean;
   stopped?: boolean;
   handoffWritten: boolean;
+  push?: FixerPushState;
 }): FixerSettle {
-  if (input.ok) return "await";
+  // A stop is the user's decision; the branch does not overrule it.
   if (input.stopped) return "pause";
+  if (input.push === "pushed") return "await";
+  if (input.push === "committed") return "push_then_await";
+  if (input.push === "none") return input.handoffWritten ? "disagree" : "fail";
+  if (input.ok) return "await";
   if (input.handoffWritten) return "disagree";
   return "fail";
 }
@@ -3735,6 +3803,93 @@ async function awaitAndDispatch(
 }
 
 /**
+ * Push the Feature branch. Writers commit; code pushes (F7).
+ *
+ * stderr is returned verbatim rather than swallowed: "no upstream", "protected
+ * branch" and "non-fast-forward" each need a different answer from the user,
+ * and a generic failure message hid all three.
+ */
+export async function pushFeatureBranch(
+  pi: ExtensionAPI,
+  worktree: string,
+  branch: string,
+): Promise<{ ok: boolean; reason: string }> {
+  if (!branch) return { ok: false, reason: "no branch to push (detached HEAD?)" };
+  try {
+    const r = await pi.exec("git", ["push", "-u", "origin", branch], {
+      cwd: worktree,
+      timeout: 120_000,
+    });
+    if (r.code === 0) return { ok: true, reason: "" };
+    return {
+      ok: false,
+      reason: `${String(r.stderr ?? "").trim() || String(r.stdout ?? "").trim()}`.slice(-600) ||
+        `git push exited ${r.code}`,
+    };
+  } catch (error) {
+    return { ok: false, reason: String((error as { message?: string })?.message ?? error) };
+  }
+}
+
+/**
+ * Stop the fix loop and say so on the PR.
+ *
+ * The spec's termination rule is "loop until merge, or until the orchestrator
+ * disagrees with the reviewers". Nothing implemented the second half, so PRs
+ * consumed seven fixers each (F6). One comment from code — never from a child,
+ * which cannot comment (F7) — records why the loop stopped, and the Feature
+ * parks with a `next_action` a human can act on.
+ */
+export async function recordFeatureDisagreement(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  paths: Paths,
+  pr: string,
+  worktree: string,
+  input: { reason: string; handoff?: string; head?: string; findings?: string[] },
+): Promise<void> {
+  const head = input.head || statusField(readText(paths.statusFile), "pr_head");
+  const shortHead = head && !isPendingToken(head) ? head.slice(0, 12) : "";
+  const body = [
+    `Orchestrator: stopping the automated fix loop on this PR.`,
+    "",
+    `Reason: ${input.reason}.`,
+    ...(shortHead ? ["", `Head at the time: \`${shortHead}\`.`] : []),
+    ...(input.findings?.length
+      ? ["", "Findings still open:", ...input.findings.map((f) => `- ${f}`)]
+      : []),
+    "",
+    "Merge this PR if you agree with the code as it stands, or reply here and re-run `/orchestrate resume`.",
+  ].join("\n");
+
+  let posted = false;
+  try {
+    const r = await pi.exec("gh", ["pr", "comment", pr, "--body", body], {
+      cwd: worktree,
+      timeout: 60_000,
+    });
+    posted = r.code === 0;
+  } catch {
+    posted = false;
+  }
+
+  upsertStatusFile(paths, {
+    phase: "pr",
+    pr,
+    ...(shortHead ? { prHead: head } : {}),
+    nextAction:
+      `disagreed${shortHead ? ` at ${shortHead}` : ""} — ${input.reason}; merge or reply on the PR`,
+  });
+  uiNotify(ctx,
+    `PR ${pr} — the fix loop stopped: ${input.reason}.\n` +
+      (posted ? "A comment explaining that is on the PR.\n" : "Could not post the PR comment.\n") +
+      (input.handoff ? `Handoff: ${input.handoff}\n` : "") +
+      "Merge it yourself if you agree with the code as it stands.",
+    "info",
+  );
+}
+
+/**
  * One review-fix round: a `fixer` in the Feature worktree, then a single
  * `git pr-await` run by code. A judgment `next=` from that await is dispatched
  * again — that is how a later review round still gets a fixer.
@@ -3760,11 +3915,15 @@ async function runReviewFixWriter(
     workerRunDir: "none",
     nextAction: `fixer round ${spawn} on PR ${pr}`,
   });
-  uiNotify(ctx, 
+  uiNotify(ctx,
     `PR ${pr} — fixer round ${spawn}: one fixer in ${worktree}.\n` +
       `The session stays idle; code runs git pr-await once (fixer round ${spawn} latch) when that writer settles.`,
     "info",
   );
+
+  // The branch before the fixer. Read here rather than after, so "did this
+  // round move origin/<branch>?" is a comparison and not a guess.
+  const before = await branchHeads(pi, worktree, { fetch: true });
 
   const outcome = await runChildInPhase(
     pi,
@@ -3776,10 +3935,17 @@ async function runReviewFixWriter(
   upsertStatusFile(paths, { workerRunId: "none", workerRunDir: "none" });
 
   const handoff = join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`);
+  const after = await branchHeads(pi, worktree, { fetch: true });
+  const push = fixerPushState({
+    remoteBefore: before.remote,
+    remoteAfter: after.remote,
+    localAfter: after.local,
+  });
   const settle = fixerSettleAction({
     ok: outcome.ok,
     stopped: outcome.stopped,
     handoffWritten: Boolean(readText(handoff).trim()),
+    push,
   });
   if (settle === "pause") {
     upsertStatusFile(paths, {
@@ -3804,20 +3970,34 @@ async function runReviewFixWriter(
     return;
   }
   if (settle === "disagree") {
-    // Writer finished and chose not to push: the remaining finding is a product
-    // call, not a code gap. Re-awaiting would re-dispatch the same head and
-    // burn another round. Merge on GitHub if you disagree with the reviewer.
-    upsertStatusFile(paths, {
-      phase: "pr",
-      pr,
-      nextAction: `fixer round ${spawn} made no code change — merge yourself if you disagree with the reviewer`,
+    // The branch did not move: the remaining finding is a product call, not a
+    // code gap. Re-awaiting would re-dispatch the same head and burn another
+    // round, so the disagreement is posted on the PR and the loop stops.
+    await recordFeatureDisagreement(pi, ctx, paths, pr, worktree, {
+      reason: `fixer round ${spawn} changed nothing on the branch`,
+      handoff,
+      head: after.remote || before.remote,
     });
-    uiNotify(ctx, 
-      `PR ${pr} — fixer round ${spawn} answered without a push.\n` +
-        `Handoff: ${handoff}\nNot landing. Merge the PR yourself if you disagree with the reviewer.`,
-      "info",
-    );
     return;
+  }
+
+  if (settle === "push_then_await") {
+    // The fixer committed and stopped short of the push. Writers are not
+    // allowed to push (F7), so this is code's job, not a failed round.
+    const pushed = await pushFeatureBranch(pi, worktree, after.branch);
+    if (!pushed.ok) {
+      upsertStatusFile(paths, {
+        phase: "pr",
+        pr,
+        nextAction: `fixer round ${spawn} committed but the push failed — ${pushed.reason}`,
+      });
+      uiNotify(ctx,
+        `PR ${pr} — fixer round ${spawn} committed, but code could not push:\n${pushed.reason}`,
+        "error",
+      );
+      return;
+    }
+    uiNotify(ctx, `PR ${pr} — fixer round ${spawn} committed; code pushed ${after.branch}.`, "info");
   }
 
   // Exactly one `git pr-await`, in code. The writer is forbidden from waiting,

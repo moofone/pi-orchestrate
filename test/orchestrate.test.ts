@@ -57,6 +57,46 @@ function makeFakePi(exec?: (cmd: string, args: string[]) => Promise<unknown>) {
   } as never;
 }
 
+/**
+ * The read-only git a fix round runs to see whether the fixer pushed
+ * (`branchHeads`). Returns `undefined` for anything else so a test's own exec
+ * script still owns `pr-await`, `push`, `gh`, and the rest.
+ *
+ * Each `HEAD` read advances one step, so the default script is "the branch
+ * moved" — what a fixer that did its job leaves behind.
+ */
+function branchHeadExec(
+  steps: { remote: string; local: string }[] = [
+    { remote: "H1", local: "H1" },
+    { remote: "H2", local: "H2" },
+  ],
+) {
+  let i = 0;
+  const at = () => steps[Math.min(i, steps.length - 1)];
+  return (cmd: string, args: string[]) => {
+    if (cmd !== "git") return undefined;
+    const a = args ?? [];
+    if (a[0] === "rev-parse" && a[1] === "--abbrev-ref") {
+      return { code: 0, stdout: "feat/x\n", stderr: "" };
+    }
+    if (a[0] === "fetch") return { code: 0, stdout: "", stderr: "" };
+    if (a[0] === "rev-parse" && String(a[1] ?? "").startsWith("origin/")) {
+      return { code: 0, stdout: `${at().remote}\n`, stderr: "" };
+    }
+    if (a[0] === "rev-parse" && a[1] === "HEAD") {
+      const step = at();
+      i += 1;
+      return { code: 0, stdout: `${step.local}\n`, stderr: "" };
+    }
+    return undefined;
+  };
+}
+
+/** The `git pr-await` calls only — the branch-head reads are not the contract. */
+function prAwaitCalls(execs: string[]): string[] {
+  return execs.filter((e) => e.startsWith("git pr-await"));
+}
+
 /** Every parent turn the extension sent through the fake `pi`. */
 function parentTurns(pi: ReturnType<typeof makeFakePi>): { text: string }[] {
   return (pi as never as { sentUserMessages: { text: string }[] }).sentUserMessages;
@@ -3239,8 +3279,11 @@ test("D2: a Feature read_comments_and_fix spawns one fixer and never asks the pa
   );
 
   const execs: string[] = [];
+  const heads = branchHeadExec();
   const pi = makeFakePi(async (cmd, args) => {
     execs.push([cmd, ...(args ?? [])].join(" "));
+    const head = heads(cmd, args ?? []);
+    if (head) return head;
     // The re-await after a push: the waiter takes the review back over, and
     // reports its own review round, which is not the fix-spawn count.
     return { code: 0, stdout: "status=handed_off\nnext=yield\nround=7\n", stderr: "" };
@@ -3300,9 +3343,14 @@ test("D2: a Feature read_comments_and_fix spawns one fixer and never asks the pa
 
   // 3. Code — not the child — ran exactly one git pr-await after it settled.
   assert.deepEqual(
-    execs,
+    prAwaitCalls(execs),
     ["git pr-await 99"],
     `code runs one git pr-await after the writer settles: ${execs.join(" | ")}`,
+  );
+  assert.equal(
+    execs.some((e) => e.startsWith("git push")),
+    false,
+    "the fixer already pushed; code must not push on top of it",
   );
 
   // 4. pr_round is the fix-spawn count, and the waiter's round=7 did not eat it.
@@ -3367,9 +3415,17 @@ test("D2: a follow-up read_comments_and_fix after a fixer still spawns the next 
   );
 
   const execs: string[] = [];
+  const heads = branchHeadExec([
+    { remote: "H1", local: "H1" },
+    { remote: "H2", local: "H2" },
+    { remote: "H2", local: "H2" },
+    { remote: "H3", local: "H3" },
+  ]);
   let awaits = 0;
   const pi = makeFakePi(async (cmd, args) => {
     execs.push([cmd, ...(args ?? [])].join(" "));
+    const head = heads(cmd, args ?? []);
+    if (head) return head;
     if (cmd === "git" && args?.[0] === "pr-await") {
       awaits += 1;
       if (awaits === 1) {
@@ -3405,7 +3461,7 @@ test("D2: a follow-up read_comments_and_fix after a fixer still spawns the next 
   assert.notEqual((action as { reason?: string })?.reason, "TEST_TIMEOUT");
   assert.equal(action, "spawn_writer");
   assert.equal(spawn.count, 2, "the second current-head verdict must spawn a second fixer");
-  assert.deepEqual(execs, ["git pr-await 99", "git pr-await 99"]);
+  assert.deepEqual(prAwaitCalls(execs), ["git pr-await 99", "git pr-await 99"]);
   assert.match(readFileSync(paths.statusFile, "utf8"), /^pr_round: 2$/m);
   assert.equal(parentTurns(pi).length, 0, "the parent stays idle across both rounds");
   assert.match(
@@ -3451,8 +3507,11 @@ function prFeatureFixture(prRound: number, extra: string[] = []) {
 /** Record every `pi.exec` argv so a writer-free verdict can be proven quiet. */
 function execRecorder(stdout = "", code = 0) {
   const execs: string[] = [];
+  const heads = branchHeadExec();
   const pi = makeFakePi(async (cmd, args) => {
     execs.push([cmd, ...(args ?? [])].join(" "));
+    const head = heads(cmd, args ?? []);
+    if (head) return head;
     return { code, stdout, stderr: "" };
   });
   return { pi, execs };
@@ -3505,9 +3564,12 @@ test("D3: investigate_dead_reviewers re-awaits in code and never spawns a writer
 test("D3: a re-await that returns read_comments_and_fix still spawns a fixer", async () => {
   const { dir, paths } = prFeatureFixture(0);
   const execs: string[] = [];
+  const heads = branchHeadExec();
   let awaits = 0;
   const pi = makeFakePi(async (cmd, args) => {
     execs.push([cmd, ...(args ?? [])].join(" "));
+    const head = heads(cmd, args ?? []);
+    if (head) return head;
     if (cmd === "git" && args?.[0] === "pr-await") {
       awaits += 1;
       if (awaits === 1) {
@@ -3539,7 +3601,7 @@ test("D3: a re-await that returns read_comments_and_fix still spawns a fixer", a
   assert.notEqual((action as { reason?: string })?.reason, "TEST_TIMEOUT");
   assert.equal(action, "reawait");
   assert.equal(spawn.count, 1, "the follow-up current-head verdict must still get a fixer");
-  assert.deepEqual(execs, ["git pr-await 99", "git pr-await 99"]);
+  assert.deepEqual(prAwaitCalls(execs), ["git pr-await 99", "git pr-await 99"]);
   assert.equal(parentTurns(pi).length, 0);
 });
 
@@ -3646,7 +3708,7 @@ test("D3: a completed worker_run_id is swept and the next fixer may spawn", asyn
   assert.equal(action, "spawn_writer", "a finished writer must not block the next round");
   assert.equal(spawn.count, 1);
   assert.match(readFileSync(paths.statusFile, "utf8"), /^worker_run_id: none$/m);
-  assert.deepEqual(execs, ["git pr-await 99"]);
+  assert.deepEqual(prAwaitCalls(execs), ["git pr-await 99"]);
   assert.equal(parentTurns(pi).length, 0);
 });
 
@@ -3660,7 +3722,7 @@ test("D3: a high fixer round still spawns and never lands from read_comments_and
   assert.equal(action, "spawn_writer", "no round cap on fixers");
   assert.equal(spawn.count, 1);
   assert.match(readFileSync(paths.statusFile, "utf8"), /^pr_round: 6$/m);
-  assert.deepEqual(execs, ["git pr-await 99"]);
+  assert.deepEqual(prAwaitCalls(execs), ["git pr-await 99"]);
   for (const argv of execs) assert.doesNotMatch(argv, /gh pr merge|git pr-land/);
   assert.equal(parentTurns(pi).length, 0);
 });
@@ -4479,5 +4541,133 @@ test("gate: writerBlockedByPlanReview is the overlap hard-stop", () => {
   assert.match(
     String(orch.writerBlockedByPlanReview("plan_review: in_progress\n")),
     /plan-reviewer still running/,
+  );
+});
+
+/* ---------------------------------------------------------------- *
+ * Phase 2 — the deterministic fix loop (F5, F6, F7, F9, F10)
+ * ---------------------------------------------------------------- */
+
+test("P2 F5: fixerPushState reads the branch, and an unreadable head is inconclusive", () => {
+  const state = orch.fixerPushState;
+  assert.equal(typeof state, "function", "fixerPushState must be exported");
+  assert.equal(
+    state({ remoteBefore: "a", remoteAfter: "b", localAfter: "b" }),
+    "pushed",
+    "origin/<branch> moved: the fixer pushed",
+  );
+  assert.equal(
+    state({ remoteBefore: "a", remoteAfter: "a", localAfter: "b" }),
+    "committed",
+    "HEAD is ahead of origin: the fixer committed and code owes the push",
+  );
+  assert.equal(
+    state({ remoteBefore: "a", remoteAfter: "a", localAfter: "a" }),
+    "none",
+    "nothing moved anywhere",
+  );
+  for (const heads of [
+    { remoteBefore: "", remoteAfter: "a", localAfter: "a" },
+    { remoteBefore: "a", remoteAfter: "", localAfter: "a" },
+    { remoteBefore: "a", remoteAfter: "a", localAfter: "" },
+  ]) {
+    assert.equal(
+      state(heads),
+      "unknown",
+      "a head git could not answer must never be read as 'no push'",
+    );
+  }
+});
+
+test("P2 F5: a fixer that pushed and then timed out re-awaits instead of being called a disagreement", () => {
+  const settle = orch.fixerSettleAction;
+  assert.equal(
+    settle({ ok: false, handoffWritten: true, push: "pushed" }),
+    "await",
+    "the branch moved — telling the user the fixer 'answered without a push' is false",
+  );
+  assert.equal(
+    settle({ ok: true, handoffWritten: true, push: "pushed" }),
+    "await",
+  );
+  assert.equal(
+    settle({ ok: true, handoffWritten: true, push: "committed" }),
+    "push_then_await",
+    "the fixer committed but did not push: code pushes, then one await",
+  );
+  assert.equal(
+    settle({ ok: false, handoffWritten: true, push: "committed" }),
+    "push_then_await",
+  );
+  assert.equal(
+    settle({ ok: true, handoffWritten: true, push: "none" }),
+    "disagree",
+    "reported ok but pushed nothing: re-awaiting the same head is the silent stall",
+  );
+  assert.equal(
+    settle({ ok: false, handoffWritten: false, push: "none" }),
+    "fail",
+  );
+  assert.equal(
+    settle({ ok: false, stopped: true, handoffWritten: true, push: "pushed" }),
+    "pause",
+    "a user stop stays a pause whatever the branch did",
+  );
+});
+
+test("P2 F5: with no readable head the settle falls back to the old ok + handoff table", () => {
+  const settle = orch.fixerSettleAction;
+  assert.equal(settle({ ok: true, handoffWritten: true }), "await");
+  assert.equal(settle({ ok: false, stopped: true, handoffWritten: false }), "pause");
+  assert.equal(settle({ ok: false, handoffWritten: true }), "disagree");
+  assert.equal(settle({ ok: false, handoffWritten: false }), "fail");
+  assert.equal(settle({ ok: true, handoffWritten: true, push: "unknown" }), "await");
+  assert.equal(settle({ ok: false, handoffWritten: true, push: "unknown" }), "disagree");
+});
+
+test("P2 F5: branchHeads fetches before reading origin and never throws on a dead git", async () => {
+  const calls: string[][] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])]);
+    if (args?.[0] === "rev-parse" && args?.[1] === "--abbrev-ref") {
+      return { code: 0, stdout: "feat/x\n", stderr: "" };
+    }
+    if (args?.[0] === "fetch") return { code: 0, stdout: "", stderr: "" };
+    if (args?.[0] === "rev-parse" && args?.[1] === "origin/feat/x") {
+      return { code: 0, stdout: "REMOTE\n", stderr: "" };
+    }
+    if (args?.[0] === "rev-parse" && args?.[1] === "HEAD") {
+      return { code: 0, stdout: "LOCAL\n", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: "no" };
+  });
+  const heads = await orch.branchHeads(pi as never, "/tmp/wt", { fetch: true });
+  assert.deepEqual(heads, { branch: "feat/x", remote: "REMOTE", local: "LOCAL" });
+  assert.ok(
+    calls.some((c) => c[1] === "fetch"),
+    "the remote head must be refreshed before it is compared",
+  );
+
+  const dead = makeFakePi(async () => {
+    throw new Error("git is gone");
+  });
+  assert.deepEqual(await orch.branchHeads(dead as never, "/tmp/wt"), {
+    branch: "",
+    remote: "",
+    local: "",
+  });
+});
+
+test("P2 F5: runReviewFixWriter decides from the branch and pushes what the fixer only committed", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const start = src.indexOf("async function runReviewFixWriter");
+  assert.ok(start > 0);
+  const body = src.slice(start, src.indexOf("\nexport async function dispatchFeaturePrVerdict", start));
+  assert.match(body, /branchHeads\(/, "the round must record the branch heads itself");
+  assert.match(body, /fixerPushState\(/, "the settle input must come from the branch");
+  assert.match(body, /push_then_await/, "code owes the push when the fixer only committed");
+  assert.ok(
+    body.indexOf("branchHeads(") < body.indexOf("runChildInPhase"),
+    "the before-head must be read before the fixer runs, not after",
   );
 });
