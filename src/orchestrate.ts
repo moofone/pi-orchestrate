@@ -456,7 +456,12 @@ function isPaused(status: string): boolean {
   return v === "after-task" || v === "on" || v === "yes" || v === "paused";
 }
 
-const DEFAULT_QA_PASS_CAP = 1;
+/**
+ * QA → fix → QA → fix → PR. Cap 1 meant the remediation Tasks QA itself asked
+ * for were implemented and then never looked at again; the second pass is what
+ * checks QA's own fixes (F12). `MAX_QA_PASS_CAP` is the ceiling.
+ */
+const DEFAULT_QA_PASS_CAP = 2;
 const DEFAULT_AUTO_ADVANCE_ON_LANDED = true;
 const SIDECAR_PATH = join(dirname(fileURLToPath(import.meta.url)), "orchestrate.json");
 
@@ -508,14 +513,30 @@ export function worktreeChanged(before: string, after: string): boolean {
  */
 export type TaskSettleAction = "done_continue" | "blocked" | "pending_pause";
 
+/** What the Task's own `- Command:` gate said. `none` = the Task had none. */
+export type TaskGate = "none" | "green" | "red";
+
+export function taskGateResult(input: { gated: boolean; ok: boolean }): TaskGate {
+  if (!input.gated) return "none";
+  return input.ok ? "green" : "red";
+}
+
 export function settleTaskOutcome(input: {
   ok: boolean;
   stopped?: boolean;
   landed: boolean;
   autoAdvance: boolean;
+  /** The Task has a runnable `- Command:` gate, so `ok` is a verified fact. */
+  gated?: boolean;
 }): { action: TaskSettleAction; reason: string } {
   if (!input.ok && input.stopped) return { action: "pending_pause", reason: "stopped" };
   if (input.ok) return { action: "done_continue", reason: input.landed ? "ok" : "ok_unchanged" };
+  // `failed_but_landed` exists for the 39% of Tasks with no runnable gate,
+  // where a harness fail plus a changed worktree usually means the child's own
+  // report was the only thing that failed. Where a real command ran and came
+  // back red, that reading is wrong: the Task is broken and the chain must not
+  // build the next Task on top of it (F13).
+  if (input.gated) return { action: "blocked", reason: "failed_gate" };
   if (input.landed && input.autoAdvance) {
     return { action: "done_continue", reason: "failed_but_landed" };
   }
@@ -641,6 +662,7 @@ export function orphanDecision(
   snapshot: RunSnapshot | undefined,
   landed: boolean,
   autoAdvance: boolean,
+  gated = false,
 ): OrphanDecision {
   // No run artifact at all (retention swept it, or the spawn never named a
   // run): git evidence is the only witness left.
@@ -648,6 +670,9 @@ export function orphanDecision(
   if (!snapshot.terminal) return "wait";
   if (snapshot.stopped) return "rerun";
   if (snapshot.ok) return landed ? "done" : "blocked";
+  // Same rule as `settleTaskOutcome`: recovery is not a softer path past a
+  // gate that ran and came back red (F13).
+  if (gated) return "blocked";
   return landed && autoAdvance ? "done" : "blocked";
 }
 
@@ -907,6 +932,30 @@ export function writerBlockedByPlanReview(status: string): string | undefined {
     return "plan-reviewer still running; refusing writer";
   }
   return undefined;
+}
+
+export type PlanReviewReconcile = "keep" | "wait" | "done" | "failed";
+
+/**
+ * What to do with a `plan_review: running` whose session may be gone (F14).
+ *
+ * Tasks got orphan recovery; the reviewer did not, so a plan-reviewer that
+ * died with its session left the field at `running` forever — and
+ * `writerBlockedByPlanReview` then refused every approve and resume, while
+ * `draftApproveCards` hid the card. The Feature could not be reached at all.
+ *
+ * No run artifact at all is `failed`, not `wait`: this is only consulted under
+ * the chain lock, so a genuinely live review is one this process is running
+ * and would have recorded. A missing record means nobody is home.
+ */
+export function planReviewReconcile(
+  state: PlanReviewState,
+  snapshot: RunSnapshot | undefined,
+): PlanReviewReconcile {
+  if (state !== "running") return "keep";
+  if (!snapshot) return "failed";
+  if (!snapshot.terminal) return "wait";
+  return snapshot.ok ? "done" : "failed";
 }
 
 export function worktreePathFor(branch: string, repo = "icemining"): string {
@@ -2212,6 +2261,9 @@ function upsertStatusFile(
     qaPass?: string;
     qaPassCap?: string;
     planReview?: string;
+    /** Async-run id / dir of the plan-reviewer, so a dead one can be settled. */
+    reviewerRunId?: string;
+    reviewerRunDir?: string;
     /** Fingerprint of a verdict dispatch refused; `none` clears it. */
     pendingVerdict?: string;
     /** Head the current verdict was raised against. */
@@ -2246,6 +2298,8 @@ function upsertStatusFile(
       "qa_pass: 0",
       `qa_pass_cap: ${DEFAULT_QA_PASS_CAP}`,
       "plan_review: none",
+      "reviewer_run_id: none",
+      "reviewer_run_dir: none",
       "next_action: wait for user",
       "",
       "## Tasks",
@@ -2279,6 +2333,8 @@ function upsertStatusFile(
   if (patch.qaPass !== undefined) setField("qa_pass", patch.qaPass);
   if (patch.qaPassCap !== undefined) setField("qa_pass_cap", patch.qaPassCap);
   if (patch.planReview !== undefined) setField("plan_review", patch.planReview);
+  if (patch.reviewerRunId !== undefined) setField("reviewer_run_id", patch.reviewerRunId);
+  if (patch.reviewerRunDir !== undefined) setField("reviewer_run_dir", patch.reviewerRunDir);
   if (patch.pendingVerdict !== undefined) setField("pending_verdict", patch.pendingVerdict);
   if (patch.prHead !== undefined) setField("pr_head", patch.prHead);
   if (patch.lastFindings !== undefined) setField("last_findings", patch.lastFindings);
@@ -3192,6 +3248,93 @@ async function worktreeFingerprint(pi: ExtensionAPI, worktree: string): Promise<
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * The commit gate (F11)
+ *
+ * A writer's only git operation is `git commit`. It is also the one the
+ * models skip most: `worktreeFingerprint` counts unstaged edits as a land, so
+ * a Task that edited and never committed used to be marked `done`. The next
+ * worker then started on a dirty tree, feature-qa reviewed uncommitted code,
+ * and `openFeaturePr` pushed HEAD — which did not contain the work.
+ *
+ * So code closes the gate itself after every writer: if the tree is dirty,
+ * code commits it deterministically; if it cannot, the Task blocks with a
+ * reason rather than advancing over work that is not on the branch.
+ * ------------------------------------------------------------------ */
+
+/** `clean` = nothing to do; `committed` = code closed the gate; `unknown` = git could not answer. */
+export type CommitGateState = "clean" | "committed" | "dirty" | "unknown";
+
+/** `git status --porcelain`, or undefined when git cannot answer. */
+export async function porcelainStatus(
+  pi: ExtensionAPI,
+  cwd: string,
+): Promise<string | undefined> {
+  try {
+    const out = await pi.exec("git", ["status", "--porcelain"], { cwd, timeout: 30_000 });
+    if (out.code !== 0) return undefined;
+    return out.stdout.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Refuse to start the *first* Task on a worktree that already has changes.
+ *
+ * Only the first: once a Task has run, a dirty tree is this Feature's own
+ * work-in-progress and the commit gate below owns it. Before then, anything
+ * uncommitted belongs to someone else, and committing it under a Task's
+ * message would attribute a stranger's edits to this plan.
+ */
+export function firstTaskBlockedByDirtyTree(
+  tasks: Task[],
+  porcelain: string | undefined,
+): string | undefined {
+  if (porcelain === undefined || !porcelain.trim()) return undefined;
+  if (tasks.some((t) => t.status !== "pending")) return undefined;
+  const files = porcelain
+    .split("\n")
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean);
+  const shown = files.slice(0, 8).join(", ");
+  return (
+    `dirty worktree: ${files.length} uncommitted file(s) before Task 1 — ${shown}` +
+    `${files.length > 8 ? ", …" : ""}. Commit or stash them, then /orchestrate resume.`
+  );
+}
+
+/**
+ * Close the commit gate for one writer.
+ *
+ * `git add -A` is deliberate: a writer's untracked new files are as much of
+ * the Task as its edits, and leaving them behind would push a half-Task.
+ */
+export async function ensureWriterCommit(
+  pi: ExtensionAPI,
+  cwd: string,
+  message: string,
+): Promise<{ state: CommitGateState; reason: string }> {
+  const before = await porcelainStatus(pi, cwd);
+  if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
+  if (!before) return { state: "clean", reason: "" };
+  try {
+    const add = await pi.exec("git", ["add", "-A"], { cwd, timeout: 120_000 });
+    if (add.code !== 0) {
+      return { state: "dirty", reason: `git add -A failed: ${(add.stderr || "").trim()}` };
+    }
+    const commit = await pi.exec("git", ["commit", "-m", message], { cwd, timeout: 120_000 });
+    if (commit.code !== 0) {
+      return { state: "dirty", reason: `git commit failed: ${(commit.stderr || "").trim()}` };
+    }
+  } catch (error) {
+    return { state: "dirty", reason: `commit gate error: ${String(error)}` };
+  }
+  const after = await porcelainStatus(pi, cwd);
+  if (after) return { state: "dirty", reason: "worktree still dirty after the commit" };
+  return { state: "committed", reason: "" };
+}
+
 /**
  * The five lines every writer child gets, in its own task text.
  *
@@ -4053,6 +4196,25 @@ async function runReviewFixWriter(
   upsertStatusFile(paths, { workerRunId: "none", workerRunDir: "none" });
 
   const handoff = join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`);
+  // Commit gate before the branch is read (F11): an uncommitted fix is
+  // invisible to `fixerPushState`, which would call the round a no-op and
+  // post a disagreement over work that was actually done.
+  const gate = await ensureWriterCommit(pi, worktree, `fix: review round ${spawn}`);
+  if (gate.state === "dirty") {
+    upsertStatusFile(paths, {
+      phase: "pr",
+      pr,
+      nextAction: `fixer round ${spawn} left the worktree dirty — ${gate.reason}`,
+    });
+    uiNotify(ctx,
+      `PR ${pr} — fixer round ${spawn} left ${worktree} dirty and code could not commit it:\n${gate.reason}`,
+      "error",
+    );
+    return;
+  }
+  if (gate.state === "committed") {
+    uiNotify(ctx, `PR ${pr} — fixer round ${spawn} did not commit; code committed it.`, "info");
+  }
   const after = await branchHeads(pi, worktree, { fetch: true });
   const push = fixerPushState({
     remoteBefore: before.remote,
@@ -4682,6 +4844,25 @@ async function runFeatureChain(
           if (made) writerCwd = made;
         }
       }
+      // Nothing has run yet and the tree already has changes: they are not
+      // this Feature's, and the commit gate below would sign them with a Task
+      // message. Stop instead (F11).
+      const dirtyFirst = firstTaskBlockedByDirtyTree(
+        tasks,
+        await porcelainStatus(pi, writerCwd),
+      );
+      if (dirtyFirst) {
+        writeText(paths.planFile, setTaskStatusInPlan(planNow, task.id, "pending"));
+        upsertStatusFile(paths, {
+          phase: "blocked",
+          activeTask: "none",
+          nextAction: dirtyFirst,
+          tasks: parseTasks(readText(paths.planFile)),
+        });
+        uiNotify(ctx, `${name}: ${dirtyFirst}\nNo Task started, no PR opened.`, "error");
+        return;
+      }
+
       upsertStatusFile(paths, {
         phase: "implementing",
         activeTask: task.id,
@@ -4734,17 +4915,60 @@ async function runFeatureChain(
         );
         return;
       }
+      // The commit gate, before any fingerprint is read (F11). A worker that
+      // edited and did not commit leaves work that `git push` would not carry,
+      // so code commits it here or the Task blocks. Committing also changes
+      // HEAD, which is what makes the fingerprint below evidence of a *land*
+      // rather than of an unstaged edit.
+      const gate = await ensureWriterCommit(pi, writerCwd, `Task ${task.id} — ${task.title}`);
+      if (gate.state === "dirty") {
+        writeText(
+          paths.planFile,
+          setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "blocked"), task.id, handoff),
+        );
+        upsertStatusFile(paths, {
+          phase: "blocked",
+          workerRunId: "none",
+          workerRunDir: "none",
+          taskBase: "none",
+          activeTask: task.id,
+          nextAction: `dirty worktree after Task ${task.id}: ${gate.reason}`,
+          tasks: parseTasks(readText(paths.planFile)),
+        });
+        uiNotify(ctx,
+          `Task ${task.id} left ${writerCwd} dirty and code could not commit it:\n${gate.reason}\n` +
+            `Chain stopped, no PR opened.`,
+          "error",
+        );
+        return;
+      }
+      if (gate.state === "committed") {
+        uiNotify(ctx, `Task ${task.id} was not committed by its worker; code committed it.`, "info");
+      }
+
       // Fingerprint after the child, before deciding fail vs continue. A
       // harness fail with a changed worktree is a false fail when
       // autoAdvanceOnLanded is on (default): the work landed, so the next
       // Task starts instead of waiting for /orchestrate resume.
       const afterFingerprint = await worktreeFingerprint(pi, writerCwd);
       const landed = worktreeChanged(beforeFingerprint, afterFingerprint);
+      // A Task with a runnable `- Command:` was graded by the host, so
+      // `outcome.ok` is a verified fact about the code and not the child's
+      // opinion of itself. That changes what a failure means (F13).
+      const gated = Boolean(taskGateCommand(body));
+      const gateResult = taskGateResult({ gated, ok: outcome.ok });
+      const handoffLine = `${handoff}  gate: ${gateResult}`;
       if (!outcome.ok) {
-        if (landed && autoAdvanceOnLanded(readText(paths.statusFile))) {
+        const failSettle = settleTaskOutcome({
+          ok: false,
+          landed,
+          autoAdvance: autoAdvanceOnLanded(readText(paths.statusFile)),
+          gated,
+        });
+        if (failSettle.action === "done_continue") {
           writeText(
             paths.planFile,
-            setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoff),
+            setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoffLine),
           );
           upsertStatusFile(paths, {
             workerRunId: "none",
@@ -4770,20 +4994,26 @@ async function runFeatureChain(
           setTaskHandoffInPlan(
             setTaskStatusInPlan(after, task.id, "blocked"),
             task.id,
-            handoff,
+            handoffLine,
           ),
         );
+        const red = failSettle.reason === "failed_gate";
         upsertStatusFile(paths, {
           phase: "blocked",
           workerRunId: "none",
           workerRunDir: "none",
           taskBase: "none",
           activeTask: task.id,
-          nextAction: "inspect the handoff, then /orchestrate resume",
+          nextAction: red
+            ? `Task ${task.id} gate is red — fix it, then /orchestrate resume`
+            : "inspect the handoff, then /orchestrate resume",
           tasks: parseTasks(readText(paths.planFile)),
         });
-        uiNotify(ctx, 
+        uiNotify(ctx,
           `Task ${task.id} did not pass (${outcome.reason ?? outcome.state ?? "failed"}).\n` +
+            (red
+              ? `Its \`- Command:\` gate ran and came back red; work landing does not change that.\n`
+              : "") +
             `Handoff: ${handoff}\nChain stopped, no PR opened.`,
           "error",
         );
@@ -4803,7 +5033,7 @@ async function runFeatureChain(
       if (settle.action === "done_continue" && settle.reason === "ok_unchanged") {
         writeText(
           paths.planFile,
-          setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoff),
+          setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoffLine),
         );
         upsertStatusFile(paths, {
           workerRunId: "none",
@@ -4827,7 +5057,7 @@ async function runFeatureChain(
 
       writeText(
         paths.planFile,
-        setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoff),
+        setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoffLine),
       );
       upsertStatusFile(paths, {
         workerRunId: "none",
@@ -4836,7 +5066,7 @@ async function runFeatureChain(
         activeTask: "none",
         tasks: parseTasks(readText(paths.planFile)),
       });
-      uiNotify(ctx, `Task ${task.id} done.`, "info");
+      uiNotify(ctx, `Task ${task.id} done (gate: ${gateResult}).`, "info");
 
       if (isPaused(readText(paths.statusFile))) {
         upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
@@ -4856,11 +5086,18 @@ async function runFeatureChain(
       });
       uiNotify(ctx, `All Tasks done on ${name}. feature-qa ${pass + 1}/${cap} (xai/grok-4.6 high)…`, "info");
 
-      const added = await runFeatureQa(pi, ctx, paths, name, worktree);
+      let added = await runFeatureQa(pi, ctx, paths, name, worktree);
+      // One automatic retry (F12). A QA child that dies in transport or misses
+      // its schema is a flake, not a verdict, and parking the Feature for a
+      // manual `/orchestrate resume` over it wasted whole Features.
+      if (added < 0) {
+        uiNotify(ctx, `feature-qa pass ${pass + 1}/${cap} did not produce findings. Retrying once…`, "warning");
+        added = await runFeatureQa(pi, ctx, paths, name, worktree);
+      }
       // Only a completed pass counts. Incrementing before this check would let
       // a failed QA satisfy the cap, and the next `/orchestrate resume` would
       // walk straight past QA into the PR.
-      if (added < 0) return; // QA itself failed; runFeatureQa already reported.
+      if (added < 0) return; // QA itself failed twice; runFeatureQa already reported.
       upsertStatusFile(paths, { qaPass: String(pass + 1) });
       if (added > 0) {
         uiNotify(ctx, `feature-qa added ${added} remediation Task(s). Continuing.`, "info");
@@ -4948,6 +5185,7 @@ export async function reconcileOrphanTask(
     snapshot,
     landed,
     autoAdvanceOnLanded(readText(paths.statusFile)),
+    Boolean(taskGateCommand(taskSection(readText(paths.planFile), task.id))),
   );
   const plan = readText(paths.planFile);
   const cleared = { workerRunId: "none", workerRunDir: "none", taskBase: "none" } as const;
@@ -5717,6 +5955,8 @@ async function reviewPlan(
   upsertStatusFile(paths, {
     phase: "reviewing",
     planReview: "running",
+    reviewerRunId: "none",
+    reviewerRunDir: "none",
     nextAction: `plan-reviewer (xai/grok-4.6 high); wait to finish before Tasks`,
   });
   uiNotify(
@@ -5729,11 +5969,16 @@ async function reviewPlan(
     ctx,
     "review",
     reviewLaunchParams(paths, cwd, featureName),
+    // Recorded so a reviewer that dies with its session can be settled from
+    // its own on-disk lifecycle file instead of wedging the Feature (F14).
+    (runId) => upsertStatusFile(paths, { reviewerRunId: runId, reviewerRunDir: asyncRunDir(runId) }),
   );
   if (!review.ok) {
     upsertStatusFile(paths, {
       phase: "reviewing",
       planReview: "failed",
+      reviewerRunId: "none",
+      reviewerRunDir: "none",
       nextAction: `/orchestrate review ${featureName}`,
     });
     uiNotify(
@@ -5746,8 +5991,61 @@ async function reviewPlan(
   upsertStatusFile(paths, {
     phase: "planning",
     planReview: "done",
+    reviewerRunId: "none",
+    reviewerRunDir: "none",
     nextAction: `wait for /orchestrate approve ${featureName}`,
   });
+  return true;
+}
+
+/**
+ * Settle a `plan_review: running` left behind by a session that is gone.
+ *
+ * Returns false when the reviewer is genuinely still alive and the caller must
+ * not proceed. Called under the chain lock, before anything consults
+ * `needsPlanReview` or `writerBlockedByPlanReview` (F14).
+ */
+export function reconcilePlanReview(ctx: ExtensionCommandContext, paths: Paths): boolean {
+  const status = readText(paths.statusFile);
+  const state = planReviewState(status);
+  const recordedDir = statusField(status, "reviewer_run_dir");
+  const runId = statusField(status, "reviewer_run_id");
+  const dir = !isPendingToken(recordedDir)
+    ? recordedDir
+    : isPendingToken(runId)
+      ? ""
+      : asyncRunDir(runId);
+  const decision = planReviewReconcile(state, readRunSnapshot(dir));
+
+  if (decision === "keep") return true;
+  if (decision === "wait") {
+    uiNotify(
+      ctx,
+      `plan-reviewer is still running from an earlier session (run ${runId.slice(0, 8)}).\n` +
+        `Not starting writers over it.`,
+      "warning",
+    );
+    return false;
+  }
+  if (decision === "done") {
+    upsertStatusFile(paths, {
+      planReview: "done",
+      reviewerRunId: "none",
+      reviewerRunDir: "none",
+    });
+    uiNotify(ctx, `plan-reviewer from an earlier session finished; plan review recorded done.`, "info");
+    return true;
+  }
+  upsertStatusFile(paths, {
+    planReview: "failed",
+    reviewerRunId: "none",
+    reviewerRunDir: "none",
+  });
+  uiNotify(
+    ctx,
+    `plan-reviewer from an earlier session is gone without finishing. Plan review reset — it re-runs now.`,
+    "warning",
+  );
   return true;
 }
 
@@ -5830,6 +6128,11 @@ async function beginImplementation(
         );
       }
     }
+
+    // A reviewer recorded `running` may belong to a session that no longer
+    // exists. Settle that from its own run artifact first, so the two checks
+    // below see the truth rather than a stale field (F14).
+    if (!reconcilePlanReview(ctx, paths)) return;
 
     // Deterministic: never start tdd-worker until plan-reviewer has settled.
     // If the user approved during review, wait here (run it) instead of overlapping.

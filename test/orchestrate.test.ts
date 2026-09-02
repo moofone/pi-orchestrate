@@ -80,6 +80,11 @@ function branchHeadExec(
       return { code: 0, stdout: "feat/x\n", stderr: "" };
     }
     if (a[0] === "fetch") return { code: 0, stdout: "", stderr: "" };
+    // The commit gate (F11). Clean = the writer committed, which is the
+    // ordinary case; a test that wants a dirty tree answers this itself.
+    if (a[0] === "status" && a.includes("--porcelain")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
     if (a[0] === "rev-parse" && String(a[1] ?? "").startsWith("origin/")) {
       return { code: 0, stdout: `${at().remote}\n`, stderr: "" };
     }
@@ -5090,5 +5095,279 @@ test("P2 F10: a Context that is the last section of the plan still reaches the P
     orch.featurePrBody(plan, "t"),
     /The last section of the plan is still the body\./,
     "JS has no \\Z: 'to the next H2 or the end' must not silently return nothing",
+  );
+});
+
+/* ---------------------------------------------------------------- *
+ * Phase 3 — the Task and QA lifecycle (F11, F12, F13, F14)
+ * ---------------------------------------------------------------- */
+
+test("P3 F11: an uncommitted Task is committed by code, not counted as done", async () => {
+  const calls: string[] = [];
+  let dirty = " M src/a.ts\n?? src/b.ts";
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 3 — parser");
+  assert.equal(gate.state, "committed", "a dirty tree after a writer is committed by code");
+  assert.ok(
+    calls.includes("git add -A"),
+    "untracked new files are as much of the Task as its edits",
+  );
+  assert.ok(
+    calls.includes("git commit -m Task 3 — parser"),
+    "the commit message names the Task deterministically",
+  );
+});
+
+test("P3 F11: a commit that does not clear the tree blocks instead of reporting success", async () => {
+  const pi = makeFakePi(async (cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: " M src/a.ts", stderr: "" };
+    if (a[0] === "commit") return { code: 1, stdout: "", stderr: "nothing to commit, hook failed" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "dirty", "a failed commit is not a closed gate");
+  assert.match(gate.reason, /hook failed/, "the git stderr reaches the user verbatim");
+});
+
+test("P3 F11: an already-clean tree runs no commit at all", async () => {
+  const calls: string[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "clean", "the worker committed; there is nothing for code to do");
+  assert.deepEqual(
+    calls.filter((c) => c.includes("commit") || c.includes("add")),
+    [],
+    "code must not manufacture an empty commit on a clean tree",
+  );
+});
+
+test("P3 F11: git that cannot answer is inconclusive, never a silent land", async () => {
+  const pi = makeFakePi(async () => ({ code: 128, stdout: "", stderr: "not a git repository" }));
+  const gate = await orch.ensureWriterCommit(pi, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "unknown", "an unreadable status must not be read as clean or dirty");
+  assert.equal(
+    await orch.porcelainStatus(pi, "/wt"),
+    undefined,
+    "porcelainStatus distinguishes 'clean' from 'git could not say'",
+  );
+});
+
+test("P3 F11: Task 1 refuses to start on a tree that already has someone else's changes", () => {
+  const pending = [
+    { id: "1", title: "a", status: "pending" },
+    { id: "2", title: "b", status: "pending" },
+  ] as never;
+  const started = [
+    { id: "1", title: "a", status: "done" },
+    { id: "2", title: "b", status: "pending" },
+  ] as never;
+  const dirty = " M auth/admin.ts\n M auth/user.ts";
+
+  const refusal = orch.firstTaskBlockedByDirtyTree(pending, dirty);
+  assert.ok(refusal, "nothing has run yet: those edits are not this Feature's to commit");
+  assert.match(refusal!, /dirty worktree/, "the reason says what it is");
+  assert.match(refusal!, /auth\/admin\.ts/, "and names the files, so the user can act");
+
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(started, dirty),
+    undefined,
+    "once a Task has run, a dirty tree is this Feature's own work and the commit gate owns it",
+  );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(pending, ""),
+    undefined,
+    "a clean tree is not a refusal",
+  );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(pending, undefined),
+    undefined,
+    "git that could not answer must not block the Feature on its own",
+  );
+});
+
+test("P3 F12: the QA cap is two passes, so QA's own remediation Tasks get reviewed", () => {
+  const status = ["# Status", "qa_pass: 0", "next_action: x"].join("\n");
+  assert.equal(
+    orch.clampedQaPassCap(Number.NaN),
+    2,
+    "default cap 2: QA → fix → QA → fix → PR, not QA → fix → PR",
+  );
+  assert.equal(orch.clampedQaPassCap(9), 2, "MAX_QA_PASS_CAP still bounds it");
+  assert.equal(orch.clampedQaPassCap(0), 0, "an explicit 0 opts out of QA entirely");
+  assert.match(
+    readFileSync(ORCH_SRC, "utf8"),
+    /const DEFAULT_QA_PASS_CAP = 2;/,
+    "the seeded qa_pass_cap in a new status.md follows the default",
+  );
+  assert.ok(status.includes("qa_pass: 0"), "qa_pass counts completed passes only");
+});
+
+test("P3 F12: a QA child that fails is retried once before the Feature parks", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const chain = src.slice(src.indexOf("if (needsFeatureQa(status))"));
+  const block = chain.slice(0, chain.indexOf("// ---- Everything done"));
+  assert.equal(
+    (block.match(/runFeatureQa\(/g) ?? []).length,
+    2,
+    "one retry: a transport or schema flake is not a QA verdict",
+  );
+  assert.match(
+    block,
+    /if \(added < 0\) return;/,
+    "after the retry, a still-failing QA parks the Feature rather than opening a PR",
+  );
+});
+
+test("P3 F13: a Task whose verified gate came back red never auto-advances", () => {
+  const settle = orch.settleTaskOutcome;
+  assert.deepEqual(
+    settle({ ok: false, landed: true, autoAdvance: true, gated: true }),
+    { action: "blocked", reason: "failed_gate" },
+    "a `- Command:` gate that ran and failed is a fact about the code, not a harness quirk",
+  );
+  assert.deepEqual(
+    settle({ ok: false, landed: true, autoAdvance: true, gated: false }),
+    { action: "done_continue", reason: "failed_but_landed" },
+    "an ungated Task keeps the old reading: the child's self-report is the only thing that failed",
+  );
+  assert.equal(
+    settle({ ok: true, landed: true, autoAdvance: true, gated: true }).action,
+    "done_continue",
+    "a green gate still advances",
+  );
+  assert.equal(
+    settle({ ok: false, stopped: true, landed: true, autoAdvance: true, gated: true }).action,
+    "pending_pause",
+    "a user pause outranks the gate: it is not a failure at all",
+  );
+});
+
+test("P3 F13: orphan recovery is not a softer path past a red gate", () => {
+  const snap = { state: "failed", terminal: true, ok: false, stopped: false, startedAtMs: 1 };
+  assert.equal(
+    orch.orphanDecision(snap, true, true, true),
+    "blocked",
+    "recovery must decide what the live chain would have decided",
+  );
+  assert.equal(
+    orch.orphanDecision(snap, true, true, false),
+    "done",
+    "an ungated Task that landed still advances, as before",
+  );
+});
+
+test("P3 F13: the gate result is recorded on the Task's handoff line", () => {
+  assert.equal(orch.taskGateResult({ gated: false, ok: false }), "none");
+  assert.equal(orch.taskGateResult({ gated: true, ok: true }), "green");
+  assert.equal(orch.taskGateResult({ gated: true, ok: false }), "red");
+  assert.match(
+    readFileSync(ORCH_SRC, "utf8"),
+    /const handoffLine = `\$\{handoff\}  gate: \$\{gateResult\}`;/,
+    "plan.md carries the gate colour, so the next reader does not have to re-derive it",
+  );
+});
+
+test("P3 F14: a plan-reviewer that died with its session no longer wedges the Feature", () => {
+  const r = orch.planReviewReconcile;
+  assert.equal(
+    r("running", undefined),
+    "failed",
+    "recorded running with no run artifact is the wedge itself: reset it so review re-runs",
+  );
+  assert.equal(
+    r("running", { state: "running", terminal: false, ok: false, stopped: false, startedAtMs: 1 }),
+    "wait",
+    "a genuinely live reviewer is still waited on — one writer at a time",
+  );
+  assert.equal(
+    r("running", { state: "complete", terminal: true, ok: true, stopped: false, startedAtMs: 1 }),
+    "done",
+    "a reviewer that finished after its session died has done the work; record it",
+  );
+  assert.equal(
+    r("running", { state: "failed", terminal: true, ok: false, stopped: false, startedAtMs: 1 }),
+    "failed",
+    "a terminal failure re-runs rather than blocking approve forever",
+  );
+  for (const state of ["none", "done", "failed"] as const) {
+    assert.equal(r(state, undefined), "keep", "only `running` is reconciled");
+  }
+});
+
+test("P3 F14: reconcilePlanReview clears the wedge and lets approve through", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-f14-"));
+  try {
+    const paths = { statusFile: join(dir, "status.md"), planFile: join(dir, "plan.md") } as never;
+    writeFileSync(
+      (paths as { statusFile: string }).statusFile,
+      [
+        "# Status",
+        "repo: r",
+        "plan: p",
+        "phase: reviewing",
+        "plan_review: running",
+        "reviewer_run_id: dead-run",
+        "reviewer_run_dir: /nonexistent/run/dir",
+        "next_action: x",
+        "",
+      ].join("\n"),
+    );
+    const notices: string[] = [];
+    const ctx = {
+      ui: { notify: (m: string) => notices.push(String(m)) },
+    } as never;
+    const before = readFileSync((paths as { statusFile: string }).statusFile, "utf8");
+    assert.equal(
+      orch.writerBlockedByPlanReview(before),
+      "plan-reviewer still running; refusing writer",
+      "as found: every approve and resume is refused",
+    );
+
+    const proceed = orch.reconcilePlanReview(ctx, paths);
+    assert.equal(proceed, true, "a dead reviewer must not stop the caller");
+    const after = readFileSync((paths as { statusFile: string }).statusFile, "utf8");
+    assert.equal(
+      orch.planReviewState(after),
+      "failed",
+      "the field is settled on disk, so the next session does not repeat the diagnosis",
+    );
+    assert.equal(
+      orch.writerBlockedByPlanReview(after),
+      undefined,
+      "and approve is reachable again",
+    );
+    assert.match(after, /reviewer_run_id: none/, "the dead run id is cleared with it");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("P3 F14: reviewPlan records the run it spawned", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const fn = src.slice(src.indexOf("async function reviewPlan("));
+  const body = fn.slice(0, fn.indexOf("\nasync function "));
+  assert.match(
+    body,
+    /reviewerRunId: runId, reviewerRunDir: asyncRunDir\(runId\)/,
+    "without the run id there is nothing for reconciliation to read",
+  );
+  const begin = src.slice(src.indexOf("async function beginImplementation("));
+  assert.ok(
+    begin.indexOf("reconcilePlanReview(ctx, paths)") <
+      begin.indexOf("needsPlanReview(readText(paths.planFile)"),
+    "reconcile first: both gates below must see the settled field, not the stale one",
   );
 });
