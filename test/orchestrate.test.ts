@@ -2563,6 +2563,134 @@ test("L4: orchestrate.ts registers resources_discover and before_agent_start for
 });
 
 /* ---------------------------------------------------------------- *
+ * L5 — the idle-parent gate.
+ *
+ * "Stay idle" was appended to the system prompt of EVERY pi session in a repo
+ * that had any Feature whose phase matched `^(implement|pr|qa)$`. That regex
+ * never matched the real phases `implementing` / `feature-qa`, and four
+ * Features stuck in `phase: pr` behind merged PRs poisoned every icemining
+ * session for days (qa/fable_01.md F8, Phase 1.5).
+ * ---------------------------------------------------------------- */
+
+function idleParentRoot(
+  rows: { name: string; phase: string; worktree?: string | null; pr?: string }[],
+): string {
+  const root = mkdtempSync(join(tmpdir(), "orch-idle-"));
+  for (const row of rows) {
+    const dir = join(root, "icemining", row.name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "plan.md"), `# Feature: ${row.name}\n`);
+    const lines = [
+      "# Status",
+      "",
+      "repo: icemining",
+      `name: ${row.name}`,
+      `phase: ${row.phase}`,
+      `pr: ${row.pr ?? "none"}`,
+    ];
+    if (row.worktree !== null) lines.push(`worktree: ${row.worktree ?? "none"}`);
+    writeFileSync(join(dir, "status.md"), `${lines.join("\n")}\n`);
+  }
+  return root;
+}
+
+test("L5: the idle gate matches the real phase names, not `implement`/`qa`", () => {
+  const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-live");
+  for (const phase of ["implementing", "feature-qa", "pr"]) {
+    const root = idleParentRoot([{ name: "feat-live", phase, worktree: WT }]);
+    try {
+      assert.equal(
+        orch.liveFeatureNeedsIdleParent(WT, root),
+        true,
+        `${phase} in the Feature's own worktree must keep the parent idle`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("L5: a Feature that is planning, reviewing or done never silences a session", () => {
+  const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-quiet");
+  for (const phase of ["planning", "reviewing", "done", "blocked", "paused"]) {
+    const root = idleParentRoot([{ name: "feat-quiet", phase, worktree: WT }]);
+    try {
+      assert.equal(
+        orch.liveFeatureNeedsIdleParent(WT, root),
+        false,
+        `${phase} has no writer running, so nothing is owed`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("L5: the reference checkout is not silenced by a Feature working in a worktree", () => {
+  // This is the poisoning case. The Feature's writer is in ice-wt; the person
+  // sitting in ~/Dev/git/icemining is doing something else entirely.
+  const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-elsewhere");
+  const REF = join(homedir(), "Dev", "git", "icemining");
+  const root = idleParentRoot([{ name: "feat-elsewhere", phase: "pr", worktree: WT }]);
+  try {
+    assert.equal(orch.liveFeatureNeedsIdleParent(REF, root), false);
+    assert.equal(orch.liveFeatureNeedsIdleParent(WT, root), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("L5: a Feature with no worktree yet still claims its reference checkout", () => {
+  // Host Features and pre-`git wt` phases record no worktree. The only cwd that
+  // can be theirs is the repo root, so that one still counts.
+  const REF = join(homedir(), "Dev", "git", "icemining");
+  const root = idleParentRoot([
+    { name: "feat-nowt", phase: "implementing", worktree: "none" },
+  ]);
+  try {
+    assert.equal(orch.liveFeatureNeedsIdleParent(REF, root), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("L5: an unrelated cwd is never silenced", () => {
+  const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-x");
+  const root = idleParentRoot([{ name: "feat-x", phase: "pr", worktree: WT }]);
+  try {
+    assert.equal(
+      orch.liveFeatureNeedsIdleParent(join(homedir(), "Dev", "git", "ice-wt", "other"), root),
+      false,
+    );
+    assert.equal(orch.liveFeatureNeedsIdleParent("", root), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("L5: reconcile is wired to session_start, the command handler, and an unref'd timer", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  assert.equal(
+    typeof (orch as Record<string, unknown>).reconcileLiveFeaturePrs,
+    "function",
+    "the reconciler entry point must be exported so it can be driven and tested",
+  );
+  assert.match(src, /reconcileLiveFeaturePrs/, "orchestrate must call the reconciler");
+  assert.match(src, /setInterval\(/, "a periodic reconcile must exist");
+  assert.match(
+    src,
+    /reconcileTimer\.unref\?\.\(\)/,
+    "the reconcile timer must be unref'd so it never holds the process open",
+  );
+  assert.match(src, /RECONCILE_INTERVAL_MS/);
+  assert.match(
+    src,
+    /pi\.on\("session_start"[\s\S]{0,600}?reconcileLiveFeaturePrs/,
+    "reconcile must run on session_start, which is the reload case F1 is about",
+  );
+});
+
+/* ---------------------------------------------------------------- *
  * D1 — Feature-PR review-fix dispatch primitives
  *
  * A judgment `next=` on a Feature-owned PR must be dispatched by code, the

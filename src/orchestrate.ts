@@ -46,12 +46,19 @@ import {
   actionableFingerprint,
   armObservedLatch,
   findFeatureOwningPr,
+  isDriverRunning,
   landFailedAlreadyMerged,
+  listFeaturePrOwners,
   MECHANICAL,
   printedLandCommand,
+  repoKey,
   spendWaiterVerdict,
+  undeliveredWaiterVerdicts,
+  waiterPaths,
   type FeaturePrOwner,
 } from "./lib/pr-await-core.ts";
+import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
+import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
 
 // The latch reads Feature ownership from the same helper; re-exported here so
 // the dispatcher has one public surface and the latch never imports this file.
@@ -4018,6 +4025,161 @@ export async function dispatchFeaturePrVerdictForOwner(
 }
 
 /* ------------------------------------------------------------------ *
+ * Durable Feature PR reconcile
+ *
+ * `pr-reconcile.ts` holds the decisions; this is the wiring that gives it a
+ * real `gh`, a real dispatcher, and real files. It runs on `session_start`, on
+ * every `/orchestrate` verb, whenever a chain releases the lock with a verdict
+ * queued, and on one process-wide 60s timer while any Feature is in `phase: pr`.
+ *
+ * That is deliberately more triggers than strictly needed. The failure being
+ * fixed is a Feature nobody is watching (F1), so every moment this extension is
+ * awake for any reason is a chance to notice.
+ * ------------------------------------------------------------------ */
+
+export const RECONCILE_INTERVAL_MS = 60_000;
+
+/** Paths for a Feature the reconciler found on disk. */
+function ownerPaths(owner: FeaturePrOwner): Paths {
+  const repoDir = dirname(owner.dir);
+  return bindFeature(
+    {
+      repo: owner.repo,
+      gitRoot: join(REF_ROOT, owner.repo),
+      repoDir,
+      featureDir: owner.dir,
+      planFile: "",
+      statusFile: "",
+      handoffsDir: "",
+      archiveDir: join(repoDir, "archive"),
+    },
+    owner.dir,
+  );
+}
+
+/** `gh pr view` for one Feature, from a directory that can answer. */
+async function featurePrState(
+  pi: ExtensionAPI,
+  owner: FeaturePrOwner,
+): Promise<{ state: "open" | "merged" | "closed" | "unknown"; head?: string }> {
+  const candidates = [owner.worktree, join(REF_ROOT, owner.repo)].filter(
+    (dir): dir is string => Boolean(dir) && existsSync(dir),
+  );
+  for (const cwd of candidates) {
+    try {
+      const result = await pi.exec(
+        "gh",
+        ["pr", "view", owner.pr, "--json", "state,mergedAt,headRefOid"],
+        { cwd, timeout: 20_000 },
+      );
+      if (result.code !== 0) continue;
+      const json = JSON.parse(String(result.stdout ?? "")) as {
+        state?: unknown;
+        mergedAt?: unknown;
+        headRefOid?: unknown;
+      };
+      const head = typeof json.headRefOid === "string" ? json.headRefOid : undefined;
+      if (json.mergedAt) return { state: "merged", head };
+      const state = String(json.state ?? "").toLowerCase();
+      if (!state) continue;
+      return { state: state === "open" ? "open" : "closed", head };
+    } catch {
+      // Try the next directory; an unanswerable PR stays `unknown`, and
+      // `unknown` never closes a Feature.
+    }
+  }
+  return { state: "unknown" };
+}
+
+/**
+ * One reconcile pass over every live Feature PR in this orchestrator root.
+ *
+ * Never throws: it is called from event handlers and a timer, and a session
+ * must not die because `gh` was rate-limited or a status.md was half-written.
+ */
+export async function reconcileLiveFeaturePrs(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | ExtensionCommandContext,
+): Promise<ReconcileResult | undefined> {
+  try {
+    return await reconcileFeaturePrs({
+      listFeatures: () => listFeaturePrOwners(),
+      prState: (owner) => featurePrState(pi, owner),
+      undeliveredVerdicts: (owner) => undeliveredWaiterVerdicts(owner.pr),
+      dispatch: (owner, verdict) =>
+        dispatchFeaturePrVerdictForOwner(pi, ctx as ExtensionContext, owner, verdict),
+      driverRunning: (owner) => isDriverRunning(owner.pr),
+      ensureWaiter: (owner) => {
+        // The waiter's own `--state` file, never the extension's latch copy,
+        // and never a path this extension then writes to (F20).
+        const paths = waiterPaths(owner.repo, owner.pr);
+        const cwd =
+          (owner.worktree && existsSync(owner.worktree) && owner.worktree) ||
+          join(REF_ROOT, owner.repo);
+        if (!existsSync(cwd)) return;
+        spawnDetachedWaiter({
+          stateFile: paths.manual[0]!,
+          cwd,
+          logFile: paths.log[0]!,
+        });
+      },
+      writeStatus: (owner, patch) => {
+        upsertStatusFile(ownerPaths(owner), patch);
+      },
+      onError: (owner, error) => {
+        uiNotify(
+          ctx as { ui?: { notify?: (m: string, t?: "info" | "warning" | "error") => void } },
+          `Reconcile of Feature ${owner.name} (PR ${owner.pr}) failed: ${String(error)}`,
+          "warning",
+        );
+      },
+    });
+  } catch {
+    // A reconcile pass is best-effort by construction.
+    return undefined;
+  }
+}
+
+let reconcileTimer: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Keep one process-wide timer alive exactly while some Feature is in the PR
+ * phase. Unref'd, so it never holds pi open, and torn down when the last PR
+ * lands — a 60s poll that runs forever in every session is the kind of cost
+ * this review is trying to remove, not add.
+ */
+function armReconcileTimer(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  let live = false;
+  try {
+    live = listFeaturePrOwners().length > 0;
+  } catch {
+    live = false;
+  }
+  if (!live) {
+    if (reconcileTimer) {
+      clearInterval(reconcileTimer);
+      reconcileTimer = undefined;
+    }
+    return;
+  }
+  if (reconcileTimer) return;
+  reconcileTimer = setInterval(() => {
+    void reconcileLiveFeaturePrs(pi, ctx).then(() => {
+      // Stop the timer once the last PR phase is over.
+      try {
+        if (listFeaturePrOwners().length === 0 && reconcileTimer) {
+          clearInterval(reconcileTimer);
+          reconcileTimer = undefined;
+        }
+      } catch {
+        /* keep polling */
+      }
+    });
+  }, RECONCILE_INTERVAL_MS);
+  reconcileTimer.unref?.();
+}
+
+/* ------------------------------------------------------------------ *
  * The Feature chain
  * ------------------------------------------------------------------ */
 
@@ -4038,6 +4200,16 @@ const RUNNING_CHAINS = new Set<string>();
  * Errors propagate; the lock is released either way, so a thrown chain does
  * not wedge the Feature until the extension reloads.
  */
+/**
+ * Called after a chain releases the Feature lock. Set by the extension so
+ * `withChainLock` keeps its two-argument shape and stays testable in isolation.
+ */
+let onChainReleased: ((featureDir: string) => void) | undefined;
+
+export function setChainReleaseHook(fn: ((featureDir: string) => void) | undefined): void {
+  onChainReleased = fn;
+}
+
 export async function withChainLock(
   featureDir: string,
   body: () => Promise<unknown>,
@@ -4049,6 +4221,14 @@ export async function withChainLock(
     return true;
   } finally {
     RUNNING_CHAINS.delete(featureDir);
+    // A verdict refused while this chain held the lock is now dispatchable.
+    // Waiting for the next 60s tick would be correct but slow, and the review
+    // round it belongs to is already minutes old.
+    try {
+      onChainReleased?.(featureDir);
+    } catch {
+      // The drain is best-effort; never fail a finished chain over it.
+    }
   }
 }
 
@@ -4839,24 +5019,61 @@ One Feature = one worktree = one branch = one PR. Never a draft. Never a PR per 
 `;
 }
 
-/** True when this cwd's repo has a live Feature in implement/pr/qa. */
-export function liveFeatureNeedsIdleParent(cwd: string): boolean {
-  const repo = guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+/** Phases in which a Feature actually owns a writer and a branch. */
+const IDLE_PARENT_PHASES = new Set(["implementing", "feature-qa", "pr"]);
+
+function samePath(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+}
+
+/**
+ * Is *this* cwd inside a Feature that currently owns a writer?
+ *
+ * Two bugs lived in the old predicate. Its regex `^(implement|pr|qa)$` never
+ * matched the phases actually written to status.md — `implementing` and
+ * `feature-qa` — so it was under-inclusive on the states that matter. And it
+ * asked only "does this repo have such a Feature?", so four Features stuck in
+ * `phase: pr` behind PRs that had merged days earlier appended `FORBIDDEN` and
+ * "stay idle" to the system prompt of every pi session in icemining (F8).
+ *
+ * The question that is actually worth answering is narrower: is the session
+ * sitting in the directory that Feature's writer is working in? A Feature
+ * writing in `ice-wt/feat-foo` has no claim on someone working in the
+ * reference checkout. A Feature that has not been given a worktree yet — host
+ * Features, anything before `git wt` — can only be working in the repo root,
+ * so that is the one cwd it may still claim.
+ *
+ * `root` is injectable so tests never walk the live `~/orchestrator`.
+ */
+export function liveFeatureNeedsIdleParent(cwd: string, root?: string): boolean {
+  if (!cwd) return false;
+  // `repoKey` is the one that resolves a worktree farm (`ice-wt/feat-foo` →
+  // `icemining`); `guessRepoFromCwd` deliberately returns "" for a farm, which
+  // would make this predicate blind in exactly the directory a writer uses.
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
   if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
   const paths: Paths = {
     repo,
     gitRoot: cwd,
-    repoDir: join(ORCH_ROOT, repo),
+    repoDir,
     featureDir: "",
     planFile: "",
     statusFile: "",
     handoffsDir: "",
-    archiveDir: join(ORCH_ROOT, repo, "archive"),
+    archiveDir: join(repoDir, "archive"),
   };
-  return discoverFeatures(paths).some(
-    (row) =>
-      row.live && /^(implement|pr|qa)$/.test(statusField(row.status, "phase") || ""),
-  );
+  const gitRoot = join(REF_ROOT, repo);
+  return discoverFeatures(paths).some((row) => {
+    if (!row.live) return false;
+    const phase = (statusField(row.status, "phase") || "").toLowerCase();
+    if (!IDLE_PARENT_PHASES.has(phase)) return false;
+    const worktree = statusField(row.status, "worktree");
+    if (worktree && !isPendingToken(worktree)) return samePath(cwd, worktree);
+    // No worktree recorded: the repo root is the only place it can be working.
+    return samePath(cwd, gitRoot);
+  });
 }
 
 /**
@@ -5247,12 +5464,33 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   overlayPi = pi;
   void loadCapabilityCeiling();
   void bindRpivTodoOverlaySink(pi);
+  let lastCtx: ExtensionContext | undefined;
+  setChainReleaseHook((featureDir) => {
+    // Only when something is actually queued: a chain that ended cleanly must
+    // not trigger a `gh pr view` for every Feature in the fleet.
+    const statusFile = join(featureDir, "status.md");
+    const pending = statusField(readText(statusFile), "pending_verdict");
+    if (!pending || isPendingToken(pending)) return;
+    if (!lastCtx) return;
+    void reconcileLiveFeaturePrs(pi, lastCtx);
+  });
   const republishOverlay = () => {
     queueMicrotask(() => {
       void bindRpivTodoOverlaySink(pi).then(() => syncLiveFeatureOverlay());
     });
   };
-  pi.on("session_start", republishOverlay);
+  // One handler per event: `pi.on` is not documented to chain, and a second
+  // registration that silently replaced the overlay republish would be a very
+  // quiet bug.
+  pi.on("session_start", async (_event, ctx) => {
+    republishOverlay();
+    lastCtx = ctx;
+    // The durable half of the PR phase. A session starting anywhere is enough
+    // to notice a merged PR, or a verdict the session that opened the PR never
+    // lived to see (F1, F8).
+    void reconcileLiveFeaturePrs(pi, ctx);
+    armReconcileTimer(pi, ctx);
+  });
   pi.on("session_compact", republishOverlay);
   pi.on("session_tree", republishOverlay);
   pi.on("resources_discover", async () => ({
@@ -5313,6 +5551,13 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       const rest = tokens.slice(1).join(" ");
 
       const paths = await resolvePaths(pi, ctx);
+
+      // Every verb is a reconcile point. The user typing anything at all is a
+      // better trigger than the 60s timer, and it costs one `gh pr view` per
+      // Feature that is actually in the PR phase.
+      lastCtx = ctx as unknown as ExtensionContext;
+      void reconcileLiveFeaturePrs(pi, ctx);
+      armReconcileTimer(pi, ctx as unknown as ExtensionContext);
 
       if (!raw || head === "help") {
         uiNotify(ctx, helpText(paths), "info");
