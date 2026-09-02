@@ -398,7 +398,39 @@ Original plan, as written before implementation:
 
 Acceptance: a Task that edits but does not commit ends `done` with a code commit on the branch; a red gate never auto-advances; QA runs twice; a dead reviewer no longer blocks approve.
 
-### Phase 4 — Plan → approve (F15, F16)
+### Phase 4 — Plan → approve — **DONE 2026-09-02**
+
+One commit, `a6ac0a9`. All three findings edit the same two call sites — the approve verb and `beginImplementation` — so splitting them would have split single edits, as in Phase 3. The suite went from 322 to 331 passing, all green; `tsc --noEmit` clean.
+
+| Finding | What landed |
+|---|---|
+| F15 | `presentDraftApproveCards` is read-only; naming happens once, in the planner completion path, inside the chain lock. |
+| F16 | Approve validates first; `> Status: APPROVED` is written by `beginImplementation` under the lock, after the worktree exists. |
+| F22 | `git wt <branch> --yes`; the `GIT_WT` shell fallback and its constant are deleted; `ghl-wt`'s stderr leads the failure message. Approve pre-flights `origin`. |
+
+**F15 — the card path renames nothing now.** `presentDraftApproveCards` ran from `agent_settled` and called `ensureFeatureNamed` on every unnamed draft with a title. That renames `pending-<utc>` to `<name>` — while the planner child is still writing to the path it was handed. The planner recreated the pending folder, the completion path named that one too, and `uniquifyName` appended `-2`. The naming call and the `bindFeature` beside it are gone; a test scrapes the function body for both, because the defect is the *presence* of a write in an event handler rather than anything about its result.
+
+Naming now happens in exactly one place: after `runChildInPhase(planner)` resolves, inside `withChainLock`, alongside `reviewPlan`. The lock is keyed on the pre-rename `featureDir` captured in a local — `feat` is rebound by the rename, so keying on it directly would have released a lock under a name it was never taken under.
+
+**One thing I expected to have to fix, and did not.** Removing the rename from the card path looked like it would strand a folder such as `pi-extensions/pending-2026-08-31T19-08-48-820Z` — a real plan the review found stuck at `name: pending` — behind a card that no longer appears. It does not. `draftApproveCards` takes its name from `featureIdentityName`, which derives the slug from the `# Feature:` title without writing anything, and `discoverFeatures` derives the same slug when resolving `/orchestrate approve <name>`. So the card still shows, the command still resolves, and approve does the rename at a moment when no planner is running. The test asserts precisely that: one card, name `something-real`, `dir` still the `pending-*` folder. The card renders an identity; it no longer creates one.
+
+**F16 — the marker is the last write, not the first.** The verb rewrote `> Status: APPROVED` before checking anything, so a failure anywhere downstream left the plan approved with nothing running: `isDraft` is then false, the card is never re-offered, and `defaultFeature('approve')` stops finding the Feature — which is exactly how `durable-pr-reconciler-2` ended up unreachable. The order is now the one the finding asks for. The verb does only read-only checks and the naming call; `beginImplementation` gained an `{ approve: true }` option and writes the marker inside the chain lock, after `ensureFeatureWorktree` has returned a directory and after `taskCountError` has passed — the last point at which anything can still refuse. The DRAFT guard at the top of `beginImplementation` is skipped for that call, or it would reject the very approve about to lift it.
+
+`markPlanApproved` is now a pure function (rewrite the `> Status:` line, else insert after the title, else prepend) rather than three inline regexes, so the branch that mattered — replacing DRAFT rather than duplicating it — is pinned by a test.
+
+**F22 — one worktree implementation.** `ghl-wt` prints `Proceed? [y/N]` and reads stdin; under `pi.exec` stdin is empty, `should_proceed(false, "")` is false, and the binary exits `aborted`. So the Rust path had never once succeeded from orchestrate, in any repo — every worktree the extension ever made came from the `~/glm-review/git-wt.sh` fallback, whose different semantics produced the `fatal: invalid reference: origin/main` the user saw. The call passes `--yes`, and the fallback plus its constant are deleted. `worktreeFailureMessage` puts `ghl-wt`'s stderr verbatim on the second line, under a first line naming the exact command that failed; the old message led with "No usable worktree" and buried git's answer, which is why a missing remote read as an orchestrate bug.
+
+The origin pre-flight is where the honest refusal lives. `approveRemoteRequirement` fails approve in one line — naming the repo and the missing remote, with no newline in it — when `git remote get-url origin` comes back empty, because `ghl-wt` branches off origin, `gh pr create` needs a remote and `pr-await`/`pr-land` need a PR: a Feature in such a repo could never finish, and refusing at approve is cheaper than discovering it three phases later. Host bases are exempt; they materialize a worktree by copy plus `git init` and never open a PR.
+
+**Deliberately not done: the `ghl-wt` half of 4.3.** The no-origin base resolution and the `--base` flag are Rust, in `gh-pr-reviewer`, and landing them means a branch and a PR in a second repository. No Phase 4 acceptance criterion depends on them any more: with the origin pre-flight in place, orchestrate never hands `ghl-wt` a repo without a remote, so the no-origin path would be dead code from this caller's point of view. It remains worth doing for solo use — `git wt` in a local-only repo still fails with a git internals dump — and it is carried forward with the other cross-repo residuals rather than dropped.
+
+**Acceptance.** No `pending-*` folder survives a completed plan and no `-2` arises from self-collision, because only one code path renames and it runs after the planner has exited. A failed approve leaves the plan `DRAFT` with the card visible, because the marker is written after the last refusal. Approve in a repo without `origin` refuses in one line and writes nothing. Approve in a repo with `origin` creates the worktree via `git wt <branch> --yes` with no shell script anywhere in the process tree — a test asserts the string `GIT_WT` no longer occurs in the source at all.
+
+**Still open after Phase 4.** This repo still has no `origin`, which now has a visible consequence rather than a buried one: `/orchestrate approve` here refuses with the one-line reason. The four Features parked at `phase: pr` with `pr: none` are unchanged, as are the cross-repo residuals — `ghl-monitor.sh` respawning from `pi-*.latch.json`, the Rust waiter taking no per-PR lock, the naming change unlanded in `gh-pr-reviewer` main, and now the `ghl-wt` no-origin path and `--base` flag.
+
+Original plan, as written before implementation:
+
+#### Phase 4 — Plan → approve (F15, F16)
 
 4.1 Move `ensureFeatureNamed` out of `presentDraftApproveCards`; name only in the planner-completion path under the chain lock; `agent_settled` only draws cards for already-named Features.
 
