@@ -18,7 +18,7 @@
  * acceptance harness reported failed. Per-Feature override:
  * `auto_advance_on_landed` in status.md.
  * Approve is a TUI card (`orchestrate-approve` entry), not a markdown fence.
- * Never .pi/plan.md / enter_plan_mode. Workers never open a PR.
+ * Never .pi/plan.md / enter_plan_mode. Workers never open a PR; code runs `gh pr create`.
  */
 
 import { createHash } from "node:crypto";
@@ -2366,7 +2366,6 @@ const CHILD_TIMEOUT_MS = 90 * 60 * 1000;
 const CHILD_WATCHDOG_GRACE_MS = 5 * 60 * 1000;
 const WRITER_TURN_BUDGET = { maxTurns: 220, graceTurns: 30 };
 export const QA_TURN_BUDGET = { maxTurns: 60, graceTurns: 10 };
-export const PR_OPEN_TURN_BUDGET = { maxTurns: 15, graceTurns: 5 };
 const PLANNER_TURN_BUDGET = { maxTurns: 80, graceTurns: 15 };
 const WRITER_MAX_CONCURRENCY = 2;
 const PLANNER_MODEL = "xai/grok-4.6:high";
@@ -3544,6 +3543,7 @@ export function reviewFixLaunchParams(
     agent: "fixer",
     task: [
       `Review-fix round ${spawn} on PR ${pr}.`,
+      `Read ${GIT_WORKFLOW_SKILL} now — the /orchestrate section. You are fixer: commit and push in the given worktree only. Code runs git pr-await after you settle.`,
       `Fix the review findings on PR ${pr} and nothing else.`,
       `Do NOT open a PR, do NOT \`git wt\`, do NOT \`git pr-await\`, do NOT \`git pr-land\`, do NOT \`gh pr merge\`, do NOT start the next Task.`,
       `The review is not yours to wait on: once you settle, code runs \`git pr-await ${pr}\` once (fixer round ${spawn} latch).`,
@@ -3570,6 +3570,12 @@ export function reviewFixLaunchParams(
     turnBudget: WRITER_TURN_BUDGET,
     intercomBridge: { ...WRITER_INTERCOM_OFF },
     tools: [...WRITER_TOOLS],
+    // fixer.md has inheritSkills: false (`--no-skills`). Pass both spellings:
+    // async spawn reads `skills`, foreground reads `skill`. `reads` prefixes
+    // the task with `[Read from: …]` so the model actually opens SKILL.md.
+    skill: "git-workflow",
+    skills: ["git-workflow"],
+    reads: [GIT_WORKFLOW_SKILL],
     agentContract: { version: 1 },
     acceptance: {
       level: "none",
@@ -3692,8 +3698,27 @@ async function runFeaturePrLand(
 }
 
 /**
+ * Handshake, then dispatch any judgment `next=` so a follow-up
+ * `read_comments_and_fix` cannot be dropped. Yield / done / pause stay silent.
+ */
+async function awaitAndDispatch(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  paths: Paths,
+  pr: string,
+  worktree: string,
+  opts: { holdsChainLock?: boolean } = {},
+): Promise<PrAwaitOutcome> {
+  const follow = await drivePrAwait(pi, ctx, paths, pr, worktree);
+  if (follow.paused || follow.done || follow.silent) return follow;
+  await dispatchFeaturePrVerdict(pi, ctx, paths, pr, worktree, follow, opts);
+  return follow;
+}
+
+/**
  * One review-fix round: a `fixer` in the Feature worktree, then a single
- * `git pr-await` run by code.
+ * `git pr-await` run by code. A judgment `next=` from that await is dispatched
+ * again — that is how a later review round still gets a fixer.
  *
  * The spawn is counted on disk *before* the child starts, so a session that
  * dies mid-fix cannot hand the next one a free round against the cap.
@@ -3777,8 +3802,9 @@ async function runReviewFixWriter(
   }
 
   // Exactly one `git pr-await`, in code. The writer is forbidden from waiting,
-  // and the parent is never handed the review to work through itself.
-  await drivePrAwait(pi, ctx, paths, pr, worktree);
+  // and the parent is never handed the review to work through itself. A
+  // judgment `next=` here is another round, not the end of the Feature.
+  await awaitAndDispatch(pi, ctx, paths, pr, worktree, { holdsChainLock: true });
 }
 
 /**
@@ -3822,7 +3848,9 @@ export async function dispatchFeaturePrVerdict(
       nextAction: `pr-await next=${result.next || "(none)"} — re-awaiting once (fixer round ${spent})`,
     });
     uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
-    await drivePrAwait(pi, ctx, paths, pr, worktree);
+    await awaitAndDispatch(pi, ctx, paths, pr, worktree, {
+      holdsChainLock: opts.holdsChainLock,
+    });
     return action;
   }
 
@@ -3963,18 +3991,6 @@ export function setTaskHandoffInPlan(plan: string, id: string, handoff: string):
   if (!re.test(plan)) return plan;
   return plan.replace(re, `$1${handoff}`);
 }
-
-const PR_OPEN_SCHEMA = {
-  type: "object",
-  properties: {
-    opened: { type: "boolean" },
-    pr: { type: "string" },
-    url: { type: "string" },
-    reason: { type: "string" },
-  },
-  required: ["opened"],
-  additionalProperties: false,
-} as const;
 
 /** Persisted structured-output artifacts named by the completion notification. */
 function structuredOutputPaths(outcome: ChildOutcome): string[] {
@@ -4616,7 +4632,42 @@ export async function discoverBranchPr(
   }
 }
 
-/** Open one Feature PR through a child, then drive `git pr-await` in code. */
+/** Push HEAD and open one non-draft Feature PR. tdd-worker never does this. */
+export async function openFeaturePr(
+  pi: ExtensionAPI,
+  worktree: string,
+  input: { title: string; body?: string; bodyFile?: string; base?: string },
+): Promise<{ pr: string; url?: string; reason?: string } | undefined> {
+  const title = input.title.trim();
+  if (!title) return { reason: "missing PR title" };
+  const base = input.base?.trim() || "main";
+  const args = ["pr", "create", "--title", title, "--base", base];
+  if (input.bodyFile) args.push("--body-file", input.bodyFile);
+  else args.push("--body", (input.body ?? title).trim() || title);
+
+  try {
+    await pi.exec("git", ["push", "-u", "origin", "HEAD"], {
+      cwd: worktree,
+      timeout: 120_000,
+    });
+  } catch {
+    /* already on origin is fine; create/discover still run */
+  }
+
+  try {
+    const created = await pi.exec("gh", args, { cwd: worktree, timeout: 60_000 });
+    const parsed = parseOpenedPr(`${created.stdout ?? ""}\n${created.stderr ?? ""}`);
+    if (parsed) return parsed;
+  } catch {
+    /* fall through to discover */
+  }
+
+  const existing = await discoverBranchPr(pi, worktree);
+  if (existing) return existing;
+  return { reason: "no PR number returned" };
+}
+
+/** Open one Feature PR in code (`gh pr create`), then drive `git pr-await`. */
 async function landFeaturePr(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
@@ -4627,7 +4678,7 @@ async function landFeaturePr(
   let pr = normalizePrNumber(statusField(readText(paths.statusFile), "pr"));
   let url: string | undefined;
 
-  // Resume / a child that opened but did not report: the branch is source of truth.
+  // Resume / a previous open that did not record the number: branch is source of truth.
   if (!pr) {
     const existing = await discoverBranchPr(pi, worktree);
     if (existing) {
@@ -4640,43 +4691,22 @@ async function landFeaturePr(
     upsertStatusFile(paths, { phase: "pr", nextAction: "opening one Feature PR" });
     uiNotify(ctx, `All Tasks done on ${name}. Opening one Feature PR from ${worktree}…`, "info");
 
-    const outcome = await runChildInPhase(pi, ctx, "implement", {
-      agent: "tdd-worker",
-      task: featurePrOpenTask(name, worktree, paths.planFile),
-      context: "fresh",
-      cwd: worktree,
-      model: modelWithThinking(WORKERS.simple),
-      output: join(paths.handoffsDir, "pr-open.md"),
-      outputMode: "inline",
-      outputSchema: PR_OPEN_SCHEMA,
-      acceptance: { level: "none", reason: "PR creation is verified by pr-await" },
-      timeoutMs: CHILD_TIMEOUT_MS,
-      turnBudget: PR_OPEN_TURN_BUDGET,
+    const plan = readText(paths.planFile);
+    const opened = await openFeaturePr(pi, worktree, {
+      title: featureTitle(plan, name),
+      bodyFile: existsSync(paths.planFile) ? paths.planFile : undefined,
+      body: featureTitle(plan, name),
     });
-
-    const opened = readStructuredOutput(paths, "pr-open", outcome) as
-      | { opened?: boolean; pr?: string; url?: string; reason?: string }
-      | undefined;
-    const resolved = resolveOpenedPr({
-      structured: opened,
-      summary: outcome.summary,
-      handoff: readText(join(paths.handoffsDir, "pr-open.md")),
-    });
-    pr = resolved?.pr ?? "";
-    url = resolved?.url ?? url;
-    if (!pr) {
-      const discovered = await discoverBranchPr(pi, worktree);
-      pr = discovered?.pr ?? "";
-      url = discovered?.url ?? url;
-    }
+    pr = opened?.pr ?? "";
+    url = opened?.url ?? url;
     if (!pr) {
       upsertStatusFile(paths, {
         phase: "pr",
-        nextAction: "Feature PR not on the branch — inspect handoffs/pr-open.md",
+        nextAction: "Feature PR not on the branch",
       });
       uiNotify(
         ctx,
-        `Could not open the Feature PR (${opened?.reason ?? outcome.reason ?? "no PR number returned"}).`,
+        `Could not open the Feature PR (${opened?.reason ?? "no PR number returned"}).`,
         "error",
       );
       return;
@@ -4735,23 +4765,51 @@ Cite that path. Do not paste wt/await/land steps into a handoff.
 Parent already ran \`git wt <branch>\` (or reused the farm). Do **not** \`git wt\` again. If \`${wt}\` is missing or is a reference checkout: **STOP**. Do not implement in ${paths.gitRoot}.
 tdd-worker and fixer must NOT \`git wt\`, must NOT open a PR, must NOT \`git pr-await\`.
 
-**After Tasks + QA cap:** code opens one Feature PR and runs \`git pr-await\` once. A judgment \`next=\` on this Feature's PR (\`read_comments_and_fix\`, \`investigate_dead_reviewers\`, \`fix_command_or_environment\`) is then dispatched by this extension, not by you: a review fix spawns one \`fixer\` in the Feature worktree, and code runs \`git pr-await\` once after that writer settles. The parent session stays idle — it does not repair review findings and does not run \`git pr-await\` itself. Never \`gh pr merge\`. Never \`git worktree add\`. Never pipe/timeout/--once on \`git pr-await\`.
+**After Tasks + QA cap:** code runs \`gh pr create\` (not a tdd-worker) and \`git pr-await\` once. A judgment \`next=\` on this Feature's PR (\`read_comments_and_fix\`, \`investigate_dead_reviewers\`, \`fix_command_or_environment\`) is then dispatched by this extension, not by you: a review fix spawns one \`fixer\` in the Feature worktree, and code runs \`git pr-await\` once after that writer settles. A later undelivered \`read_comments_and_fix\` spawns another fixer — code keeps doing that until the waiter lands or the user merges. Never stop while review data still says there are current-head findings to fix. The parent session stays idle — it does not repair review findings and does not run \`git pr-await\` itself. Never \`gh pr merge\`. Never \`git worktree add\`. Never pipe/timeout/--once on \`git pr-await\`.
 One Feature = one worktree = one branch = one PR. Never a draft. Never a PR per Task. If a Task is blocked, stop.
 `;
 }
 
-export function featurePrOpenTask(name: string, worktree: string, planFile: string): string {
-  return [
-    `Commit any remaining work in ${worktree} only — never in a reference checkout.`,
-    `Open exactly ONE pull request for Feature ${name} against the owner repo with \`gh pr create\`.`,
-    `Never a draft. Never a fork. Never more than one PR.`,
-    `Do NOT run \`git pr-await\`, \`git pr-land\`, or \`gh pr merge\`.`,
-    `Do NOT tell anyone to /orchestrate resume. Do not narrate next steps.`,
-    `Plan: ${planFile}`,
-    "",
-    `Return { opened: true, pr: "<number>", url: "<html url>" } through the structured output schema. That is the only return.`,
-    `If a PR already exists for this branch, return that number with opened: true instead of opening another.`,
-  ].join("\n");
+/** True when this cwd's repo has a live Feature in implement/pr/qa. */
+export function liveFeatureNeedsIdleParent(cwd: string): boolean {
+  const repo = guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir: join(ORCH_ROOT, repo),
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(ORCH_ROOT, repo, "archive"),
+  };
+  return discoverFeatures(paths).some(
+    (row) =>
+      row.live && /^(implement|pr|qa)$/.test(statusField(row.status, "phase") || ""),
+  );
+}
+
+/**
+ * Forced into the parent system prompt. Skills are progressive-disclosure and
+ * models skip the read (git-workflow-guard.ts documents that). Citing the path
+ * is not enough — this block is the skill, inlined, for the sessions that need it.
+ */
+export function parentGitWorkflowAppend(input: {
+  featureLive?: boolean;
+  latchWake?: boolean;
+}): string | undefined {
+  if (!input.featureLive && !input.latchWake) return undefined;
+  const parts = [
+    `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`,
+  ];
+  if (input.featureLive) {
+    parts.push(FORBIDDEN);
+    parts.push(
+      "A live /orchestrate Feature owns PR work in this session. Stay idle: do not implement product code, do not repair review findings, do not run git pr-await. Code dispatches one fixer per current-head verdict and keeps dispatching while review data still says read_comments_and_fix.",
+    );
+  }
+  return parts.join("\n\n");
 }
 
 export function plannerLaunchParams(paths: Paths, objective: string): Record<string, unknown> {
@@ -5128,6 +5186,22 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   pi.on("session_start", republishOverlay);
   pi.on("session_compact", republishOverlay);
   pi.on("session_tree", republishOverlay);
+  pi.on("resources_discover", async () => ({
+    skillPaths: [dirname(GIT_WORKFLOW_SKILL)],
+  }));
+  pi.on("before_agent_start", async (event, ctx) => {
+    const cwd =
+      (typeof event.systemPromptOptions?.cwd === "string" && event.systemPromptOptions.cwd) ||
+      (typeof (ctx as { cwd?: string }).cwd === "string" && (ctx as { cwd?: string }).cwd) ||
+      process.cwd();
+    const prompt = typeof event.prompt === "string" ? event.prompt : "";
+    const extra = parentGitWorkflowAppend({
+      featureLive: liveFeatureNeedsIdleParent(cwd),
+      latchWake: /pr-latch:|read_comments_and_fix/.test(prompt),
+    });
+    if (!extra) return;
+    return { systemPrompt: `${event.systemPrompt}\n\n${extra}` };
+  });
 
   pi.registerEntryRenderer<ApproveCardData>(APPROVE_ENTRY, (entry, options, theme) =>
     renderApproveEntry(entry, options, theme),

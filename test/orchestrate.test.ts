@@ -824,14 +824,93 @@ test("L3: landFeaturePr never parks on resume once a PR exists; pr-await is code
   );
   const land = src.indexOf("async function landFeaturePr");
   const discover = src.indexOf("discoverBranchPr", land);
-  const child = src.indexOf("featurePrOpenTask", land);
+  const open = src.indexOf("openFeaturePr", land);
   const awaitPr = src.indexOf("drivePrAwait", land);
   assert.ok(land >= 0 && discover > land, "must look for an existing branch PR");
-  assert.ok(child > discover, "spawn open-child only after discover misses");
-  assert.ok(awaitPr > child, "drivePrAwait runs after a PR number exists");
-  const openTask = (orch.featurePrOpenTask as Function)("x", "/tmp/wt", "/tmp/plan.md") as string;
-  assert.match(openTask, /Do NOT tell anyone to \/orchestrate resume/);
-  assert.match(openTask, /opened: true/);
+  assert.ok(open > discover, "open Feature PR in code only after discover misses");
+  assert.ok(awaitPr > open, "drivePrAwait runs after a PR number exists");
+  assert.equal(
+    src.includes("featurePrOpenTask"),
+    false,
+    "tdd-worker must not be asked to gh pr create; that is the orchestrator's job",
+  );
+  assert.equal(
+    typeof (orch as Record<string, unknown>).featurePrOpenTask,
+    "undefined",
+    "the PR-open child task is gone; code opens the PR",
+  );
+});
+
+test("L3: openFeaturePr pushes then gh pr create in code, never a tdd-worker", async () => {
+  assert.equal(
+    typeof orch.openFeaturePr,
+    "function",
+    "openFeaturePr must be exported so Feature PR create is testable without a child",
+  );
+  const calls: { cmd: string; args: string[] }[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push({ cmd, args: [...(args ?? [])] });
+    if (cmd === "git" && args?.[0] === "push") {
+      return { code: 0, stdout: "ok", stderr: "" };
+    }
+    if (cmd === "gh" && args?.[0] === "pr" && args?.[1] === "create") {
+      return {
+        code: 0,
+        stdout: "https://github.com/moofone/icemining/pull/2210\n",
+        stderr: "",
+      };
+    }
+    return { code: 1, stdout: "", stderr: "unexpected" };
+  });
+  const opened = await orch.openFeaturePr(pi as never, "/tmp/wt", {
+    title: "Quiesce identical current-state",
+    body: "Plan body",
+  });
+  assert.deepEqual(opened, {
+    pr: "2210",
+    url: "https://github.com/moofone/icemining/pull/2210",
+  });
+  const create = calls.find((c) => c.cmd === "gh" && c.args[0] === "pr" && c.args[1] === "create");
+  assert.ok(create, "must run gh pr create via pi.exec");
+  assert.equal(create!.args.includes("--draft"), false, "never a draft");
+  assert.equal(create!.args.includes("--title"), true);
+  assert.equal(create!.args.includes("--base"), true);
+  assert.ok(
+    calls.some((c) => c.cmd === "git" && c.args[0] === "push"),
+    "must push the branch before create",
+  );
+  assert.equal(
+    parentTurns(pi).length,
+    0,
+    "opening a Feature PR must not send a parent turn",
+  );
+});
+
+test("L3: openFeaturePr discovers an existing branch PR when create prints nothing", async () => {
+  const pi = makeFakePi(async (cmd, args) => {
+    if (cmd === "git" && args?.[0] === "push") {
+      return { code: 0, stdout: "ok", stderr: "" };
+    }
+    if (cmd === "gh" && args?.[0] === "pr" && args?.[1] === "create") {
+      return { code: 1, stdout: "", stderr: "already exists" };
+    }
+    if (cmd === "gh" && args?.[0] === "pr" && args?.[1] === "view") {
+      return {
+        code: 0,
+        stdout: '{"number":2210,"url":"https://github.com/moofone/icemining/pull/2210"}',
+        stderr: "",
+      };
+    }
+    return { code: 1, stdout: "", stderr: "no" };
+  });
+  const opened = await orch.openFeaturePr(pi as never, "/tmp/wt", {
+    title: "x",
+    body: "x",
+  });
+  assert.deepEqual(opened, {
+    pr: "2210",
+    url: "https://github.com/moofone/icemining/pull/2210",
+  });
 });
 
 test("L3: handshake timeout is 30 minutes and is not a review deadline", () => {
@@ -2311,7 +2390,11 @@ test("L4: FORBIDDEN / gitWorkflowBlock / resume / pr-open cite the skill and nev
     undefined,
     "resumePrompt sent a parent turn on resume; it must be gone",
   );
-  assert.equal(typeof orch.featurePrOpenTask, "function", "featurePrOpenTask must be exported");
+  assert.equal(
+    (orch as Record<string, unknown>).featurePrOpenTask,
+    undefined,
+    "PR-open child is gone; tdd-worker never opens a PR",
+  );
   assert.equal(
     (orch as Record<string, unknown>).prHandoffPrompt,
     undefined,
@@ -2320,18 +2403,22 @@ test("L4: FORBIDDEN / gitWorkflowBlock / resume / pr-open cite the skill and nev
 
   const forbidden = orch.FORBIDDEN as string;
   const block = (orch.gitWorkflowBlock as Function)(paths, wt) as string;
-  const openTask = (orch.featurePrOpenTask as Function)("x", wt, paths.planFile) as string;
 
   for (const [label, text] of [
     ["FORBIDDEN", forbidden],
     ["gitWorkflowBlock", block],
-    ["featurePrOpenTask", openTask],
   ] as const) {
     assertNoStalePoller(label, text);
   }
 
   assert.match(block, /tdd-worker and fixer must NOT `git wt`/);
   assert.match(block, /must NOT `git pr-await`/);
+  assert.match(block, /gh pr create/);
+  assert.match(
+    block,
+    /not a tdd-worker|never a tdd-worker|tdd-worker never/i,
+    "the Feature PR is opened by code, not by tdd-worker",
+  );
   assert.equal(block.includes(GIT_WORKFLOW_SKILL), true, "gitWorkflowBlock must cite the canonical skill path");
   assert.match(forbidden, /next=yield/);
   assert.match(
@@ -2339,19 +2426,17 @@ test("L4: FORBIDDEN / gitWorkflowBlock / resume / pr-open cite the skill and nev
     /Do NOT implement product code in this parent session/,
     "the parent is still not a writer",
   );
-  assert.match(openTask, /gh pr create/);
-  assert.match(openTask, /Do NOT run `git pr-await`/);
-  assert.equal(
-    /(?<!NOT run )`git pr-await`/.test(openTask),
-    false,
-    "PR-open child must not be told to run git pr-await",
-  );
 
   // The Feature-PR paragraph describes a dispatcher, not a `next=` table for
   // this session to work through itself.
   assert.match(block, /read_comments_and_fix/, "the block still names the verdict it dispatches");
   assert.match(block, /dispatch/i, "the Feature-PR paragraph must say code dispatches the verdict");
   assert.match(block, /stays idle/i, "and that the parent session stays idle");
+  assert.match(
+    block,
+    /another fixer|keeps doing that|Never stop while review data/i,
+    "gitWorkflowBlock must say later review rounds still get a fixer",
+  );
   for (const re of [
     /fix current-head findings/i,
     /follow the skill `next=` table/i,
@@ -2407,6 +2492,11 @@ test("L4: the skill's /orchestrate section hands a Feature review fix to a write
     /no `pr-await`|not `git pr-await`|never `git pr-await`/i,
     "a Task/fix worker still must not wait on the review itself",
   );
+  assert.match(
+    section,
+    /another fixer|keeps doing that|Never stop while review data/i,
+    "a later read_comments_and_fix still gets a fixer; one round is not the end",
+  );
 
   for (const re of [/fix current-head findings/i, /follow the `next=` table/i]) {
     assert.equal(
@@ -2448,6 +2538,28 @@ test("L4: the skill still leaves a solo session its own latch, verdict, and fix"
     /dispatch/i,
     "a Feature-owned verdict is dispatched to a writer instead of waking the parent",
   );
+});
+
+test("L4: parentGitWorkflowAppend forces a skill read and keeps a Feature parent idle", () => {
+  assert.equal(typeof orch.parentGitWorkflowAppend, "function");
+  assert.equal(orch.parentGitWorkflowAppend({}), undefined, "unrelated sessions stay unprompted");
+  const idle = orch.parentGitWorkflowAppend({ featureLive: true }) as string;
+  assert.match(idle, /git-workflow\/SKILL\.md/);
+  assert.match(idle, /not optional progressive disclosure/);
+  assert.match(idle, /Do NOT implement product code/);
+  assert.match(idle, /Stay idle/);
+  assert.match(idle, /keeps dispatching while review data still says read_comments_and_fix/);
+  const wake = orch.parentGitWorkflowAppend({ latchWake: true }) as string;
+  assert.match(wake, /git-workflow\/SKILL\.md/);
+  assert.doesNotMatch(wake, /Stay idle/, "a solo latch wake still gets to fix");
+});
+
+test("L4: orchestrate.ts registers resources_discover and before_agent_start for git-workflow", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  assert.match(src, /resources_discover/);
+  assert.match(src, /before_agent_start/);
+  assert.match(src, /parentGitWorkflowAppend/);
+  assert.match(src, /skillPaths: \[dirname\(GIT_WORKFLOW_SKILL\)\]/);
 });
 
 /* ---------------------------------------------------------------- *
@@ -2721,6 +2833,10 @@ test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and
   assert.match(task, /\b99\b/, "the contract must name the PR under review");
   assert.match(task, /Review-fix round 1/, "fixer round is visible on the child");
   assert.match(task, /fixer round 1 latch/, "the post-settle await is labeled with the same round");
+  assert.match(task, /git-workflow\/SKILL\.md/, "the fixer is told to read git-workflow, not skip it");
+  assert.equal(params.skill, "git-workflow", "foreground spawn skill override");
+  assert.deepEqual(params.skills, ["git-workflow"], "async spawn skills override (fixer.md inheritSkills: false)");
+  assert.deepEqual(params.reads, [GIT_WORKFLOW_SKILL], "reads prefixes the task so SKILL.md is actually opened");
   assertNoStalePoller("reviewFixLaunchParams", task);
 });
 
@@ -2779,12 +2895,13 @@ function autoSettleSpawn(
       seen.count += 1;
       if (seen.count === 1) seen.params = req?.params ?? {};
       const requestId = req?.requestId ?? "";
+      const id = seen.count === 1 ? runId : `${runId}-${seen.count}`;
       queueMicrotask(() => {
         bus.emit(`${RPC_REPLY_PREFIX}${requestId}`, {
           success: true,
-          data: { details: { runId } },
+          data: { details: { runId: id } },
         });
-        bus.emit(ASYNC_COMPLETE_EVENT, { runId, ...completion });
+        bus.emit(ASYNC_COMPLETE_EVENT, { runId: id, ...completion });
       });
     },
   );
@@ -2932,6 +3049,75 @@ test("D2: drivePrAwait reports the waiter round without overwriting the fix-spaw
   assert.equal(parentTurns(pi).length, 0, "a yield is 0 tokens");
 });
 
+test("D2: a follow-up read_comments_and_fix after a fixer still spawns the next fixer", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-fix-loop-"));
+  const paths = featurePaths(dir);
+  writeFileSync(paths.planFile, "# Feature: t\n");
+  writeFileSync(
+    paths.statusFile,
+    [
+      "# Status",
+      "",
+      "pause: off",
+      `worktree: ${dir}`,
+      "phase: pr",
+      "pr: 99",
+      "pr_round: 0",
+      "worker_run_id: none",
+      "worker_run_dir: none",
+      "",
+    ].join("\n"),
+  );
+
+  const execs: string[] = [];
+  let awaits = 0;
+  const pi = makeFakePi(async (cmd, args) => {
+    execs.push([cmd, ...(args ?? [])].join(" "));
+    if (cmd === "git" && args?.[0] === "pr-await") {
+      awaits += 1;
+      if (awaits === 1) {
+        return {
+          code: 0,
+          stdout: [
+            "status=reviewer_verdict",
+            "next=read_comments_and_fix",
+            "round=4",
+            "reviewer said: second-round finding still open",
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+    }
+    return { code: 0, stdout: "status=handed_off\nnext=yield\nround=8\n", stderr: "" };
+  });
+  const spawn = autoSettleSpawn(pi, "run-fix-loop");
+  const { ctx } = makeFakeCtx();
+
+  const action = (await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      { done: false, next: "read_comments_and_fix", output: FIX_VERDICT, round: "3" },
+    ),
+    6000,
+  )) as string | { reason?: string };
+
+  assert.notEqual((action as { reason?: string })?.reason, "TEST_TIMEOUT");
+  assert.equal(action, "spawn_writer");
+  assert.equal(spawn.count, 2, "the second current-head verdict must spawn a second fixer");
+  assert.deepEqual(execs, ["git pr-await 99", "git pr-await 99"]);
+  assert.match(readFileSync(paths.statusFile, "utf8"), /^pr_round: 2$/m);
+  assert.equal(parentTurns(pi).length, 0, "the parent stays idle across both rounds");
+  assert.match(
+    String(spawn.params.task),
+    /credit_share overflows/,
+    "first spawn still carries the original verdict",
+  );
+});
+
 /* ---------------------------------------------------------------- *
  * D3 — the other verdicts, one writer, and the twenty-fixer bound
  *
@@ -3017,6 +3203,47 @@ test("D3: investigate_dead_reviewers re-awaits in code and never spawns a writer
     `the user is told what happened: ${notices.join(" | ")}`,
   );
   assert.equal(parentTurns(pi).length, 0, "the parent is not woken to investigate");
+});
+
+test("D3: a re-await that returns read_comments_and_fix still spawns a fixer", async () => {
+  const { dir, paths } = prFeatureFixture(0);
+  const execs: string[] = [];
+  let awaits = 0;
+  const pi = makeFakePi(async (cmd, args) => {
+    execs.push([cmd, ...(args ?? [])].join(" "));
+    if (cmd === "git" && args?.[0] === "pr-await") {
+      awaits += 1;
+      if (awaits === 1) {
+        return { code: 0, stdout: FIX_VERDICT, stderr: "" };
+      }
+    }
+    return { code: 0, stdout: "status=handed_off\nnext=yield\nround=6\n", stderr: "" };
+  });
+  const spawn = autoSettleSpawn(pi, "run-dead-then-fix");
+  const { ctx } = makeFakeCtx();
+
+  const action = await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      {
+        done: false,
+        next: "investigate_dead_reviewers",
+        output: "next=investigate_dead_reviewers\nround=4\n",
+        round: "4",
+      },
+    ),
+    6000,
+  );
+
+  assert.notEqual((action as { reason?: string })?.reason, "TEST_TIMEOUT");
+  assert.equal(action, "reawait");
+  assert.equal(spawn.count, 1, "the follow-up current-head verdict must still get a fixer");
+  assert.deepEqual(execs, ["git pr-await 99", "git pr-await 99"]);
+  assert.equal(parentTurns(pi).length, 0);
 });
 
 test("D3: fix_command_or_environment reports and dispatches nothing", async () => {

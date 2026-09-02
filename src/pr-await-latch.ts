@@ -34,8 +34,8 @@ import { join } from "node:path";
 
 import {
 	ACTIONABLE,
+	actionableFingerprint,
 	MECHANICAL,
-	MAX_WORKTREE_CANDIDATES,
 	REPO_ROOT,
 	SHORT_MS,
 	adoptableLatch,
@@ -150,7 +150,7 @@ export type LatchHooks = {
 	onFeatureActionable?: (
 		ctx: ExtensionContext,
 		owner: FeaturePrOwner,
-		verdict: { pr: string; next: string; output: string },
+		verdict: { pr: string; next: string; output: string; round?: string },
 	) => void | Promise<void>;
 };
 
@@ -179,6 +179,12 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	let terminalWoken = false;
 	/** Fingerprint of the ACTIONABLE verdict already injected this session. */
 	let lastActionableFingerprint: string | undefined;
+	/**
+	 * True only while this session is actually waiting. absorb / armObservedLatch
+	 * set it; a later user prompt clears it so a merge cannot hijack a chat that
+	 * has moved on (icemining#2150 into an unrelated git-workflow conversation).
+	 */
+	let deferralActive = false;
 	const watchMs = hooks.watchMs ?? 15_000;
 	const chromeMs = hooks.chromeMs ?? (hooks.watchMs === undefined ? 1_000 : 0);
 
@@ -204,6 +210,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			await orch.dispatchFeaturePrVerdictForOwner(pi, ctx, owner, {
 				next: verdict.next,
 				output: verdict.output,
+				round: verdict.round,
 			});
 		});
 
@@ -254,6 +261,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			terminalWoken = false;
 			lastActionableFingerprint = undefined;
 			waitStartedAt = 0;
+			deferralActive = next.origin === "observed";
+		} else if (!next) {
+			deferralActive = false;
 		}
 		latch = next;
 		persist();
@@ -429,6 +439,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	function wakeParent(ctx: ExtensionContext, text: string): void {
+		if (!deferralActive) return;
 		try {
 			if (ctx.isIdle()) pi.sendUserMessage(text);
 			else pi.sendUserMessage(text, { deliverAs: "followUp" });
@@ -457,10 +468,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				// Cleanup is best-effort; never take the session down over it.
 			}
 		}
-		setLatch(undefined);
 		status(ctx);
 		notify(ctx, toastText(s, state));
+		// Wake while deferralActive is still set; setLatch(undefined) clears it.
 		if (opts.wake) wakeParent(ctx, resumeText(s, state));
+		setLatch(undefined);
 	}
 
 	/**
@@ -536,10 +548,6 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 	}
 
-	function actionableFingerprint(next: string, verdict: string | undefined): string {
-		return `${next}:${(verdict ?? "").slice(0, 160)}`;
-	}
-
 	/**
 	 * The Grok/Claude stop-hook injects one undelivered ACTIONABLE verdict on
 	 * Stop. Pi has no Stop hook — the session has already yielded — so the
@@ -550,17 +558,21 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const pr = latch.pr;
 		const candidates = [stateFile, join(stateDir(), `manual-${pr}.json`)];
 		let hit:
-			| { path: string; lastNext: string; verdict?: string }
+			| { path: string; lastNext: string; verdict?: string; round?: string }
 			| undefined;
 		for (const path of candidates) {
 			const v = readWaiterVerdict(path);
 			if (!v?.lastNext || !ACTIONABLE.has(v.lastNext) || v.verdictDelivered) continue;
 			if (v.pr && v.pr !== pr) continue;
-			hit = { path, lastNext: v.lastNext, verdict: v.verdict };
+			hit = { path, lastNext: v.lastNext, verdict: v.verdict, round: v.round };
 			break;
 		}
 		if (!hit) return;
-		const fp = actionableFingerprint(hit.lastNext, hit.verdict);
+		const fp = actionableFingerprint({
+			next: hit.lastNext,
+			verdict: hit.verdict,
+			round: hit.round,
+		});
 		if (fp === lastActionableFingerprint) return;
 		lastActionableFingerprint = fp;
 		for (const path of candidates) markVerdictDelivered(path);
@@ -602,6 +614,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					pr,
 					next: hit.lastNext,
 					output: hit.verdict ?? "",
+					round: hit.round,
 				});
 			} catch (err) {
 				// A failed dispatch is reported, never converted into a parent turn:
@@ -721,46 +734,10 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 	}
 
-	/**
-	 * Last resort when no latch survived: an open PR on a branch this session was
-	 * actually working in.
-	 *
-	 * Only cwds the session touched are eligible. Ranking `git worktree list` by
-	 * mtime used to make the most recently active *sibling* worktree the top
-	 * candidate, so any session that merely settled in the repo latched whatever
-	 * PR a different session was driving — one PR ended up spread across six
-	 * concurrent sessions, each announcing it.
-	 */
-	async function discover(ctx: ExtensionContext): Promise<void> {
-		const candidates = [...new Set([...seenCwds, ctx.cwd].filter((c) => c.startsWith(REPO_ROOT)))].slice(
-			0,
-			MAX_WORKTREE_CANDIDATES,
-		);
-		for (const cwd of candidates) {
-			if (isReferenceCheckout(cwd)) continue;
-			const branch = await sh("git", ["rev-parse", "--abbrev-ref", "HEAD"], cwd);
-			const name = branch.out.trim();
-			if (!branch.ok || !name || name === "main" || name === "HEAD") continue;
-
-			const list = await sh(
-				"gh",
-				["pr", "list", "--head", name, "--state", "open", "--json", "number", "--limit", "1"],
-				cwd,
-			);
-			if (!list.ok) continue;
-			const pr = list.out.match(/"number"\s*:\s*(\d+)/)?.[1];
-			if (pr) {
-				setLatch({ pr, cwd, origin: "discovered" });
-				return;
-			}
-		}
-	}
-
 	async function handoff(ctx: ExtensionContext, opts: { wakeOnTerminal?: boolean } = {}): Promise<void> {
 		if (disabled || ensuring || latchOff()) return;
 		ensuring = true;
 		try {
-			if (!latch) await discover(ctx);
 			if (!latch || !stateFile) return;
 
 			const state = await prState(latch.pr, latch.cwd);
@@ -833,41 +810,52 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		void handoff(ctx as ExtensionContext, { wakeOnTerminal: true });
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		const id = ctx.sessionManager.getSessionId();
 		sessionId = id;
 		stateFile = id ? join(stateDir(), `pi-${id}.json`) : undefined;
 		latchFile = id ? join(stateDir(), `pi-${id}.latch.json`) : undefined;
+		seenCwds.clear();
+		pendingCommands.clear();
+		deferralActive = false;
 		if (!stateFile || !latchFile) return;
+
+		const reason =
+			event && typeof event === "object" && typeof (event as { reason?: unknown }).reason === "string"
+				? (event as { reason: string }).reason
+				: "startup";
 
 		// Prefer this session's own latch, then the legacy shared path.
 		latch = readLatchFile(latchFile) ?? (existsSync(stateFile) ? readLatchFile(stateFile) : undefined);
 		if (latch) {
 			// Same-session reload. The previous process may have died without the
 			// waiter, so re-ensure it, but do not wake: the user is not here.
+			deferralActive = (latch.origin ?? "adopted") === "observed";
 			if (!disabled) void handoff(ctx, { wakeOnTerminal: false });
 			return;
 		}
 
 		// A pi reload mints a NEW session id, so the previous session's latch is
-		// orphaned under a name we would never look for, and the PR is dropped in
-		// silence. Take it over. A live user reloaded, so a terminal PR must wake.
+		// orphaned under a name we would never look for. Take it over only when
+		// this session is a successor in the SAME worktree. A fresh chat in the
+		// reference checkout (`~/Dev/git/icemining`) must not inherit ice-wt PRs
+		// — that is how #2150 woke an unrelated conversation.
 		if (disabled || latchOff()) return;
-		// Never inherit across repositories: the PR number alone is ambiguous. A
-		// session whose own repo cannot be named cannot establish that match at
-		// all, so it adopts nothing — passing `repo: undefined` used to *disable*
-		// the check rather than fail it, which is how a coins-minimal session was
-		// told to continue deferred work on icemining-devops#478.
+		if (reason === "new" || reason === "resume") return;
+		if (isReferenceCheckout(ctx.cwd)) return;
 		const repo = repoKey(ctx.cwd);
 		if (!repo) return;
-		const adopted = adoptableLatch(stateDir(), { exclude: [stateFile, latchFile], repo });
+		const adopted = adoptableLatch(stateDir(), {
+			exclude: [stateFile, latchFile],
+			repo,
+			cwd: ctx.cwd,
+		});
 		if (!adopted) return;
 		setLatch({ ...adopted, origin: "adopted" });
+		// Successor of a wait in this worktree: still waiting, even though origin
+		// is adopted (the wake must not claim this session deferred the work).
+		deferralActive = true;
 		notify(ctx, `pr-latch: adopted ${prLinkLabel(adopted)} from a previous session`);
-		// A `manual-<pr>.json` records that the waiter waited, not that any session
-		// deferred work. If such a PR is already terminal it resolved before this
-		// session existed: re-arm a waiter if it is open, but never announce a
-		// merge nobody here was waiting for.
 		void handoff(ctx, { wakeOnTerminal: adopted.source !== "manual" });
 	});
 
@@ -875,6 +863,16 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		// Leave the waiter. Aborting it was the D-2 self-inflicted stall.
 		stopWatch();
 		pendingCommands.clear();
+		seenCwds.clear();
+	});
+
+	pi.on("input", async (event) => {
+		const source =
+			event && typeof event === "object" ? (event as { source?: unknown }).source : undefined;
+		// Our own merge/ACTIONABLE injection is source "extension". A real user
+		// prompt means this session has moved on; toast on merge, do not hijack.
+		if (source !== "extension") deferralActive = false;
+		return { action: "continue" as const };
 	});
 
 	pi.on("tool_execution_start", async (event) => {

@@ -12,6 +12,22 @@ export const ACTIONABLE = new Set([
 	"fix_command_or_environment",
 ]);
 
+/**
+ * Identity of one ACTIONABLE delivery. `next=` alone is not enough: every
+ * later review round is also `read_comments_and_fix`, and slicing the body
+ * to 160 chars made the second round look like the first, so orchestration
+ * stopped after one or two fixers while findings remained.
+ */
+export function actionableFingerprint(input: {
+	next: string;
+	verdict?: string;
+	round?: string;
+}): string {
+	const next = String(input.next ?? "").trim().toLowerCase();
+	const round = String(input.round ?? "").trim() || "none";
+	return `${next}:r${round}:${(input.verdict ?? "").slice(0, 4000)}`;
+}
+
 export const MECHANICAL = new Set(["git_pr_land", "git_pr_land_continue"]);
 
 /** Waiter-owned fields on `pi-<id>.json` / `manual-<pr>.json`. */
@@ -606,6 +622,10 @@ export function writeLatchFile(path: string, s: LatchState | undefined): void {
  * - `repo` must match. `icemining-devops#475` and `icemining#475` are different
  *   pull requests; adopting across repos is how a chat about hardware was told
  *   to resume a devops deploy, then resolved `#475` against the wrong repo.
+ * - `cwd` must match when provided. Same-repo is not successorship: a session
+ *   sitting in `~/Dev/git/icemining` must not inherit a latch from
+ *   `ice-wt/feat-foo`. That is how one chat was told it deferred work on
+ *   icemining#2150.
  * - The owning process must be gone, and provably so. A latch whose `pid` is
  *   still alive belongs to a session that is still using it — taking it spread
  *   one PR across six concurrent sessions. A `pi-<id>` latch that records no
@@ -638,6 +658,11 @@ export function adoptableLatch(
 		 * `undefined` and silently disabling the check.
 		 */
 		repo?: string;
+		/**
+		 * Only a latch filed in this worktree. Same-repo is not enough: the
+		 * reference checkout and every `ice-wt/*` branch share `repoKey`.
+		 */
+		cwd?: string;
 		alive?: (pid: number) => boolean;
 		/** Owner pid that counts as this session (an in-process reload). */
 		self?: number;
@@ -702,6 +727,7 @@ export function adoptableLatch(
 		// different pull request in icemining than in icemining-devops.
 		if (!stateRepo) continue;
 		if (opts.repo && stateRepo !== opts.repo) continue;
+		if (opts.cwd && state.cwd.replace(/\/+$/, "") !== opts.cwd.replace(/\/+$/, "")) continue;
 		if (heldElsewhere.has(state.pr)) continue;
 		if (state.pid) {
 			// A reload inside the same process is still a successor; another live pi is not.

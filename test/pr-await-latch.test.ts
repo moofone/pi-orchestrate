@@ -58,6 +58,7 @@ const {
 	trailingCd,
 } = await import("../src/pr-await-latch.ts");
 const {
+	actionableFingerprint,
 	armObservedLatch,
 	formatWaitElapsed,
 	formatWaitLine,
@@ -176,9 +177,11 @@ function harness(
 		setIdle: (v: boolean) => {
 			idle = v;
 		},
-		start: () => handlers.session_start({}, ctx),
+		start: (event: Record<string, unknown> = {}) => handlers.session_start(event, ctx),
 		shutdown: () => handlers.session_shutdown({}, ctx),
 		settle: () => handlers.agent_settled({}, ctx),
+		input: (text: string, source = "interactive") =>
+			handlers.input?.({ text, source }, ctx),
 		bash: async (command: string, output: string) => {
 			await handlers.tool_execution_start({ toolName: "bash", toolCallId: "tc", args: { command } });
 			await handlers.tool_execution_end({ toolCallId: "tc", result: { output }, isError: false });
@@ -494,7 +497,7 @@ test("arms from a gh pr create URL when pr-await was never run", async () => {
 	h.cleanup();
 });
 
-test("cold discovery finds an unmerged PR in a worktree this session worked in", async () => {
+test("cold discovery does not latch a PR this session never awaited", async () => {
 	const WT = join(homedir(), "Dev", "git", "deribit_bot_v2-wt");
 	const MAIN = join(homedir(), "Dev", "git", "deribit_bot_v2");
 	const h = harness((cmd, args, opts) => {
@@ -504,11 +507,12 @@ test("cold discovery finds an unmerged PR in a worktree this session worked in",
 		return ok("[]");
 	}, MAIN);
 	await h.start();
-	// The session itself worked in WT, so WT is a cwd it may speak for.
+	// Working in a worktree is not waiting on its PR. Guessing here is how one
+	// session latched another session's branch.
 	await h.bash(`cd ${WT} && cargo test`, "ok");
 	await h.settle();
 	await sleep(120);
-	assert.equal(h.spawns.length, 1);
+	assert.equal(h.spawns.length, 0, "must not discover a PR this session never awaited");
 	assert.equal(h.wakes.length, 0);
 	h.cleanup();
 });
@@ -622,7 +626,7 @@ test("ACTIONABLE is the judgment set the waiter records and the latch delivers",
 
 test("reload under a NEW session id adopts an orphaned live latch and wakes", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_me__");
-	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), REPO);
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT);
 	// A real reload leaves the dead session's OWN latch behind: `pi-<id>.latch.json`
 	// carrying its pid. That file is what makes this session a successor, so it is
 	// what the wake is licensed by. (It used to be sourced from `manual-9931.json`
@@ -631,8 +635,8 @@ test("reload under a NEW session id adopts an orphaned live latch and wakes", as
 	const orphan = join(h.dir, "pi-DEAD-RELOAD.latch.json");
 	writeFileSync(orphan, JSON.stringify({ pr: "9931", cwd: WT, origin: "observed", pid: 999999 }));
 	try {
-		// Brand-new session id and no pi-<id> file for it: what a reload produces.
-		await h.start();
+		// Brand-new session id, same worktree: what a reload in that Feature produces.
+		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.wakes.length, 1, `adopted latch must wake the reloaded parent; wakes=${h.wakes.length}`);
 		assert.match(h.wakes[0], /#9931 merged/);
@@ -647,6 +651,57 @@ test("reload under a NEW session id adopts an orphaned live latch and wakes", as
 		h.cleanup();
 		rmSync(orphan, { force: true });
 	}
+});
+
+test("a fresh session in the reference checkout does not inherit a worktree latch", async () => {
+	// Live: this git-workflow chat (cwd ~/Dev/git/icemining) was injected
+	//   pr-latch: moofone/icemining#2150 merged. Continue the work you deferred.
+	// The session never ran pr-await 2150. Same-repo adoption from ice-wt was enough.
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "__not_this_chat__");
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), REPO);
+	writeFileSync(
+		join(h.dir, "pi-DEAD-2150.latch.json"),
+		JSON.stringify({ pr: "2150", cwd: WT, origin: "observed", pid: 999999 }),
+	);
+	try {
+		await h.start({ reason: "startup" });
+		await sleep(120);
+		assert.equal(h.wakes.length, 0, `reference checkout must not inherit ice-wt PRs; got ${h.wakes.join(" | ")}`);
+		assert.equal(
+			h.notifies.filter((n) => /2150/.test(n)).length,
+			0,
+			`must not adopt; got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a later user prompt cancels the deferred-work wake", async () => {
+	let view = OPEN;
+	const h = harness(
+		(cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)),
+		REPO,
+		{ watchMs: 20 },
+	);
+	await h.start();
+	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+	await h.settle();
+	await sleep(40);
+	assert.equal(h.wakes.length, 0);
+	await h.input("check git-workflow, tdd-worker should not open PRs");
+	view = MERGED;
+	await sleep(80);
+	assert.equal(
+		h.wakes.length,
+		0,
+		`moved-on session must not be told it deferred this merge; got ${h.wakes.join(" | ")}`,
+	);
+	assert.ok(
+		h.notifies.some((n) => /2142/.test(n) && /merged/.test(n)),
+		`toast still reports the merge; got ${h.notifies.join(" | ")}`,
+	);
+	h.cleanup();
 });
 
 test("a latch from another repository is never adopted", async () => {
@@ -740,12 +795,12 @@ test("a manual latch for a PR a live session already owns is not adopted", async
 
 test("a waiter-written manual latch is still adoptable", async () => {
 	// `manual-<pr>.json` has no owning pi session by construction, so the pid rule
-	// must not lock out the case adoption exists for.
+	// must not lock out the case adoption exists for — but only in this worktree.
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__manual_ok__");
-	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), REPO);
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), WT);
 	writeFileSync(join(h.dir, "manual-9950.json"), JSON.stringify({ pr: "9950", cwd: WT }));
 	try {
-		await h.start();
+		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.spawns.length, 1, "a manual latch must still be re-armed after a reload");
 	} finally {
@@ -770,11 +825,11 @@ test("an inherited latch is not re-adopted onward by a third session", async () 
 
 test("an adopted still-open latch is re-armed with a driver instead of dropped", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_open__");
-	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), REPO);
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), WT);
 	const orphan = join(h.dir, "manual-9933.json");
 	writeFileSync(orphan, JSON.stringify({ pr: "9933", cwd: WT }));
 	try {
-		await h.start();
+		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.spawns.length, 1, "reload must re-ensure the waiter for an adopted open PR");
 		assert.equal(h.wakes.length, 0, "an open PR must not wake the parent");
@@ -786,11 +841,11 @@ test("an adopted still-open latch is re-armed with a driver instead of dropped",
 
 test("adopted terminal latch wakes exactly once even with the watch armed", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_once__");
-	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), REPO, { watchMs: 20 });
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT, { watchMs: 20 });
 	const orphan = join(h.dir, "pi-DEAD-ONCE.latch.json");
 	writeFileSync(orphan, JSON.stringify({ pr: "9932", cwd: WT, origin: "observed", pid: 999999 }));
 	try {
-		await h.start();
+		await h.start({ reason: "reload" });
 		await sleep(200);
 		assert.equal(h.wakes.length, 1, `expected exactly one wake, got ${h.wakes.length}`);
 	} finally {
@@ -967,12 +1022,12 @@ test("a manual latch still wakes about a merge it actually witnesses", async () 
 			if (args[1] === "view") return merged ? MERGED : OPEN;
 			return ok("[]");
 		},
-		REPO,
+		WT,
 		{ watchMs: 20 },
 	);
 	writeFileSync(join(h.dir, "manual-9955.json"), JSON.stringify({ pr: "9955", cwd: WT }));
 	try {
-		await h.start();
+		await h.start({ reason: "reload" });
 		await sleep(80);
 		assert.equal(h.wakes.length, 0, "still open — nothing to announce yet");
 		assert.equal(h.spawns.length, 1, "an adopted open PR must get its waiter back");
@@ -989,13 +1044,13 @@ test("no wake is ever labelled with a bare, repo-less PR number", async () => {
 	// `pr-latch: PR #478 merged` is unactionable: #478 is icemining-devops there
 	// and a different pull request in icemining. Every wake must name the repo.
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__labelled__");
-	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), REPO);
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT);
 	writeFileSync(
 		join(h.dir, "pi-DEAD-LABEL.latch.json"),
 		JSON.stringify({ pr: "478", cwd: WT, origin: "observed", pid: 999999 }),
 	);
 	try {
-		await h.start();
+		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.wakes.length, 1);
 		assert.doesNotMatch(h.wakes[0], /(?:^|\s)PR #478\b/, `bare label: ${h.wakes[0]}`);
@@ -1009,11 +1064,11 @@ test("a terminal manual latch is retired so later sessions stop re-adopting it",
 	// manual-2162.json survived its own PR's merge and stayed adoptable for the
 	// full 24h window, so every subsequent session in the repo picked it up again.
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__retire__");
-	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), REPO);
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT);
 	const spent = join(h.dir, "manual-9960.json");
 	writeFileSync(spent, JSON.stringify({ pr: "9960", cwd: WT }));
 	try {
-		await h.start();
+		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.wakes.length, 0);
 		assert.equal(existsSync(spent), false, "a merged manual latch must not survive to be re-adopted");
@@ -1131,6 +1186,32 @@ test("same ACTIONABLE verdict does not wake twice", async () => {
 	await sleep(80);
 	assert.equal(h.wakes.length, 1, "same fingerprint must not re-wake even if delivered was reset");
 	h.cleanup();
+});
+
+test("actionableFingerprint distinguishes later rounds of the same next=", () => {
+	const first = actionableFingerprint({
+		next: "read_comments_and_fix",
+		verdict: ACTIONABLE_VERDICT,
+		round: "1",
+	});
+	const same = actionableFingerprint({
+		next: "read_comments_and_fix",
+		verdict: ACTIONABLE_VERDICT,
+		round: "1",
+	});
+	const laterRound = actionableFingerprint({
+		next: "read_comments_and_fix",
+		verdict: ACTIONABLE_VERDICT,
+		round: "2",
+	});
+	const laterBody = actionableFingerprint({
+		next: "read_comments_and_fix",
+		verdict: `${ACTIONABLE_VERDICT}\nsecond finding`,
+		round: "1",
+	});
+	assert.equal(first, same);
+	assert.notEqual(first, laterRound, "a new review round must not look like the first");
+	assert.notEqual(first, laterBody, "new findings must not look like the first");
 });
 
 test("same-session reload wakes on undelivered ACTIONABLE", async () => {
@@ -1347,6 +1428,36 @@ test("an already-delivered ACTIONABLE dispatches nothing for a Feature PR either
 		await sleep(80);
 		assert.equal(h.wakes.length, 0);
 		assert.equal(h.dispatches.length, 0, "a spent verdict must not buy a second writer");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a later Feature ACTIONABLE with a new round dispatches a second fixer", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchMs: 20 });
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId, { round: "1" });
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(h.dispatches.length, 1, "first round dispatches once");
+		writeActionable(h.dir, h.sessionId, {
+			verdictDelivered: false,
+			round: "2",
+			verdict: `${ACTIONABLE_VERDICT}\nsecond-round finding`,
+		});
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "the parent stays idle on later rounds too");
+		assert.equal(
+			h.dispatches.length,
+			2,
+			"a new review round must dispatch another fixer, not stop after one",
+		);
+		assert.equal(h.dispatches[1].verdict.next, "read_comments_and_fix");
+		assert.match(h.dispatches[1].verdict.output, /second-round finding/);
 	} finally {
 		h.cleanup();
 	}
