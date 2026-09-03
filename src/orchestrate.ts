@@ -3204,7 +3204,11 @@ export function unquoteGitPath(raw: string): string {
     const ch = inner[i];
     if (ch === undefined) break;
     if (ch !== "\\") {
-      bytes.push(ch.charCodeAt(0));
+      const cp = inner.codePointAt(i);
+      if (cp === undefined) break;
+      const char = String.fromCodePoint(cp);
+      bytes.push(...new TextEncoder().encode(char));
+      i += char.length - 1;
       continue;
     }
     const next = inner[++i];

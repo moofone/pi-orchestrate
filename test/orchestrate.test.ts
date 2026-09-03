@@ -5305,6 +5305,12 @@ test("P3 F11: porcelainEntryPath decodes git C-style quoted paths", () => {
     "caf\u00e9",
     "octal escapes are UTF-8 bytes, not Latin-1 code units",
   );
+  assert.equal(
+    orch.unquoteGitPath('"caf\u00e9"'),
+    "caf\u00e9",
+    "literal Unicode inside quotes (quotePath=false) is not byte-sliced",
+  );
+  assert.equal(orch.unquoteGitPath('"a \ud83c\udf89 b"'), "a \ud83c\udf89 b");
   assert.deepEqual(orch.porcelainEntryPaths("R  old.ts -> new.ts"), ["old.ts", "new.ts"]);
   assert.equal(
     orch.porcelainEntryPath(`R  old.ts -> ${quotedBackslash}`),
