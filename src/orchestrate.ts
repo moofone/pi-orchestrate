@@ -3248,12 +3248,36 @@ export function unquoteGitPath(raw: string): string {
   return out;
 }
 
+/** Dest path after the rename/copy arrow that sits outside C-style quotes. */
+export function renameDestination(rest: string): string {
+  if (rest.startsWith('"')) {
+    let i = 1;
+    while (i < rest.length) {
+      if (rest[i] === "\\" && i + 1 < rest.length) {
+        i += 2;
+        continue;
+      }
+      if (rest[i] === '"') {
+        i++;
+        break;
+      }
+      i++;
+    }
+    const after = rest.slice(i);
+    if (after.startsWith(" -> ")) return after.slice(4);
+    return rest.slice(0, i);
+  }
+  const arrow = rest.indexOf(" -> ");
+  if (arrow >= 0) return rest.slice(arrow + 4);
+  return rest;
+}
+
 /** Path from one `git status --porcelain` v1 line (rename dest wins). */
 export function porcelainEntryPath(line: string): string {
   if (line.length < 4) return "";
+  const xy = line.slice(0, 2);
   let rest = line.slice(3);
-  const arrow = rest.lastIndexOf(" -> ");
-  if (arrow >= 0) rest = rest.slice(arrow + 4);
+  if (xy.includes("R") || xy.includes("C")) rest = renameDestination(rest);
   rest = rest.trim();
   return unquoteGitPath(rest);
 }
@@ -3261,19 +3285,27 @@ export function porcelainEntryPath(line: string): string {
 /**
  * Darwin `cargo test` rewrites Cargo.lock; icemining's pre-commit hook refuses
  * that lock from macOS (ops-canonical). Residual lock dirt is not Feature work.
+ * Linux ops *must* still commit lock updates — do not ignore by basename alone.
  */
-export function isCommitGateIgnoredPath(path: string): boolean {
+export function isCommitGateIgnoredPath(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== "darwin") return false;
   const base = path.replace(/\\/g, "/").split("/").pop() ?? path;
   return base === "Cargo.lock";
 }
 
-/** Porcelain with ignored residual files (Cargo.lock) removed. */
-export function actionablePorcelain(porcelain: string): string {
+/** Porcelain with ignored residual files (Darwin Cargo.lock) removed. */
+export function actionablePorcelain(
+  porcelain: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   return porcelain
     .split("\n")
     .filter((line) => {
       if (!line.trim()) return false;
-      return !isCommitGateIgnoredPath(porcelainEntryPath(line));
+      return !isCommitGateIgnoredPath(porcelainEntryPath(line), platform);
     })
     .join("\n");
 }
@@ -3286,16 +3318,18 @@ export function actionablePorcelain(porcelain: string): string {
  * uncommitted belongs to someone else, and committing it under a Task's
  * message would attribute a stranger's edits to this plan.
  *
- * Cargo.lock-only dirt is ignored: Darwin cargo churn is not someone else's
+ * Darwin Cargo.lock-only dirt is ignored: cargo churn is not someone else's
  * Feature, and the Mac pre-commit hook would refuse the commit anyway.
+ * Linux still treats a lock change as Feature work.
  */
 export function firstTaskBlockedByDirtyTree(
   tasks: Task[],
   porcelain: string | undefined,
+  platform: NodeJS.Platform = process.platform,
 ): string | undefined {
   if (porcelain === undefined || !porcelain.trim()) return undefined;
   if (tasks.some((t) => t.status !== "pending")) return undefined;
-  const actionable = actionablePorcelain(porcelain);
+  const actionable = actionablePorcelain(porcelain, platform);
   if (!actionable) return undefined;
   const files = actionable
     .split("\n")
@@ -3321,10 +3355,11 @@ export async function ensureWriterCommit(
   pi: ExtensionAPI,
   cwd: string,
   message: string,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<{ state: CommitGateState; reason: string }> {
   const before = await porcelainStatus(pi, cwd);
   if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
-  const paths = actionablePorcelain(before)
+  const paths = actionablePorcelain(before, platform)
     .split("\n")
     .map((line) => porcelainEntryPath(line))
     .filter(Boolean);
@@ -3334,7 +3369,8 @@ export async function ensureWriterCommit(
     if (add.code !== 0) {
       return { state: "dirty", reason: `git add -A failed: ${(add.stderr || "").trim()}` };
     }
-    const commit = await pi.exec("git", ["commit", "-m", message, "--", ...paths], {
+    const literalPaths = paths.map((path) => `:(literal)${path}`);
+    const commit = await pi.exec("git", ["commit", "-m", message, "--", ...literalPaths], {
       cwd,
       timeout: 120_000,
     });
@@ -3345,7 +3381,7 @@ export async function ensureWriterCommit(
     return { state: "dirty", reason: `commit gate error: ${String(error)}` };
   }
   const after = await porcelainStatus(pi, cwd);
-  if (after && actionablePorcelain(after)) {
+  if (after && actionablePorcelain(after, platform)) {
     return { state: "dirty", reason: "worktree still dirty after the commit" };
   }
   return { state: "committed", reason: "" };
