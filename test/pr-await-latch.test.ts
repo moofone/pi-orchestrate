@@ -38,6 +38,7 @@ const REAL_OUTPUT = [
 ].join("\n");
 
 const REPO = join(homedir(), "Dev", "git", "icemining");
+const PI_SUB = join(homedir(), "Dev", "git", "pi-subagents");
 // Isolate from the real latch dir. Adoption scans this directory, and the live
 // ~/.local/state/ghl-await holds real orphaned latches that would be adopted.
 // One directory PER HARNESS: a settled handoff can still persist after a test
@@ -67,6 +68,7 @@ const {
 	osc8Link,
 	prLinkLabel,
 	prUrl,
+	ghPrViewArgs,
 	isExtensionOwnedStateFile,
 	readLiveRound,
 	repoKey,
@@ -1036,6 +1038,115 @@ test("spawnCwdFor refuses a cwd that is not a git checkout", () => {
 		"a removed worktree must fall back to its reference checkout",
 	);
 	assert.equal(spawnCwdFor({ pr: "2163", cwd: REPO }), REPO);
+	assert.equal(
+		spawnCwdFor({ pr: "2150", cwd: PI_SUB, slug: "moofone/icemining" }),
+		undefined,
+		"ghl-pr-await in pi-subagents would query moofone/pi-subagents#2150 and 404",
+	);
+	assert.equal(
+		spawnCwdFor({ pr: "1831", cwd: PI_SUB, slug: "nicobailon/pi-subagents" }),
+		undefined,
+		"fork origin is not the upstream slug; the waiter has no --repo",
+	);
+	assert.equal(
+		spawnCwdFor({ pr: "2150", cwd: REPO, slug: "moofone/icemining" }),
+		REPO,
+		"matching slug still spawns in that checkout",
+	);
+	assert.equal(
+		spawnCwdFor({ pr: "1", cwd: PI_SUB, slug: "moofone/pi-subagents" }),
+		PI_SUB,
+		"same-origin slug is a defensible waiter cwd",
+	);
+});
+
+const NOT_IN_THIS_REPO = {
+	stdout: "",
+	stderr: 'GraphQL: Could not resolve to a PullRequest with the number of 2150. (repository.pullRequest)',
+	code: 1,
+	killed: false,
+};
+
+function ghRepo(args: string[]): string | undefined {
+	const i = args.indexOf("--repo");
+	return i >= 0 ? args[i + 1] : undefined;
+}
+
+test("observed latch for another repo's already-merged PR wakes and does not spawn", async () => {
+	// Live: pi-subagents chat latched moofone/icemining#2150 (merged 2026-08-25).
+	// `gh pr view 2150` in that cwd 404s; the waiter 404-looped; chrome still
+	// showed waiting moofone/icemining#2150 after the session answered #1831.
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok("[]");
+			if (args[1] === "view" && String(args[2]) === "2150") {
+				return ghRepo(args) === "moofone/icemining" ? MERGED : NOT_IN_THIS_REPO;
+			}
+			return NOT_IN_THIS_REPO;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2150",
+			cwd: PI_SUB,
+			lastNext: "yield",
+			slug: "moofone/icemining",
+			url: "https://github.com/moofone/icemining/pull/2150",
+		});
+		await sleep(80);
+		assert.equal(
+			h.spawns.length,
+			0,
+			`must not start a waiter against the wrong origin; got ${h.spawns.map((s) => s.join(" ")).join(" | ")}`,
+		);
+		assert.equal(h.wakes.length, 1, `merged slug PR must wake; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /2150 merged/);
+		assert.ok(
+			h.calls.some((c) => /gh pr view 2150\b/.test(c) && /--repo moofone\/icemining/.test(c)),
+			`must query --repo slug; got ${h.calls.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("slug-mismatched open PR still wakes on merge without a waiter", async () => {
+	// nicobailon/pi-subagents#1831 from a moofone/pi-subagents checkout: cwd-only
+	// `gh pr view 1831` 404s, and a waiter started here loops the same way.
+	let view = OPEN;
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok("[]");
+			if (args[1] === "view" && String(args[2]) === "1831") {
+				return ghRepo(args) === "nicobailon/pi-subagents" ? view : NOT_IN_THIS_REPO;
+			}
+			return NOT_IN_THIS_REPO;
+		},
+		PI_SUB,
+		{ watchMs: 20 },
+	);
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "1831",
+			cwd: PI_SUB,
+			lastNext: "yield",
+			slug: "nicobailon/pi-subagents",
+			url: "https://github.com/nicobailon/pi-subagents/pull/1831",
+		});
+		await sleep(40);
+		assert.equal(h.spawns.length, 0, "fork-cwd waiter would 404 on the upstream number");
+		assert.equal(h.wakes.length, 0, "must not wake while the slug PR is still open");
+		view = MERGED;
+		await sleep(80);
+		assert.equal(h.wakes.length, 1, `merge on the slug repo must wake; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /1831 merged/);
+		assert.equal(h.spawns.length, 0);
+	} finally {
+		h.cleanup();
+	}
 });
 
 test("defaultSpawnDriver never falls back to HOME or process.cwd()", async () => {
@@ -1775,6 +1886,28 @@ test("wait chrome includes review round when known", () => {
 	assert.equal(originSlug(git), "moofone/icemining-devops");
 	assert.equal(prUrl({ pr: "485", cwd: git }), url);
 	rmSync(git, { recursive: true, force: true });
+});
+
+test("ghPrViewArgs passes --repo only when the latch names owner/repo", () => {
+	assert.deepEqual(ghPrViewArgs("2150"), ["pr", "view", "2150", "--json", "state,mergedAt"]);
+	assert.deepEqual(ghPrViewArgs("2150", "moofone/icemining"), [
+		"pr",
+		"view",
+		"2150",
+		"--json",
+		"state,mergedAt",
+		"--repo",
+		"moofone/icemining",
+	]);
+	assert.deepEqual(ghPrViewArgs("1831", "NicoBailon/pi-subagents"), [
+		"pr",
+		"view",
+		"1831",
+		"--json",
+		"state,mergedAt",
+		"--repo",
+		"nicobailon/pi-subagents",
+	]);
 });
 
 test("wait chrome is a Loader factory, not a frozen braille string", async () => {

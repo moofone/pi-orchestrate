@@ -233,6 +233,29 @@ export function originSlug(cwd: string): string | undefined {
 	return m?.[1]?.replace(/\.git$/i, "");
 }
 
+/** Lowercased `owner/repo` with a trailing `.git` stripped. */
+export function normalizeGithubSlug(s: string | undefined): string {
+	return (s ?? "").trim().replace(/\.git$/i, "").toLowerCase();
+}
+
+export function sameGithubSlug(a?: string, b?: string): boolean {
+	const left = normalizeGithubSlug(a);
+	const right = normalizeGithubSlug(b);
+	return Boolean(left && left === right);
+}
+
+/**
+ * `gh pr view` argv. A latch that already knows `owner/repo` must pass
+ * `--repo`: `gh` otherwise resolves the number against cwd origin, which is
+ * how pi-subagents 404'd on icemining#2150 and nicobailon#1831.
+ */
+export function ghPrViewArgs(pr: string, slug?: string): string[] {
+	const args = ["pr", "view", String(pr), "--json", "state,mergedAt"];
+	const repo = normalizeGithubSlug(slug);
+	if (repo.includes("/")) args.push("--repo", repo);
+	return args;
+}
+
 /** GitHub PR URL from latch fields, if we have enough to form one. */
 // These four already treat every field but `pr` as optional at runtime — the
 // guards below say so. The types demanded all of them, which forced callers and
@@ -797,7 +820,13 @@ export function spawnCwdFor(latch: Partial<LatchState> | undefined): string | un
 	// icemining#2163's waiter died: it was spawned from a directory that is not
 	// a checkout, logged the same resolve error ~40 times, and exited — leaving
 	// an open PR with nothing waiting on it and a session that never resumed.
-	return referenceCheckoutFor(latch.cwd);
+	const cwd = referenceCheckoutFor(latch.cwd);
+	if (!cwd) return undefined;
+	// `ghl-pr-await` has no `--repo`. It reads origin in this cwd. A latch whose
+	// slug is a different GitHub repo (icemining vs pi-subagents, or a fork vs
+	// upstream) would 404-loop forever — chrome still showing the slug.
+	if (latch.slug && !sameGithubSlug(originSlug(cwd), latch.slug)) return undefined;
+	return cwd;
 }
 
 export function resolveQueryCwd(cwd: string): string {
