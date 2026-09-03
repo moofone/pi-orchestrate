@@ -60,6 +60,9 @@ import {
 	parseField,
 	parsePrState,
 	ghPrViewArgs,
+	githubPrUrlFor,
+	isGraphqlPrNotFound,
+	normalizeGithubSlug,
 	pidAlive,
 	printedLandCommand,
 	isReferenceCheckout,
@@ -845,17 +848,6 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const args = ghPrViewArgs(pr, slug);
 		// With `--repo`, cwd is only for gh auth/context. Do not fall back to a
 		// cwd-only view: that 404 is not "still open", it is the wrong repository.
-		if (slug) {
-			const tried = new Set<string>();
-			for (const candidate of [resolveQueryCwd(cwd), cwd, referenceCheckoutFor(cwd)]) {
-				if (!candidate || tried.has(candidate)) continue;
-				tried.add(candidate);
-				const { out, ok } = await sh("gh", args, candidate);
-				const st = parsePrState(out, ok);
-				if (st !== "unknown") return st;
-			}
-			return "unknown";
-		}
 		const tried = new Set<string>();
 		for (const candidate of [resolveQueryCwd(cwd), cwd, referenceCheckoutFor(cwd)]) {
 			if (!candidate || tried.has(candidate)) continue;
@@ -863,8 +855,18 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			const { out, ok } = await sh("gh", args, candidate);
 			const st = parsePrState(out, ok);
 			if (st !== "unknown") return st;
+			// GraphQL uses the same missing-PR string for private/no-access. Only
+			// treat it as closed when we can still see the repository itself.
+			if (isGraphqlPrNotFound(out) && (await repoAccessible(candidate, slug))) return "closed";
 		}
 		return "unknown";
+	}
+
+	async function repoAccessible(cwd: string, slug?: string): Promise<boolean> {
+		const repo = normalizeGithubSlug(slug) || originSlug(cwd) || "";
+		if (!repo.includes("/")) return false;
+		const { ok } = await sh("gh", ["repo", "view", repo, "--json", "name"], cwd);
+		return ok;
 	}
 
 	function absorb(command: string, output: string, ctx: ExtensionContext): void {
@@ -889,10 +891,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const head = parseField(output, "head");
 		const round = parseField(output, "round");
 		const roundTotal = parseField(output, "round_total");
-		const url =
-			output.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/)?.[0] ??
-			parseField(output, "url");
-		const slug = url?.match(/github\.com\/([^\s/]+\/[^\s/]+)\/pull\//)?.[1];
+		const fromText = githubPrUrlFor(pr, output) ?? githubPrUrlFor(pr, parseField(output, "url"));
+		const url = fromText?.url;
+		const slug = fromText?.slug;
 		// First-hand: this session ran the command, so it may later be told that it
 		// deferred work until this PR resolves.
 		setLatch({

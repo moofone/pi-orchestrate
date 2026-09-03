@@ -256,6 +256,24 @@ export function ghPrViewArgs(pr: string, slug?: string): string[] {
 	return args;
 }
 
+/** First GitHub PR URL in `text` whose `/pull/N` is this PR. */
+export function githubPrUrlFor(
+	pr: string,
+	text: string | undefined,
+): { url: string; slug: string } | undefined {
+	if (!text) return undefined;
+	const want = String(pr);
+	for (const m of text.matchAll(/https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/pull\/(\d+)/g)) {
+		if (m[2] === want && m[1]) return { url: m[0], slug: m[1] };
+	}
+	return undefined;
+}
+
+/** GraphQL missing-PR text. Same string is used for private/no-access. */
+export function isGraphqlPrNotFound(out: string): boolean {
+	return /Could not resolve to a PullRequest/i.test(out);
+}
+
 /** GitHub PR URL from latch fields, if we have enough to form one. */
 // These four already treat every field but `pr` as optional at runtime — the
 // guards below say so. The types demanded all of them, which forced callers and
