@@ -3185,49 +3185,37 @@ export async function porcelainStatus(
   }
 }
 
-/** Decode git's C-style quoted pathname (`quote.c` unquote_c_style). */
+const GIT_C_ESCAPE: Record<string, number> = {
+  n: 0x0a,
+  t: 0x09,
+  r: 0x0d,
+  a: 0x07,
+  b: 0x08,
+  f: 0x0c,
+  v: 0x0b,
+};
+
+/** Decode git's C-style quoted pathname (`quote.c` unquote_c_style) as UTF-8. */
 export function unquoteGitPath(raw: string): string {
   if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) return raw;
   const inner = raw.slice(1, -1);
-  let out = "";
+  const bytes: number[] = [];
   for (let i = 0; i < inner.length; i++) {
     const ch = inner[i];
+    if (ch === undefined) break;
     if (ch !== "\\") {
-      out += ch;
+      bytes.push(ch.charCodeAt(0));
       continue;
     }
     const next = inner[++i];
     if (next === undefined) break;
     if (next === "\\" || next === '"') {
-      out += next;
+      bytes.push(next.charCodeAt(0));
       continue;
     }
-    if (next === "n") {
-      out += "\n";
-      continue;
-    }
-    if (next === "t") {
-      out += "\t";
-      continue;
-    }
-    if (next === "r") {
-      out += "\r";
-      continue;
-    }
-    if (next === "a") {
-      out += "\u0007";
-      continue;
-    }
-    if (next === "b") {
-      out += "\b";
-      continue;
-    }
-    if (next === "f") {
-      out += "\f";
-      continue;
-    }
-    if (next === "v") {
-      out += "\v";
+    const named = GIT_C_ESCAPE[next];
+    if (named !== undefined) {
+      bytes.push(named);
       continue;
     }
     if (next >= "0" && next <= "7") {
@@ -3240,12 +3228,12 @@ export function unquoteGitPath(raw: string): string {
         i++;
         count++;
       }
-      out += String.fromCharCode(Number.parseInt(oct, 8));
+      bytes.push(Number.parseInt(oct, 8));
       continue;
     }
-    out += next;
+    bytes.push(next.charCodeAt(0));
   }
-  return out;
+  return new TextDecoder("utf-8").decode(Uint8Array.from(bytes));
 }
 
 /** Dest path after the rename/copy arrow that sits outside C-style quotes. */
@@ -3272,14 +3260,47 @@ export function renameDestination(rest: string): string {
   return rest;
 }
 
+/** Source and dest of a porcelain v1 rename/copy rest field. */
+export function renameSides(rest: string): { from: string; to: string } {
+  const to = renameDestination(rest);
+  if (rest.startsWith('"')) {
+    let i = 1;
+    while (i < rest.length) {
+      if (rest[i] === "\\" && i + 1 < rest.length) {
+        i += 2;
+        continue;
+      }
+      if (rest[i] === '"') {
+        i++;
+        break;
+      }
+      i++;
+    }
+    return { from: rest.slice(0, i), to };
+  }
+  const arrow = rest.indexOf(" -> ");
+  if (arrow >= 0) return { from: rest.slice(0, arrow), to };
+  return { from: rest, to };
+}
+
 /** Path from one `git status --porcelain` v1 line (rename dest wins). */
 export function porcelainEntryPath(line: string): string {
-  if (line.length < 4) return "";
+  const paths = porcelainEntryPaths(line);
+  return paths[paths.length - 1] ?? "";
+}
+
+/** Every path a porcelain v1 line must include in a commit pathspec. */
+export function porcelainEntryPaths(line: string): string[] {
+  if (line.length < 4) return [];
   const xy = line.slice(0, 2);
-  let rest = line.slice(3);
-  if (xy.includes("R") || xy.includes("C")) rest = renameDestination(rest);
-  rest = rest.trim();
-  return unquoteGitPath(rest);
+  const rest = line.slice(3);
+  if (xy.includes("R") || xy.includes("C")) {
+    const { from, to } = renameSides(rest);
+    const paths = [unquoteGitPath(from.trim()), unquoteGitPath(to.trim())].filter(Boolean);
+    return paths[0] === paths[1] ? paths.slice(0, 1) : paths;
+  }
+  const path = unquoteGitPath(rest.trim());
+  return path ? [path] : [];
 }
 
 /**
@@ -3305,7 +3326,7 @@ export function actionablePorcelain(
     .split("\n")
     .filter((line) => {
       if (!line.trim()) return false;
-      return !isCommitGateIgnoredPath(porcelainEntryPath(line), platform);
+      return porcelainEntryPaths(line).some((path) => !isCommitGateIgnoredPath(path, platform));
     })
     .join("\n");
 }
@@ -3359,10 +3380,15 @@ export async function ensureWriterCommit(
 ): Promise<{ state: CommitGateState; reason: string }> {
   const before = await porcelainStatus(pi, cwd);
   if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
-  const paths = actionablePorcelain(before, platform)
-    .split("\n")
-    .map((line) => porcelainEntryPath(line))
-    .filter(Boolean);
+  const paths = [
+    ...new Set(
+      actionablePorcelain(before, platform)
+        .split("\n")
+        .filter((line) => line.trim())
+        .flatMap((line) => porcelainEntryPaths(line))
+        .filter((path) => !isCommitGateIgnoredPath(path, platform)),
+    ),
+  ];
   if (paths.length === 0) return { state: "clean", reason: "" };
   try {
     const add = await pi.exec("git", ["add", "-A"], { cwd, timeout: 120_000 });

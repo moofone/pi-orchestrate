@@ -5301,6 +5301,12 @@ test("P3 F11: porcelainEntryPath decodes git C-style quoted paths", () => {
   assert.equal(orch.unquoteGitPath(`"foo${backslash}nbar"`), "foo\nbar");
   assert.equal(orch.unquoteGitPath(`"foo${backslash}001bar"`), "foo\u0001bar");
   assert.equal(
+    orch.unquoteGitPath(`"caf${backslash}303${backslash}251"`),
+    "caf\u00e9",
+    "octal escapes are UTF-8 bytes, not Latin-1 code units",
+  );
+  assert.deepEqual(orch.porcelainEntryPaths("R  old.ts -> new.ts"), ["old.ts", "new.ts"]);
+  assert.equal(
     orch.porcelainEntryPath(`R  old.ts -> ${quotedBackslash}`),
     `foo${backslash}bar`,
     "rename dest is unquoted too",
@@ -5315,6 +5321,23 @@ test("P3 F11: porcelainEntryPath decodes git C-style quoted paths", () => {
     "new -> x",
     "a non-rename path may contain an arrow",
   );
+});
+
+test("P3 F11: staged rename commits both source and destination", async () => {
+  let dirty = "R  old.ts -> new.ts";
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.ok(a.includes(":(literal)old.ts"), `source deletion must be in the pathspec: ${a.join(" ")}`);
+      assert.ok(a.includes(":(literal)new.ts"), `destination must be in the pathspec: ${a.join(" ")}`);
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "committed");
 });
 
 test("P3 F11: quoted porcelain paths are committed decoded, not still-escaped", async () => {
