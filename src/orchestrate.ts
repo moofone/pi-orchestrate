@@ -3139,7 +3139,7 @@ async function worktreeFingerprint(pi: ExtensionAPI, worktree: string): Promise<
       timeout: 30_000,
     });
     if (head.code !== 0 || status.code !== 0) return "";
-    return `${head.stdout.trim()}\n${status.stdout.trim()}`;
+    return `${head.stdout.trim()}\n${actionablePorcelain(stripOuterNewlines(status.stdout))}`;
   } catch {
     return "";
   }
@@ -3162,6 +3162,14 @@ async function worktreeFingerprint(pi: ExtensionAPI, worktree: string): Promise<
 /** `clean` = nothing to do; `committed` = code closed the gate; `unknown` = git could not answer. */
 export type CommitGateState = "clean" | "committed" | "dirty" | "unknown";
 
+/** Drop surrounding newlines without eating porcelain's leading XY space. */
+function stripOuterNewlines(raw: string): string {
+  let text = raw;
+  while (text.startsWith("\n")) text = text.slice(1);
+  while (text.endsWith("\n")) text = text.slice(0, -1);
+  return text;
+}
+
 /** `git status --porcelain`, or undefined when git cannot answer. */
 export async function porcelainStatus(
   pi: ExtensionAPI,
@@ -3170,10 +3178,161 @@ export async function porcelainStatus(
   try {
     const out = await pi.exec("git", ["status", "--porcelain"], { cwd, timeout: 30_000 });
     if (out.code !== 0) return undefined;
-    return out.stdout.trim();
+    // Do not String#trim: porcelain v1 uses a leading space in XY (` M file`).
+    return stripOuterNewlines(out.stdout);
   } catch {
     return undefined;
   }
+}
+
+const GIT_C_ESCAPE: Record<string, number> = {
+  n: 0x0a,
+  t: 0x09,
+  r: 0x0d,
+  a: 0x07,
+  b: 0x08,
+  f: 0x0c,
+  v: 0x0b,
+};
+
+/** Decode git's C-style quoted pathname (`quote.c` unquote_c_style) as UTF-8. */
+export function unquoteGitPath(raw: string): string {
+  if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) return raw;
+  const inner = raw.slice(1, -1);
+  const bytes: number[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === undefined) break;
+    if (ch !== "\\") {
+      const cp = inner.codePointAt(i);
+      if (cp === undefined) break;
+      const char = String.fromCodePoint(cp);
+      bytes.push(...new TextEncoder().encode(char));
+      i += char.length - 1;
+      continue;
+    }
+    const next = inner[++i];
+    if (next === undefined) break;
+    if (next === "\\" || next === '"') {
+      bytes.push(next.charCodeAt(0));
+      continue;
+    }
+    const named = GIT_C_ESCAPE[next];
+    if (named !== undefined) {
+      bytes.push(named);
+      continue;
+    }
+    if (next >= "0" && next <= "7") {
+      let oct = next;
+      let count = 1;
+      while (count < 3 && i + 1 < inner.length) {
+        const digit = inner[i + 1];
+        if (digit === undefined || digit < "0" || digit > "7") break;
+        oct += digit;
+        i++;
+        count++;
+      }
+      bytes.push(Number.parseInt(oct, 8));
+      continue;
+    }
+    bytes.push(next.charCodeAt(0));
+  }
+  return new TextDecoder("utf-8").decode(Uint8Array.from(bytes));
+}
+
+/** Dest path after the rename/copy arrow that sits outside C-style quotes. */
+export function renameDestination(rest: string): string {
+  if (rest.startsWith('"')) {
+    let i = 1;
+    while (i < rest.length) {
+      if (rest[i] === "\\" && i + 1 < rest.length) {
+        i += 2;
+        continue;
+      }
+      if (rest[i] === '"') {
+        i++;
+        break;
+      }
+      i++;
+    }
+    const after = rest.slice(i);
+    if (after.startsWith(" -> ")) return after.slice(4);
+    return rest.slice(0, i);
+  }
+  const arrow = rest.indexOf(" -> ");
+  if (arrow >= 0) return rest.slice(arrow + 4);
+  return rest;
+}
+
+/** Source and dest of a porcelain v1 rename/copy rest field. */
+export function renameSides(rest: string): { from: string; to: string } {
+  const to = renameDestination(rest);
+  if (rest.startsWith('"')) {
+    let i = 1;
+    while (i < rest.length) {
+      if (rest[i] === "\\" && i + 1 < rest.length) {
+        i += 2;
+        continue;
+      }
+      if (rest[i] === '"') {
+        i++;
+        break;
+      }
+      i++;
+    }
+    return { from: rest.slice(0, i), to };
+  }
+  const arrow = rest.indexOf(" -> ");
+  if (arrow >= 0) return { from: rest.slice(0, arrow), to };
+  return { from: rest, to };
+}
+
+/** Path from one `git status --porcelain` v1 line (rename dest wins). */
+export function porcelainEntryPath(line: string): string {
+  const paths = porcelainEntryPaths(line);
+  return paths[paths.length - 1] ?? "";
+}
+
+/** Every path a porcelain v1 line must include in a commit pathspec. */
+export function porcelainEntryPaths(line: string): string[] {
+  if (line.length < 4) return [];
+  const xy = line.slice(0, 2);
+  const rest = line.slice(3);
+  if (xy.includes("R") || xy.includes("C")) {
+    const { from, to } = renameSides(rest);
+    const paths = [unquoteGitPath(from.trim()), unquoteGitPath(to.trim())].filter(Boolean);
+    return paths[0] === paths[1] ? paths.slice(0, 1) : paths;
+  }
+  const path = unquoteGitPath(rest.trim());
+  return path ? [path] : [];
+}
+
+/**
+ * Darwin `cargo test` rewrites Cargo.lock; icemining's pre-commit hook refuses
+ * that lock from macOS (ops-canonical). Residual lock dirt is not Feature work.
+ * Linux ops *must* still commit lock updates — do not ignore by basename alone.
+ */
+export function isCommitGateIgnoredPath(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== "darwin") return false;
+  const base = path.replace(/\\/g, "/").split("/").pop() ?? path;
+  return base === "Cargo.lock";
+}
+
+/** Porcelain with ignored residual files (Darwin Cargo.lock) removed. */
+export function actionablePorcelain(
+  porcelain: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return porcelain
+    .split("\n")
+    .filter((line) => {
+      if (!line.trim()) return false;
+      return porcelainEntryPaths(line).some((path) => !isCommitGateIgnoredPath(path, platform));
+    })
+    .join("\n");
 }
 
 /**
@@ -3183,16 +3342,23 @@ export async function porcelainStatus(
  * work-in-progress and the commit gate below owns it. Before then, anything
  * uncommitted belongs to someone else, and committing it under a Task's
  * message would attribute a stranger's edits to this plan.
+ *
+ * Darwin Cargo.lock-only dirt is ignored: cargo churn is not someone else's
+ * Feature, and the Mac pre-commit hook would refuse the commit anyway.
+ * Linux still treats a lock change as Feature work.
  */
 export function firstTaskBlockedByDirtyTree(
   tasks: Task[],
   porcelain: string | undefined,
+  platform: NodeJS.Platform = process.platform,
 ): string | undefined {
   if (porcelain === undefined || !porcelain.trim()) return undefined;
   if (tasks.some((t) => t.status !== "pending")) return undefined;
-  const files = porcelain
+  const actionable = actionablePorcelain(porcelain, platform);
+  if (!actionable) return undefined;
+  const files = actionable
     .split("\n")
-    .map((line) => line.slice(3).trim())
+    .map((line) => porcelainEntryPath(line))
     .filter(Boolean);
   const shown = files.slice(0, 8).join(", ");
   return (
@@ -3206,21 +3372,38 @@ export function firstTaskBlockedByDirtyTree(
  *
  * `git add -A` is deliberate: a writer's untracked new files are as much of
  * the Task as its edits, and leaving them behind would push a half-Task.
+ * The commit itself is pathspec'd to actionable files so an already-staged
+ * Darwin Cargo.lock is not included (Mac pre-commit refuses that lock; we
+ * cannot `git reset`/`git restore` it). Leftover lock dirt is not a block.
  */
 export async function ensureWriterCommit(
   pi: ExtensionAPI,
   cwd: string,
   message: string,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<{ state: CommitGateState; reason: string }> {
   const before = await porcelainStatus(pi, cwd);
   if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
-  if (!before) return { state: "clean", reason: "" };
+  const paths = [
+    ...new Set(
+      actionablePorcelain(before, platform)
+        .split("\n")
+        .filter((line) => line.trim())
+        .flatMap((line) => porcelainEntryPaths(line))
+        .filter((path) => !isCommitGateIgnoredPath(path, platform)),
+    ),
+  ];
+  if (paths.length === 0) return { state: "clean", reason: "" };
   try {
     const add = await pi.exec("git", ["add", "-A"], { cwd, timeout: 120_000 });
     if (add.code !== 0) {
       return { state: "dirty", reason: `git add -A failed: ${(add.stderr || "").trim()}` };
     }
-    const commit = await pi.exec("git", ["commit", "-m", message], { cwd, timeout: 120_000 });
+    const literalPaths = paths.map((path) => `:(literal)${path}`);
+    const commit = await pi.exec("git", ["commit", "-m", message, "--", ...literalPaths], {
+      cwd,
+      timeout: 120_000,
+    });
     if (commit.code !== 0) {
       return { state: "dirty", reason: `git commit failed: ${(commit.stderr || "").trim()}` };
     }
@@ -3228,7 +3411,9 @@ export async function ensureWriterCommit(
     return { state: "dirty", reason: `commit gate error: ${String(error)}` };
   }
   const after = await porcelainStatus(pi, cwd);
-  if (after) return { state: "dirty", reason: "worktree still dirty after the commit" };
+  if (after && actionablePorcelain(after, platform)) {
+    return { state: "dirty", reason: "worktree still dirty after the commit" };
+  }
   return { state: "committed", reason: "" };
 }
 

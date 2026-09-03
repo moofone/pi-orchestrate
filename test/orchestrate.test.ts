@@ -5287,6 +5287,85 @@ test("P2 F10: a Context that is the last section of the plan still reaches the P
  * Phase 3 — the Task and QA lifecycle (F11, F12, F13, F14)
  * ---------------------------------------------------------------- */
 
+test("P3 F11: porcelainEntryPath decodes git C-style quoted paths", () => {
+  const backslash = String.fromCharCode(92);
+  const quotedBackslash = `"foo${backslash}${backslash}bar"`; // git: "foo\\bar"
+  assert.equal(orch.porcelainEntryPath(" M src/a.ts"), "src/a.ts");
+  assert.equal(
+    orch.unquoteGitPath(quotedBackslash),
+    `foo${backslash}bar`,
+    "quoted backslash decodes to one backslash, not a still-escaped pathspec",
+  );
+  assert.equal(orch.porcelainEntryPath(` M ${quotedBackslash}`), `foo${backslash}bar`);
+  assert.equal(orch.unquoteGitPath(`"foo${backslash}"bar"`), 'foo"bar');
+  assert.equal(orch.unquoteGitPath(`"foo${backslash}nbar"`), "foo\nbar");
+  assert.equal(orch.unquoteGitPath(`"foo${backslash}001bar"`), "foo\u0001bar");
+  assert.equal(
+    orch.unquoteGitPath(`"caf${backslash}303${backslash}251"`),
+    "caf\u00e9",
+    "octal escapes are UTF-8 bytes, not Latin-1 code units",
+  );
+  assert.equal(
+    orch.unquoteGitPath('"caf\u00e9"'),
+    "caf\u00e9",
+    "literal Unicode inside quotes (quotePath=false) is not byte-sliced",
+  );
+  assert.equal(orch.unquoteGitPath('"a \ud83c\udf89 b"'), "a \ud83c\udf89 b");
+  assert.deepEqual(orch.porcelainEntryPaths("R  old.ts -> new.ts"), ["old.ts", "new.ts"]);
+  assert.equal(
+    orch.porcelainEntryPath(`R  old.ts -> ${quotedBackslash}`),
+    `foo${backslash}bar`,
+    "rename dest is unquoted too",
+  );
+  assert.equal(
+    orch.porcelainEntryPath('R  "old" -> "new -> x"'),
+    "new -> x",
+    "rename arrow inside a quoted dest is not the separator",
+  );
+  assert.equal(
+    orch.porcelainEntryPath(' M "new -> x"'),
+    "new -> x",
+    "a non-rename path may contain an arrow",
+  );
+});
+
+test("P3 F11: staged rename commits both source and destination", async () => {
+  let dirty = "R  old.ts -> new.ts";
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.ok(a.includes(":(literal)old.ts"), `source deletion must be in the pathspec: ${a.join(" ")}`);
+      assert.ok(a.includes(":(literal)new.ts"), `destination must be in the pathspec: ${a.join(" ")}`);
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "committed");
+});
+
+test("P3 F11: quoted porcelain paths are committed decoded, not still-escaped", async () => {
+  const backslash = String.fromCharCode(92);
+  let dirty = ` M "foo${backslash}${backslash}bar"`;
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.ok(
+        a.some((arg) => String(arg).includes(`foo${backslash}bar`)),
+        `git commit pathspec must be the real path, got ${a.join(" ")}`,
+      );
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "committed");
+});
+
 test("P3 F11: an uncommitted Task is committed by code, not counted as done", async () => {
   const calls: string[] = [];
   let dirty = " M src/a.ts\n?? src/b.ts";
@@ -5307,7 +5386,7 @@ test("P3 F11: an uncommitted Task is committed by code, not counted as done", as
     "untracked new files are as much of the Task as its edits",
   );
   assert.ok(
-    calls.includes("git commit -m Task 3 — parser"),
+    calls.some((c) => c.startsWith("git commit -m Task 3 — parser")),
     "the commit message names the Task deterministically",
   );
 });
@@ -5380,6 +5459,106 @@ test("P3 F11: Task 1 refuses to start on a tree that already has someone else's 
     orch.firstTaskBlockedByDirtyTree(pending, undefined),
     undefined,
     "git that could not answer must not block the Feature on its own",
+  );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(pending, " M Cargo.lock", "darwin"),
+    undefined,
+    "Darwin Cargo.lock churn is not someone else's Feature",
+  );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(pending, " M crates/stratum-adapter/Cargo.lock", "darwin"),
+    undefined,
+    "nested Cargo.lock is the same residual",
+  );
+  assert.match(
+    orch.firstTaskBlockedByDirtyTree(pending, " M Cargo.lock", "linux") ?? "",
+    /Cargo.lock/,
+    "Linux lock updates are Feature work and must be committed",
+  );
+});
+
+test("P3 F11: Linux Cargo.lock is committed as Feature work", async () => {
+  let dirty = " M Cargo.lock";
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.ok(
+        a.some((arg) => String(arg).includes("Cargo.lock")),
+        `Linux must commit the lock, got ${a.join(" ")}`,
+      );
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x", "linux");
+  assert.equal(gate.state, "committed");
+});
+
+test("P3 F11: commit pathspecs are literal so wildcards are filenames", async () => {
+  let dirty = " M foo[bar].rs";
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.ok(a.includes(":(literal)foo[bar].rs"), `got ${a.join(" ")}`);
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "committed");
+});
+
+test("P3 F11: Darwin Cargo.lock leftover is not a closed-gate failure", async () => {
+  const calls: string[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: " M Cargo.lock", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x", "darwin");
+  assert.equal(gate.state, "clean", "lock-only dirt is residual, not uncommitted Task work");
+  assert.deepEqual(
+    calls.filter((c) => c.includes("commit") || c.includes("add")),
+    [],
+    "code must not try to commit a Darwin Cargo.lock",
+  );
+});
+
+test("P3 F11: a Task commit that leaves only Cargo.lock dirty still closed the gate", async () => {
+  let dirty = " M src/pearl.rs\nM  Cargo.lock";
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.equal(
+        a.some((arg) => String(arg).includes("Cargo.lock")),
+        false,
+        "the lock is not in the commit pathspec",
+      );
+      assert.ok(
+        a.includes(":(literal)src/pearl.rs"),
+        "the Task file is committed as a literal pathspec",
+      );
+      dirty = "M  Cargo.lock";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(
+    pi as never,
+    "/wt",
+    "Task 1 — pin submitblock",
+    "darwin",
+  );
+  assert.equal(
+    gate.state,
+    "committed",
+    "Mac pre-commit refusing Cargo.lock must not stop the Feature chain",
   );
 });
 
