@@ -61,7 +61,6 @@ import {
 	parsePrState,
 	ghPrViewArgs,
 	githubPrUrlFor,
-	isGraphqlPrNotFound,
 	normalizeGithubSlug,
 	pidAlive,
 	printedLandCommand,
@@ -75,7 +74,6 @@ import {
 	readLiveRound,
 	waiterLogSaysTerminal,
 	waiterVerdictIsMissingPr,
-	waiterVerdictIsRestMissingPr,
 	waiterManualFilesOwnedBy,
 	waiterPidFilesOwnedBy,
 	referenceCheckoutFor,
@@ -670,7 +668,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			const next = readWaiterVerdict(path)?.lastNext;
 			if (next && (TERMINAL_NEXT.has(next) || MECHANICAL.has(next))) return true;
 		}
-		return latch ? waiterLogSaysTerminal(latch.pr) : false;
+		return latch ? waiterLogSaysTerminal(latch.pr, stateDir(), latch) : false;
 	}
 
 	/**
@@ -766,14 +764,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			break;
 		}
 		if (!hit) return;
-		// REST 404 on get-a-pull-request is a missing PR, not an env fix.
-		if (waiterVerdictIsRestMissingPr(hit.verdict)) {
-			await finishTerminal(ctx, latch, "closed");
-			return;
-		}
-		// GraphQL not-found is also private/no-access. Close only if prState can
-		// still see the repository; otherwise do not wake a fix.
-		if (isGraphqlPrNotFound(hit.verdict ?? "")) {
+		// REST 404 and GraphQL not-found are missing-PR *or* private/no-access.
+		// Close only when prState can still see the repository; otherwise keep the latch.
+		if (waiterVerdictIsMissingPr(hit.verdict)) {
 			const state = await prState(latch.pr, latch.cwd, latch.slug);
 			if (state === "merged" || state === "closed") {
 				await finishTerminal(ctx, latch, state);

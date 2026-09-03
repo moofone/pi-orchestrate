@@ -1196,9 +1196,17 @@ test("a REST 404 on get-a-pull-request is closed when the repo is visible", asyn
 
 test("waiter REST 404 ACTIONABLE is closed, not fix_command_or_environment", async () => {
 	// Live: drive-pi-subagents-2150.log next=fix_command_or_environment for a
-	// missing PR. gh may still look OPEN (wrong-repo leftover). Do not wake a fix.
+	// missing PR. Close only when the repository itself is still visible.
 	const YIELD_OUT = ["status=handed_off", "next=yield", "pr=2150", "instruction=stop_talking", ""].join("\n");
-	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(YIELD_OUT)), PI_SUB);
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok(YIELD_OUT);
+			if (args[0] === "pr") return REST_PR_404_EXEC;
+			if (args[0] === "repo") return ok('{"name":"pi-subagents"}');
+			return REST_PR_404_EXEC;
+		},
+		PI_SUB,
+	);
 	try {
 		await h.start();
 		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, YIELD_OUT);
@@ -1219,6 +1227,49 @@ test("waiter REST 404 ACTIONABLE is closed, not fix_command_or_environment", asy
 		assert.equal(h.wakes.length, 1, `got ${h.wakes.join(" | ")}`);
 		assert.match(h.wake(0), /2150 closed without merging/);
 		assert.doesNotMatch(h.wake(0), /fix_command_or_environment/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("REST 404 ACTIONABLE does not close when the repo is not visible", async () => {
+	const UNAUTH = {
+		stdout: "",
+		stderr: "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+		code: 1,
+		killed: false,
+	};
+	const YIELD_OUT = ["status=handed_off", "next=yield", "pr=2150", "instruction=stop_talking", ""].join("\n");
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok(YIELD_OUT);
+			if (args[0] === "pr") return REST_PR_404_EXEC;
+			return UNAUTH;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, YIELD_OUT);
+		await h.settle();
+		await sleep(40);
+		writeFileSync(
+			waiterState(h.dir, "2150", "pi-subagents"),
+			JSON.stringify({
+				pr: "2150",
+				cwd: PI_SUB,
+				lastNext: "fix_command_or_environment",
+				verdictDelivered: false,
+				verdict: ["status=error", "next=fix_command_or_environment", `error=${REST_PR_404}`].join("\n"),
+			}),
+		);
+		await h.settle();
+		await sleep(80);
+		assert.equal(
+			h.wakes.length,
+			0,
+			`private/no-access REST 404 must not close or fix; got ${h.wakes.join(" | ")}`,
+		);
 	} finally {
 		h.cleanup();
 	}
@@ -2280,6 +2331,18 @@ test("waiterVerdictIsMissingPr: REST/GraphQL missing PR, not rate-limit or a rea
 		waiterLogSaysTerminal("2150", dir),
 		false,
 		"GraphQL not-found is also private/no-access; the log path has no repo-visibility check",
+	);
+
+	writeFileSync(
+		join(dir, "drive-icemining-devops-2150.log"),
+		[`status=error`, `next=fix_command_or_environment`, `error=${REST_PR_404}`, ""].join("\n"),
+	);
+	writeFileSync(join(dir, "drive-pi-subagents-2150.log"), "next=poll_again\n");
+	const ice = join(homedir(), "Dev", "git", "ice-wt", "feat-scope-log");
+	assert.equal(
+		waiterLogSaysTerminal("2150", dir, { cwd: ice }),
+		false,
+		"another repo's same-number REST 404 must not close this latch",
 	);
 	rmSync(dir, { recursive: true, force: true });
 });

@@ -1139,8 +1139,21 @@ export function waiterLogFiles(pr: string, dir = stateDir()): string[] {
 	return waiterFilesFor(pr, "drive", "log", dir);
 }
 
-export function waiterLogSaysTerminal(pr: string, dir = stateDir()): boolean {
-	for (const path of waiterLogFiles(pr, dir)) {
+export function waiterLogFilesOwnedBy(
+	pr: string,
+	dir: string,
+	owner: { cwd?: string; slug?: string },
+): string[] {
+	return waiterFilesOwnedBy(pr, "drive", "log", dir, owner);
+}
+
+export function waiterLogSaysTerminal(
+	pr: string,
+	dir = stateDir(),
+	owner?: { cwd?: string; slug?: string },
+): boolean {
+	const paths = owner ? waiterLogFilesOwnedBy(pr, dir, owner) : waiterLogFiles(pr, dir);
+	for (const path of paths) {
 		let text = "";
 		try {
 			text = readFileSync(path, "utf8");
