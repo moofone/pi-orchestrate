@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { overlayTodosFromFeature } from "../src/lib/overlay.ts";
+import { overlayTodosFromFeature, overlayWidgetLines } from "../src/lib/overlay.ts";
 
 test("overlay: Task N keeps plan id and blocked maps to pending", () => {
   const plan = [
@@ -73,4 +73,28 @@ test("overlay: plan-reviewer in_progress never shares the board with a Task", ()
     1,
     "exactly one in_progress while reviewing: writers are blocked, Tasks stay pending",
   );
+});
+
+test("overlay: widget lines keep every Feature row past Pi's 10-line string cap", () => {
+  const plan = [
+    "### Task 1 — one",
+    "- Status: done",
+    "### Task 2 — two",
+    "- Status: done",
+    "### Task 3 — three",
+    "- Status: done",
+    "### Task 4 — four",
+    "- Status: done",
+    "### Task 5 — five",
+    "- Status: in_progress",
+  ].join("\n");
+  const todos = overlayTodosFromFeature(
+    plan,
+    ["phase: implementing", "plan_review: done", "qa_pass: 0", "qa_pass_cap: 2"].join("\n"),
+  );
+  const lines = overlayWidgetLines(todos);
+  assert.equal(todos.length, 10, "planner + reviewer + approve + 5 tasks + two QA passes");
+  assert.ok(lines.length > 10, "heading + 10 rows already exceeds MAX_WIDGET_LINES");
+  assert.ok(lines.some((line) => line.includes("feature-qa 2/2")), "the last QA pass is not clipped");
+  assert.doesNotMatch(lines.join("\n"), /widget truncated/);
 });
