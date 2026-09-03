@@ -1258,6 +1258,53 @@ test("GraphQL not-found with an inaccessible repo is not a closed wake", async (
 	}
 });
 
+test("/reload of an observed foreign-slug merged latch wakes and does not spawn", async () => {
+	// Live: pi-subagents /reload re-read pi-01a06448…latch.json (icemining#2150,
+	// merged 2026-08-25). session_start called handoff({ wakeOnTerminal: false }),
+	// the comment said "the user is not here", chrome kept waiting, and the
+	// waiter 404-looped in pi-subagents origin.
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok("[]");
+			if (args[0] === "pr" && args[1] === "view" && String(args[2]) === "2150") {
+				return ghRepo(args) === "moofone/icemining" ? MERGED : NOT_IN_THIS_REPO;
+			}
+			if (args[0] === "repo" && args[1] === "view") return ok('{"name":"icemining"}');
+			return NOT_IN_THIS_REPO;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		writeFileSync(
+			join(h.dir, `pi-${h.sessionId}.latch.json`),
+			JSON.stringify({
+				pr: "2150",
+				cwd: PI_SUB,
+				url: "https://github.com/moofone/icemining/pull/2150",
+				slug: "moofone/icemining",
+				origin: "observed",
+			}),
+		);
+		await h.start();
+		await sleep(80);
+		assert.equal(
+			h.spawns.length,
+			0,
+			`must not respawn a waiter on /reload; got ${h.spawns.map((s) => s.join(" ")).join(" | ")}`,
+		);
+		assert.equal(h.wakes.length, 1, `/reload user is here; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /2150 merged/);
+		assert.equal(
+			existsSync(join(h.dir, `pi-${h.sessionId}.latch.json`)),
+			false,
+			"terminal latch must not survive /reload to spin again",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("defaultSpawnDriver never falls back to HOME or process.cwd()", async () => {
 	const homeResult = defaultSpawnDriver(join(DRIVER_PROBE_DIR, "home-state.json"), {
 		pr: "2163",

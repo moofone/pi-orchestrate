@@ -1130,10 +1130,12 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		// written — a waiter rewrite read back as a session latch (F20).
 		latch = readLatchFile(latchFile);
 		if (latch) {
-			// Same-session reload. The previous process may have died without the
-			// waiter, so re-ensure it, but do not wake: the user is not here.
+			// Same-session `/reload`. The user is in this chat: an observed latch
+			// that is already merged must inject continue, not toast-and-spin.
+			// Adopted/discovered stay notify-only (the "user is not here" case is a
+			// successor session, handled below).
 			deferralActive = (latch.origin ?? "adopted") === "observed";
-			if (!disabled) void handoff(ctx, { wakeOnTerminal: false });
+			if (!disabled) void handoff(ctx, { wakeOnTerminal: deferralActive });
 			return;
 		}
 
