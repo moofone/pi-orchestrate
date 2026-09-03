@@ -2642,6 +2642,21 @@ test("L4: the skill still leaves a solo session its own latch, verdict, and fix"
   );
 });
 
+test("parent PR-phase prompt says code injects the next message", () => {
+  const wake = orch.parentGitWorkflowAppend({ latchWake: true }) as string;
+  assert.match(wake, /inject|code/, "says the wake is code-owned");
+  assert.match(wake, /next=yield/);
+  assert.doesNotMatch(
+    wake,
+    /git-workflow\/SKILL\.md/,
+    "the latch wake does not force a git-workflow skill read",
+  );
+  assert.doesNotMatch(wake, /I will not talk/, "no idle promise covers a code-owned wake");
+  assert.doesNotMatch(wake, /Stay idle/, "a solo latch wake still gets to fix");
+  const idle = orch.parentGitWorkflowAppend({ featureLive: true }) as string;
+  assert.match(idle, /Stay idle/, "the Feature parent stays idle");
+});
+
 test("L4: parentGitWorkflowAppend forces a skill read and keeps a Feature parent idle", () => {
   assert.equal(typeof orch.parentGitWorkflowAppend, "function");
   assert.equal(orch.parentGitWorkflowAppend({}), undefined, "unrelated sessions stay unprompted");
@@ -2652,7 +2667,12 @@ test("L4: parentGitWorkflowAppend forces a skill read and keeps a Feature parent
   assert.match(idle, /Stay idle/);
   assert.match(idle, /keeps dispatching while review data still says read_comments_and_fix/);
   const wake = orch.parentGitWorkflowAppend({ latchWake: true }) as string;
-  assert.match(wake, /git-workflow\/SKILL\.md/);
+  assert.doesNotMatch(
+    wake,
+    /git-workflow\/SKILL\.md/,
+    "a solo latch wake is not forced to read the skill (L5)",
+  );
+  assert.match(wake, /next=yield/, "the wake says code injects the next turn");
   assert.doesNotMatch(wake, /Stay idle/, "a solo latch wake still gets to fix");
 });
 
