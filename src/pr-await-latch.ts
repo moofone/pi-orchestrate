@@ -61,6 +61,7 @@ import {
 	parsePrState,
 	ghPrViewArgs,
 	githubPrUrlFor,
+	isGraphqlPrNotFound,
 	normalizeGithubSlug,
 	pidAlive,
 	printedLandCommand,
@@ -74,6 +75,9 @@ import {
 	readLiveRound,
 	waiterLogSaysTerminal,
 	waiterVerdictIsMissingPr,
+	waiterVerdictIsRestMissingPr,
+	waiterManualFilesOwnedBy,
+	waiterPidFilesOwnedBy,
 	referenceCheckoutFor,
 	repoKey,
 	resolveQueryCwd,
@@ -594,7 +598,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		// Spent bookkeeping: a waiter-written `manual-<pr>.json` for a PR that is
 		// already over must not be re-adopted. Leaving it is how
 		// `manual-pi-subagents-2150.json` survived icemining#2150's merge.
-		for (const path of waiterManualFiles(s.pr, stateDir())) {
+		for (const path of waiterManualFilesOwnedBy(s.pr, stateDir(), s)) {
 			try {
 				rmSync(path, { force: true });
 			} catch {
@@ -605,7 +609,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		notify(ctx, toastText(s, state));
 		// A 404 waiter keeps REST-polling after the latch is spent. SIGTERM it
 		// here: `/pr-latch clear` already does, and a terminal PR is the same end.
-		killDriver(s.pr);
+		killDriver(s.pr, s);
 		// Wake while deferralActive is still set; setLatch(undefined) clears it.
 		if (opts.wake !== false) wakeParent(ctx, resumeText(s, state, opts.owner));
 		setLatch(undefined);
@@ -762,11 +766,18 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			break;
 		}
 		if (!hit) return;
-		// Waiter REST 404 on get-a-pull-request is a missing PR, not an env fix.
-		// Live: lastNext=fix_command_or_environment while gh may still look OPEN
-		// (wrong-repo leftover). Close the latch; do not wake a fix.
-		if (waiterVerdictIsMissingPr(hit.verdict)) {
+		// REST 404 on get-a-pull-request is a missing PR, not an env fix.
+		if (waiterVerdictIsRestMissingPr(hit.verdict)) {
 			await finishTerminal(ctx, latch, "closed");
+			return;
+		}
+		// GraphQL not-found is also private/no-access. Close only if prState can
+		// still see the repository; otherwise do not wake a fix.
+		if (isGraphqlPrNotFound(hit.verdict ?? "")) {
+			const state = await prState(latch.pr, latch.cwd, latch.slug);
+			if (state === "merged" || state === "closed") {
+				await finishTerminal(ctx, latch, state);
+			}
 			return;
 		}
 		const fp = actionableFingerprint({
@@ -1071,10 +1082,12 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 	}
 
-	function killDriver(pr: string): void {
-		// Both spellings: `/pr-latch clear` promises the waiter is stopped, and
-		// leaving the repo-qualified daemon alive would keep polling GitHub.
-		for (const path of waiterPidFiles(pr, stateDir())) {
+	function killDriver(pr: string, owner?: { cwd?: string; slug?: string }): void {
+		// Repo-scoped: a terminal icemining#N must not SIGTERM icemining-devops#N.
+		const files = owner
+			? waiterPidFilesOwnedBy(pr, stateDir(), owner)
+			: waiterPidFiles(pr, stateDir());
+		for (const path of files) {
 			let pid = 0;
 			try {
 				pid = Number(readFileSync(path, "utf8").trim());
@@ -1221,7 +1234,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			const arg = args.trim();
 			if (arg === "clear") {
 				stopWatch();
-				if (latch) killDriver(latch.pr);
+				if (latch) killDriver(latch.pr, latch);
 				setLatch(undefined);
 				status(ctx);
 				ctx.ui.notify("pr-latch cleared (waiter stopped)", "info");

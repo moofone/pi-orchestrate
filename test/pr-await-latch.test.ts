@@ -8,6 +8,7 @@
  */
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -74,6 +75,7 @@ const {
 	parsePrState,
 	waiterVerdictIsMissingPr,
 	waiterLogSaysTerminal,
+	pidAlive,
 	isExtensionOwnedStateFile,
 	readLiveRound,
 	repoKey,
@@ -1222,6 +1224,51 @@ test("waiter REST 404 ACTIONABLE is closed, not fix_command_or_environment", asy
 	}
 });
 
+test("GraphQL not-found ACTIONABLE does not close without a visible repo", async () => {
+	// Same missing-PR GraphQL string as private/no-access. Unlike REST 404,
+	// this must not finishTerminal until gh repo view succeeds (prState).
+	const UNAUTH = {
+		stdout: "",
+		stderr: "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+		code: 1,
+		killed: false,
+	};
+	const YIELD_OUT = ["status=handed_off", "next=yield", "pr=2150", "instruction=stop_talking", ""].join("\n");
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok(YIELD_OUT);
+			if (args[0] === "pr") return NOT_IN_THIS_REPO;
+			return UNAUTH;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, YIELD_OUT);
+		await h.settle();
+		await sleep(40);
+		writeFileSync(
+			waiterState(h.dir, "2150", "pi-subagents"),
+			JSON.stringify({
+				pr: "2150",
+				cwd: PI_SUB,
+				lastNext: "fix_command_or_environment",
+				verdictDelivered: false,
+				verdict: [
+					"status=error",
+					"next=fix_command_or_environment",
+					"error=GraphQL: Could not resolve to a PullRequest with the number of 2150. (repository.pullRequest)",
+				].join("\n"),
+			}),
+		);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, `auth/permission GraphQL must not close or fix; got ${h.wakes.join(" | ")}`);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("absorb ignores a GitHub URL whose pull number is not the awaited PR", async () => {
 	const YIELD_OUT = [
 		"https://github.com/moofone/icemining/pull/2150",
@@ -1479,6 +1526,35 @@ test("reload does not re-arm a manual latch whose PR REST-404s", async () => {
 		assert.equal(h.spawns.length, 0, "must not spawn a 404 waiter for a missing PR");
 		assert.equal(existsSync(spent), false, "REST 404 is closed; retire the manual latch");
 	} finally {
+		h.cleanup();
+	}
+});
+
+test("a terminal latch does not delete or SIGTERM another repo's same-number waiter", async () => {
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "__scope_cleanup__");
+	const DEVOPS = join(homedir(), "Dev", "git", "devops-wt", "feat-other-475");
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT);
+	const ours = join(h.dir, "manual-9963.json");
+	const theirs = join(h.dir, "manual-icemining-devops-9963.json");
+	const theirPid = join(h.dir, "drive-icemining-devops-9963.pid");
+	writeFileSync(ours, JSON.stringify({ pr: "9963", cwd: WT }));
+	writeFileSync(theirs, JSON.stringify({ pr: "9963", cwd: DEVOPS }));
+	const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+	child.unref();
+	writeFileSync(theirPid, String(child.pid));
+	try {
+		await h.start({ reason: "reload" });
+		await sleep(120);
+		assert.equal(existsSync(ours), false, "this repo's spent manual latch is retired");
+		assert.equal(existsSync(theirs), true, "icemining-devops#9963 must survive icemining#9963 closing");
+		assert.equal(existsSync(theirPid), true);
+		assert.equal(pidAlive(child.pid!), true, "must not SIGTERM the other repo's waiter");
+	} finally {
+		try {
+			if (child.pid) process.kill(child.pid, "SIGTERM");
+		} catch {
+			/* already gone */
+		}
 		h.cleanup();
 	}
 });
@@ -2190,6 +2266,21 @@ test("waiterVerdictIsMissingPr: REST/GraphQL missing PR, not rate-limit or a rea
 	);
 	assert.equal(waiterLogSaysTerminal("2150", dir), true, "drive log 404 is terminal");
 	assert.equal(waiterLogSaysTerminal("2142", dir), false);
+
+	writeFileSync(
+		join(dir, "drive-pi-subagents-2150.log"),
+		[
+			"status=error",
+			"next=fix_command_or_environment",
+			"error=GraphQL: Could not resolve to a PullRequest with the number of 2150. (repository.pullRequest)",
+			"",
+		].join("\n"),
+	);
+	assert.equal(
+		waiterLogSaysTerminal("2150", dir),
+		false,
+		"GraphQL not-found is also private/no-access; the log path has no repo-visibility check",
+	);
 	rmSync(dir, { recursive: true, force: true });
 });
 
