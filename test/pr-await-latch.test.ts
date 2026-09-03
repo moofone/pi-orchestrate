@@ -726,33 +726,6 @@ test("a fresh session in the reference checkout does not inherit a worktree latc
 	}
 });
 
-test("a later user prompt cancels the deferred-work wake", async () => {
-	let view = OPEN;
-	const h = harness(
-		(cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)),
-		REPO,
-		{ watchMs: 20 },
-	);
-	await h.start();
-	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
-	await h.settle();
-	await sleep(40);
-	assert.equal(h.wakes.length, 0);
-	await h.input("check git-workflow, tdd-worker should not open PRs");
-	view = MERGED;
-	await sleep(80);
-	assert.equal(
-		h.wakes.length,
-		0,
-		`moved-on session must not be told it deferred this merge; got ${h.wakes.join(" | ")}`,
-	);
-	assert.ok(
-		h.notifies.some((n) => /2142/.test(n) && /merged/.test(n)),
-		`toast still reports the merge; got ${h.notifies.join(" | ")}`,
-	);
-	h.cleanup();
-});
-
 test("a latch from another repository is never adopted", async () => {
 	// The live failure: an icemining chat adopted the icemining-devops#475 latch
 	// and was told to continue work it had never started.
@@ -2033,6 +2006,112 @@ test("P5 F20: a waiter rewrite is not a latch, even after a reload under the sam
 
 /** A live wait with fs.watch armed and a backstop far too slow to be the cause. */
 const watchOnly = { watchMs: 600_000, chromeMs: 0 } as const;
+
+test("observed Feature-owned merge wakes once after the user pastes the PR URL", async () => {
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { name: "release-build-timing-record", pr: "2242" });
+	const prUrl2242 = "https://github.com/moofone/icemining/pull/2242";
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2242",
+			cwd: REPO,
+			lastNext: "yield",
+			url: prUrl2242,
+		});
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "must not wake while the PR is still OPEN");
+		await h.input(prUrl2242);
+		assert.equal(h.wakes.length, 0, "pasting the PR URL must not itself wake");
+		view = MERGED;
+		writeFileSync(join(h.dir, "drive-icemining-2242.log"), "status=landed\n");
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`observed Feature merge must wake once after user input; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2242 merged/);
+		assert.match(h.wake(0), /https:\/\/github\.com\/moofone\/icemining\/pull\/2242/);
+		assert.match(h.wake(0), /Feature release-build-timing-record is complete/);
+		assert.match(h.wake(0), /Confirm to the user/);
+		assert.match(h.wake(0), /Do not run git pr-land or git wt-rm/);
+		assert.doesNotMatch(
+			h.wake(0),
+			/Continue the work you deferred/,
+			`Feature-owned wake must not claim deferred work; got ${h.wake(0)}`,
+		);
+		assert.equal(h.dispatches.length, 1, "merge must dispatch next=done exactly once");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		writeFileSync(join(h.dir, "drive-icemining-2242.log"), "status=landed\nnext=done\n", { flag: "a" });
+		await sleep(500);
+		assert.equal(h.wakes.length, 1, `terminalWoken must reject a second wake; got ${h.wakes.join(" | ")}`);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("solo observed merge still wakes after an unrelated prompt", async () => {
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0);
+		await h.input("check git-workflow, tdd-worker should not open PRs");
+		view = MERGED;
+		const path = waiterState(h.dir);
+		const cur = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		writeFileSync(path, JSON.stringify({ ...cur, lastNext: "done" }));
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`solo observed must still wake after an unrelated prompt; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.match(h.wake(0), /Continue the work you deferred/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("adopted latch plus an unrelated prompt does not wake", async () => {
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_prompt__");
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok("[]")), WT, watchOnly);
+	writeFileSync(
+		join(h.dir, "pi-DEAD-ADOPT.latch.json"),
+		JSON.stringify({ pr: "2142", cwd: WT, origin: "observed", pid: 999999 }),
+	);
+	try {
+		await h.start({ reason: "reload" });
+		await sleep(120);
+		assert.equal(h.wakes.length, 0, "open adopted latch must not wake yet");
+		await h.input("check git-workflow, tdd-worker should not open PRs");
+		view = MERGED;
+		const path = waiterState(h.dir);
+		const cur = existsSync(path)
+			? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
+			: { pr: "2142", cwd: WT };
+		writeFileSync(path, JSON.stringify({ ...cur, lastNext: "done" }));
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			0,
+			`adopted latch after a later prompt must toast only; got ${h.wakes.join(" | ")}`,
+		);
+		assert.ok(
+			h.notifies.some((n) => /2142/.test(n) && /merged/.test(n)),
+			`toast still reports the merge; got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
 
 test("P5 F18: the GitHub backstop is minutes, not the old 15s poll", () => {
 	assert.equal(WATCH_BACKSTOP_MS, 600_000);

@@ -245,8 +245,10 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	let lastRefusedFingerprint: string | undefined;
 	/**
 	 * True only while this session is actually waiting. absorb / armObservedLatch
-	 * set it; a later user prompt clears it so a merge cannot hijack a chat that
-	 * has moved on (icemining#2150 into an unrelated git-workflow conversation).
+	 * set it for `observed`; adoption sets it for a successor. A later user prompt
+	 * cancels `adopted` / `discovered` so a guess cannot hijack a chat that has
+	 * moved on (icemining#2150). An `observed` latch stays armed — the only
+	 * explicit cancel is `/pr-latch clear`.
 	 */
 	let deferralActive = false;
 	const watchMs = hooks.watchMs ?? WATCH_BACKSTOP_MS;
@@ -488,10 +490,17 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * often is: an unrelated chat once received `Continue the work you deferred`
 	 * for a devops PR it had never heard of.
 	 */
-	function resumeText(s: LatchState, state: "merged" | "closed"): string {
+	function resumeText(s: LatchState, state: "merged" | "closed", owner?: FeaturePrOwner): string {
 		const label = prLabel(s);
 		const where = s.url ? ` (${s.url})` : "";
 		const outcome = state === "merged" ? "merged" : "closed without merging";
+		if (owner) {
+			return (
+				`pr-latch: ${label} ${outcome}${where}. ` +
+				`Feature ${owner.name} is complete. Confirm to the user. ` +
+				`Do not run git pr-land or git wt-rm.`
+			);
+		}
 		if ((s.origin ?? "adopted") === "observed") {
 			return state === "merged"
 				? `pr-latch: ${label} merged${where}. Continue the work you deferred until this merge. Do not wait for another user message.`
@@ -554,7 +563,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		ctx: ExtensionContext,
 		s: LatchState,
 		state: "merged" | "closed",
-		opts: { wake: boolean } = { wake: true },
+		opts: { wake?: boolean; owner?: FeaturePrOwner } = { wake: true },
 	): Promise<void> {
 		if (terminalWoken) return;
 		terminalWoken = true;
@@ -575,7 +584,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		status(ctx);
 		notify(ctx, toastText(s, state));
 		// Wake while deferralActive is still set; setLatch(undefined) clears it.
-		if (opts.wake) wakeParent(ctx, resumeText(s, state));
+		if (opts.wake !== false) wakeParent(ctx, resumeText(s, state, opts.owner));
 		setLatch(undefined);
 	}
 
@@ -613,7 +622,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				);
 			}
 		}
-		await reportTerminal(ctx, s, state, opts);
+		await reportTerminal(ctx, s, state, { ...opts, owner });
 	}
 
 	/**
@@ -1100,9 +1109,13 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	pi.on("input", async (event) => {
 		const source =
 			event && typeof event === "object" ? (event as { source?: unknown }).source : undefined;
-		// Our own merge/ACTIONABLE injection is source "extension". A real user
-		// prompt means this session has moved on; toast on merge, do not hijack.
-		if (source !== "extension") deferralActive = false;
+		// Our own merge/ACTIONABLE injection is source "extension". A later prompt
+		// cancels adopted/discovered (missing origin counts as adopted). Observed
+		// stays armed: pasting the PR URL is not "moved on"; `/pr-latch clear` is.
+		if (source !== "extension") {
+			const origin = latch?.origin ?? "adopted";
+			if (origin === "adopted" || origin === "discovered") deferralActive = false;
+		}
 		return { action: "continue" as const };
 	});
 
