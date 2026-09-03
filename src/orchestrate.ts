@@ -3543,7 +3543,8 @@ export function parseQaFindings(raw: unknown): QaFinding[] {
       severity,
       title,
       goal: String(f.goal ?? "").trim(),
-      complexity: String(f.complexity ?? "").toLowerCase() === "critical" ? "critical" : "simple",
+      // Child complexity is ignored: remediations always use the critical tdd-worker.
+      complexity: "critical",
       read: Array.isArray(f.read) ? f.read.map(String) : undefined,
       redTest: String(f.redTest ?? "").trim(),
       command: String(f.command ?? "").trim(),
@@ -3557,13 +3558,13 @@ export function parseQaFindings(raw: unknown): QaFinding[] {
 }
 
 export function renderQaTask(finding: QaFinding, id: number): string {
-  const worker = finding.complexity === "critical" ? WORKERS.critical : WORKERS.simple;
+  const worker = WORKERS.critical;
   const list = (values: string[] | undefined) =>
     values && values.length ? values.map((v) => `\`${v}\``).join(", ") : "—";
   return [
     `### Task ${id} — QA: ${finding.title}`,
     `- Status: pending`,
-    `- Complexity: ${finding.complexity}`,
+    `- Complexity: critical`,
     `- Worker: ${worker.model}, thinking ${worker.thinking}`,
     `- Goal: ${finding.goal || finding.title}`,
     `- Read: ${list(finding.read)}`,
@@ -5244,7 +5245,8 @@ export function qaLaunchParams(
       "",
       `Classify every finding as blocker | fix-now | defer | correct, with file:line evidence.`,
       `For each blocker and fix-now, return a complete tdd-worker contract:`,
-      `goal, complexity (simple|critical), read, redTest, command, implement, invariants, outOfTask.`,
+      `goal, complexity, read, redTest, command, implement, invariants, outOfTask.`,
+      `Remediation Tasks always launch as critical tdd-worker. Do not mark them simple.`,
       `The command must be a real, runnable red/green command for this repo.`,
       `Return findings through the structured output schema. Defer and correct are recorded but never become Tasks.`,
     ].join("\n"),
