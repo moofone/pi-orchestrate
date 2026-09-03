@@ -59,6 +59,7 @@ import {
 	parseAwaitCall,
 	parseField,
 	parsePrState,
+	ghPrViewArgs,
 	pidAlive,
 	printedLandCommand,
 	isReferenceCheckout,
@@ -701,7 +702,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			stopWatch();
 			return;
 		}
-		const state = await prState(latch.pr, latch.cwd);
+		const state = await prState(latch.pr, latch.cwd, latch.slug);
 		if (state === "merged" || state === "closed") {
 			await finishTerminal(ctx, latch, state);
 		}
@@ -840,12 +841,26 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 	}
 
-	async function prState(pr: string, cwd: string): Promise<ReturnType<typeof parsePrState>> {
+	async function prState(pr: string, cwd: string, slug?: string): Promise<ReturnType<typeof parsePrState>> {
+		const args = ghPrViewArgs(pr, slug);
+		// With `--repo`, cwd is only for gh auth/context. Do not fall back to a
+		// cwd-only view: that 404 is not "still open", it is the wrong repository.
+		if (slug) {
+			const tried = new Set<string>();
+			for (const candidate of [resolveQueryCwd(cwd), cwd, referenceCheckoutFor(cwd)]) {
+				if (!candidate || tried.has(candidate)) continue;
+				tried.add(candidate);
+				const { out, ok } = await sh("gh", args, candidate);
+				const st = parsePrState(out, ok);
+				if (st !== "unknown") return st;
+			}
+			return "unknown";
+		}
 		const tried = new Set<string>();
 		for (const candidate of [resolveQueryCwd(cwd), cwd, referenceCheckoutFor(cwd)]) {
 			if (!candidate || tried.has(candidate)) continue;
 			tried.add(candidate);
-			const { out, ok } = await sh("gh", ["pr", "view", pr, "--json", "state,mergedAt"], candidate);
+			const { out, ok } = await sh("gh", args, candidate);
 			const st = parsePrState(out, ok);
 			if (st !== "unknown") return st;
 		}
@@ -931,7 +946,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		try {
 			if (!latch) return;
 
-			const state = await prState(latch.pr, latch.cwd);
+			const state = await prState(latch.pr, latch.cwd, latch.slug);
 			if (state === "closed" || state === "merged") {
 				await finishTerminal(ctx, latch, state, { wake: !!opts.wakeOnTerminal });
 				return;
@@ -966,6 +981,15 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 
 			const running = driverRunning(latch.pr);
 			if (!running && !spawnCwdFor(latch)) {
+				// Slug is a different GitHub repo than this checkout's origin
+				// (icemining#2150 from pi-subagents, nicobailon#1831 from the fork).
+				// `ghl-pr-await` would 404-loop here. Watch via `gh --repo` instead.
+				if (latch.slug) {
+					status(ctx, `pr-await ${prLabel(latch)} · watching`);
+					startWatch(ctx);
+					await checkActionable(ctx);
+					return;
+				}
 				// An open PR with no waiter and nowhere to start one. Say so loudly:
 				// silence here is what left icemining#2163 open with a dead daemon.
 				status(ctx, `pr-await ${prLabel(latch)} · NO WAITER`);
