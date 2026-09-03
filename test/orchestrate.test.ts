@@ -4147,6 +4147,62 @@ test("T3: QA findings, Tasks, and qa_pass_cap are bounded", () => {
   assert.equal([...plan.matchAll(/^### Task /gm)].length, 9, "1 existing + 8 appended");
 });
 
+test("T3: QA remediations are always critical tdd-worker, even if the finding says simple", () => {
+  const parsed = orch.parseQaFindings({
+    findings: [
+      {
+        severity: "blocker",
+        title: "Pearl live HashrateSampleRecorded still persists",
+        goal: "never persist Pearl live nethash",
+        complexity: "simple",
+        redTest: "pearl_live_hashrate_sample_does_not_record_hashrate",
+        command: "true",
+        implement: "gate HashrateSampleRecorded",
+      },
+      {
+        severity: "defer",
+        title: "docs only",
+        goal: "g",
+        complexity: "simple",
+        redTest: "t",
+        command: "true",
+        implement: "i",
+      },
+    ],
+  });
+  assert.equal(parsed.length, 1, "defer never becomes a Task");
+  assert.equal(parsed[0]?.complexity, "critical");
+
+  const dir = mkdtempSync(join(tmpdir(), "orch-qa-critical-"));
+  const planFile = join(dir, "plan.md");
+  writeFileSync(
+    planFile,
+    "# Feature: cap\n\n> Status: APPROVED\n\n## Tasks\n\n### Task 1 — already\n- Status: done\n- Complexity: simple\n",
+  );
+  const added = orch.appendQaTasks(
+    { planFile, handoffsDir: join(dir, "handoffs") } as never,
+    parsed,
+  );
+  assert.equal(added, 1);
+  const plan = readFileSync(planFile, "utf8");
+  assert.match(plan, /### Task 2 — QA: Pearl live HashrateSampleRecorded still persists/);
+  assert.match(plan, /- Complexity: critical/);
+  assert.match(plan, /- Worker: cursor\/grok-4.6, thinking medium/);
+  assert.equal(
+    [...plan.matchAll(/- Complexity: simple/g)].length,
+    1,
+    "only the original Task 1 stays simple",
+  );
+
+  const params = orch.qaLaunchParams(
+    { planFile, handoffsDir: join(dir, "handoffs") } as never,
+    "chart-ingest-bleed-stop",
+    "/tmp/wt",
+    "feature-qa",
+  );
+  assert.match(String(params.task), /always launch as critical tdd-worker/);
+});
+
 test("T4: worktree farm is per-repo, not always ice-wt", () => {
   assert.equal(typeof orch.worktreeFarmFor, "function");
   const farm = orch.worktreeFarmFor as (repo: string) => string;
