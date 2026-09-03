@@ -4360,7 +4360,7 @@ type OverlayTodo = {
   status: "pending" | "in_progress" | "completed";
   activeForm?: string;
   blockedBy?: number[];
-  metadata?: { kind: "planner" | "plan-reviewer" | "task" | "qa"; taskId?: string; qaPass?: number };
+  metadata?: { kind: "planner" | "plan-reviewer" | "approve" | "task" | "qa"; taskId?: string; qaPass?: number };
 };
 
 function overlayTodos(plan: string, status: string): OverlayTodo[] {
@@ -4396,6 +4396,7 @@ test("overlay: Task N id is the plan id; done/in_progress/pending/blocked map de
     [
       { id: 1001, status: "completed", subject: "Planner", kind: "planner" },
       { id: 1002, status: "completed", subject: "Plan reviewer", kind: "plan-reviewer" },
+      { id: 1003, status: "completed", subject: "Approve", kind: "approve" },
       { id: 1, status: "completed", subject: "Task 1 — one", kind: "task" },
       { id: 2, status: "in_progress", subject: "Task 2 — two", kind: "task" },
       { id: 3, status: "pending", subject: "Task 3 — three", kind: "task" },
@@ -4406,7 +4407,8 @@ test("overlay: Task N id is the plan id; done/in_progress/pending/blocked map de
   assert.equal(taskTodos[1]?.activeForm, "implementing Task 2");
   assert.equal(taskTodos[0]?.activeForm, undefined);
   assert.deepEqual(todos[1]?.blockedBy, [1001]);
-  assert.deepEqual(taskTodos[0]?.blockedBy, [1002]);
+  assert.deepEqual(todos[2]?.blockedBy, [1002]);
+  assert.deepEqual(taskTodos[0]?.blockedBy, [1003]);
   assert.deepEqual(taskTodos[1]?.blockedBy, [1]);
   assert.deepEqual(taskTodos[2]?.blockedBy, [2]);
   assert.equal(
@@ -4425,12 +4427,13 @@ test("overlay: same plan+status always yields the same snapshot (no clocks)", ()
 
 test("overlay: live Feature Tasks plus the owed QA pass", () => {
   const todos = overlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL);
-  assert.equal(todos.length, 8);
+  assert.equal(todos.length, 9);
   assert.deepEqual(
     todos.map((t) => [t.id, t.status, t.metadata?.kind]),
     [
       [1001, "completed", "planner"],
       [1002, "completed", "plan-reviewer"],
+      [1003, "completed", "approve"],
       [1, "completed", "task"],
       [2, "completed", "task"],
       [3, "completed", "task"],
@@ -4487,6 +4490,7 @@ test("overlay: QA remediation Tasks keep their plan ids; QA pass sits after max 
     [
       [1001, "Planner", "completed", "planner"],
       [1002, "Plan reviewer", "completed", "plan-reviewer"],
+      [1003, "Approve", "completed", "approve"],
       [1, "Task 1 — already", "completed", "task"],
       [6, "Task 6 — QA: missing wait arm", "pending", "task"],
       [7, "feature-qa", "completed", "qa"],
@@ -4533,6 +4537,7 @@ test("overlay: planning Feature shows planner then plan-reviewer before any Task
     [
       [1001, "Planner", "in_progress", "planner"],
       [1002, "Plan reviewer", "pending", "plan-reviewer"],
+      [1003, "Approve", "pending", "approve"],
     ],
   );
   assert.equal(todos[0]?.activeForm, "writing Feature plan");
@@ -4542,7 +4547,7 @@ test("overlay: planning Feature shows planner then plan-reviewer before any Task
 test("overlay: colon Task headings still project", () => {
   const todos = overlayTodos(
     "### Task 1: Required manifest rule_set\n- Status: pending\n",
-    "qa_pass_cap: 0\n",
+    "plan_review: done\nqa_pass_cap: 0\n",
   );
   const task = todos.find((t) => t.metadata?.kind === "task");
   assert.equal(task?.id, 1);
@@ -4564,7 +4569,7 @@ test("overlay: syncOverlayTodos publishes the snapshot to the sink, not the mode
     assert.equal(writes[0]?.id, "sess-1");
     assert.deepEqual(writes[0]?.state, snapshot);
     assert.deepEqual(snapshot, orch.projectOverlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL));
-    assert.equal(snapshot.nextId, 1003);
+    assert.equal(snapshot.nextId, 1004);
 
     writes.length = 0;
     orch.setOverlayTodoSink({
@@ -4596,8 +4601,7 @@ test("overlay: plan-reviewer in_progress never shares the board with a Task", ()
     [
       ["planner", "completed"],
       ["plan-reviewer", "in_progress"],
-      ["task", "pending"],
-      ["qa", "pending"],
+      ["approve", "pending"],
     ],
   );
   assert.equal(todos.find((t) => t.metadata?.kind === "plan-reviewer")?.activeForm, "reviewing Feature plan");

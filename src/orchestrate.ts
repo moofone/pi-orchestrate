@@ -32,11 +32,12 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type {
   ExtensionAPI,
@@ -82,7 +83,7 @@ import {
 } from "./lib/lifecycle.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
 import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
-import { projectOverlayTodos, type OverlayTodoState } from "./lib/overlay.ts";
+import { overlayTodosFromFeature, projectOverlayTodos, type OverlayTodoState } from "./lib/overlay.ts";
 import {
   classifyFeaturePrNext,
   fixSpawnCount,
@@ -437,8 +438,16 @@ function promoteLiveFolder(paths: Paths, name: string): string {
     bindFeature(paths, dest);
     return dest;
   }
-  if (paths.featureDir !== dest && existsSync(paths.featureDir) && !existsSync(dest)) {
-    renameSync(paths.featureDir, dest);
+  const src = paths.featureDir;
+  if (src !== dest && existsSync(src) && !existsSync(dest)) {
+    renameSync(src, dest);
+    if (basename(src).startsWith("pending-")) {
+      try {
+        symlinkSync(relative(dirname(src), dest) || name, src);
+      } catch {
+        /* dest is the source of truth */
+      }
+    }
   }
   bindFeature(paths, dest);
   return dest;
@@ -871,6 +880,16 @@ function presentDraftApproveCards(
   } catch (error) {
     if (!isStaleCtxError(error)) throw error;
   }
+}
+
+function formatTodoProgress(paths: Paths, headline: string, extra: string[] = []): string {
+  const todos = overlayTodosFromFeature(readText(paths.planFile), readText(paths.statusFile));
+  const lines = todos.map((t) => {
+    const mark =
+      t.status === "completed" ? "done" : t.status === "in_progress" ? "now" : "pending";
+    return `- ${t.subject} (${mark})`;
+  });
+  return [headline, "", "Todos:", ...lines, ...extra].join("\n");
 }
 
 export function worktreePathFor(branch: string, repo = "icemining"): string {
@@ -2019,6 +2038,7 @@ export {
 export {
   OVERLAY_PLANNER_ID,
   OVERLAY_REVIEWER_ID,
+  OVERLAY_APPROVE_ID,
   overlayTodosFromFeature,
   projectOverlayTodos,
   type OverlayTodo,
@@ -4721,7 +4741,11 @@ async function runFeatureChain(
         activeTask: "none",
         tasks: parseTasks(readText(paths.planFile)),
       });
-      uiNotify(ctx, `Task ${task.id} done (gate: ${gateResult}).`, "info");
+      uiNotify(
+        ctx,
+        formatTodoProgress(paths, `Task ${task.id} done (gate: ${gateResult}).`),
+        "info",
+      );
 
       if (isPaused(readText(paths.statusFile))) {
         upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
@@ -4755,7 +4779,14 @@ async function runFeatureChain(
       if (added < 0) return; // QA itself failed twice; runFeatureQa already reported.
       upsertStatusFile(paths, { qaPass: String(pass + 1) });
       if (added > 0) {
-        uiNotify(ctx, `feature-qa added ${added} remediation Task(s). Continuing.`, "info");
+        uiNotify(
+          ctx,
+          formatTodoProgress(
+            paths,
+            `feature-qa added ${added} remediation Task(s). Next tdd-worker implements them.`,
+          ),
+          "info",
+        );
         continue;
       }
       uiNotify(ctx, "feature-qa found nothing to fix.", "info");
@@ -5421,6 +5452,57 @@ export function liveFeatureNeedsIdleParent(cwd: string, root?: string): boolean 
   });
 }
 
+export function liveFeaturePlanReviewRunning(cwd: string, root?: string): boolean {
+  if (!cwd) return false;
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir,
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(repoDir, "archive"),
+  };
+  const gitRoot = join(REF_ROOT, repo);
+  return discoverFeatures(paths).some((row) => {
+    if (!row.live) return false;
+    if (planReviewState(row.status) !== "running") return false;
+    const worktree = statusField(row.status, "worktree");
+    if (worktree && !isPendingToken(worktree)) return samePath(cwd, worktree);
+    return samePath(cwd, gitRoot);
+  });
+}
+
+export function liveFeatureTaskChain(cwd: string, root?: string): boolean {
+  if (!cwd) return false;
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir,
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(repoDir, "archive"),
+  };
+  const gitRoot = join(REF_ROOT, repo);
+  return discoverFeatures(paths).some((row) => {
+    if (!row.live) return false;
+    const phase = (statusField(row.status, "phase") || "").toLowerCase();
+    if (phase !== "implementing" && phase !== "feature-qa") return false;
+    const worktree = statusField(row.status, "worktree");
+    if (worktree && !isPendingToken(worktree) && samePath(cwd, worktree)) return true;
+    return samePath(cwd, gitRoot);
+  });
+}
+
 /**
  * Forced into the parent system prompt. Skills are progressive-disclosure and
  * models skip the read (git-workflow-guard.ts documents that). Citing the path
@@ -5429,15 +5511,32 @@ export function liveFeatureNeedsIdleParent(cwd: string, root?: string): boolean 
 export function parentGitWorkflowAppend(input: {
   featureLive?: boolean;
   latchWake?: boolean;
+  planReviewRunning?: boolean;
+  taskChain?: boolean;
 }): string | undefined {
-  if (!input.featureLive && !input.latchWake) return undefined;
-  const parts = [
-    `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`,
-  ];
+  if (!input.featureLive && !input.latchWake && !input.planReviewRunning && !input.taskChain) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  if (input.featureLive || input.latchWake) {
+    parts.push(
+      `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`,
+    );
+  }
   if (input.featureLive) {
     parts.push(FORBIDDEN);
     parts.push(
       "A live /orchestrate Feature owns PR work in this session. Stay idle: do not implement product code, do not repair review findings, do not run git pr-await. Code dispatches one fixer per current-head verdict and keeps dispatching while review data still says read_comments_and_fix.",
+    );
+  }
+  if (input.planReviewRunning) {
+    parts.push(
+      "plan-reviewer is still running. Stay quiet. Do NOT summarize the plan as a Task table, todo list, or slice board. Do NOT suggest or run /orchestrate approve. One short line is enough: plan-reviewer is running; wait.",
+    );
+  }
+  if (input.taskChain) {
+    parts.push(
+      "A Feature is running Tasks in this repo. After each tdd-worker or feature-qa child completes, show the current todo list immediately (done/now/pending). Do not wait until all Tasks are done to show progress. Do not spawn tdd-worker; the extension does.",
     );
   }
   return parts.join("\n\n");
@@ -5647,7 +5746,7 @@ async function reviewPlan(
     return false;
   }
   upsertStatusFile(paths, {
-    phase: "planning",
+    phase: "reviewing",
     planReview: "done",
     reviewerRunId: "none",
     reviewerRunDir: "none",
@@ -5937,6 +6036,8 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
     const extra = parentGitWorkflowAppend({
       featureLive: liveFeatureNeedsIdleParent(cwd),
       latchWake: /pr-latch:|read_comments_and_fix/.test(prompt),
+      planReviewRunning: liveFeaturePlanReviewRunning(cwd),
+      taskChain: liveFeatureTaskChain(cwd),
     });
     if (!extra) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${extra}` };
