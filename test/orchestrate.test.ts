@@ -5307,7 +5307,7 @@ test("P3 F11: an uncommitted Task is committed by code, not counted as done", as
     "untracked new files are as much of the Task as its edits",
   );
   assert.ok(
-    calls.includes("git commit -m Task 3 — parser"),
+    calls.some((c) => c.startsWith("git commit -m Task 3 — parser")),
     "the commit message names the Task deterministically",
   );
 });
@@ -5380,6 +5380,54 @@ test("P3 F11: Task 1 refuses to start on a tree that already has someone else's 
     orch.firstTaskBlockedByDirtyTree(pending, undefined),
     undefined,
     "git that could not answer must not block the Feature on its own",
+  );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(pending, " M Cargo.lock"),
+    undefined,
+    "Darwin Cargo.lock churn is not someone else's Feature",
+  );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(pending, " M crates/stratum-adapter/Cargo.lock"),
+    undefined,
+    "nested Cargo.lock is the same residual",
+  );
+});
+
+test("P3 F11: Darwin Cargo.lock leftover is not a closed-gate failure", async () => {
+  const calls: string[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: " M Cargo.lock", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "clean", "lock-only dirt is residual, not uncommitted Task work");
+  assert.deepEqual(
+    calls.filter((c) => c.includes("commit") || c.includes("add")),
+    [],
+    "code must not try to commit a Darwin Cargo.lock",
+  );
+});
+
+test("P3 F11: a Task commit that leaves only Cargo.lock dirty still closed the gate", async () => {
+  let dirty = " M src/pearl.rs\nM  Cargo.lock";
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.equal(a.includes("Cargo.lock"), false, "the lock is not in the commit pathspec");
+      assert.ok(a.includes("src/pearl.rs"), "the Task file is committed by pathspec");
+      dirty = "M  Cargo.lock";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — pin submitblock");
+  assert.equal(
+    gate.state,
+    "committed",
+    "Mac pre-commit refusing Cargo.lock must not stop the Feature chain",
   );
 });
 
