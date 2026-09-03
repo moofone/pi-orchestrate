@@ -274,6 +274,23 @@ export function isGraphqlPrNotFound(out: string): boolean {
 	return /Could not resolve to a PullRequest/i.test(out);
 }
 
+/** REST 404 on get-a-pull-request. The waiter already resolved owner/repo. */
+export function waiterVerdictIsRestMissingPr(text: string | undefined): boolean {
+	if (!text) return false;
+	return /client error 404/i.test(text) && /get-a-pull-request/i.test(text);
+}
+
+/**
+ * Waiter/gh text that means this pull number does not exist — REST 404 on
+ * get-a-pull-request (live `drive-pi-subagents-2150.log`) or GraphQL not-found.
+ * Rate-limit and a real `fix_command_or_environment` (fetch failed, land) stay false.
+ * GraphQL still needs a repo-visibility check before it is treated as closed.
+ */
+export function waiterVerdictIsMissingPr(text: string | undefined): boolean {
+	if (!text) return false;
+	return waiterVerdictIsRestMissingPr(text) || isGraphqlPrNotFound(text);
+}
+
 /** GitHub PR URL from latch fields, if we have enough to form one. */
 // These four already treat every field but `pr` as optional at runtime — the
 // guards below say so. The types demanded all of them, which forced callers and
@@ -1122,8 +1139,21 @@ export function waiterLogFiles(pr: string, dir = stateDir()): string[] {
 	return waiterFilesFor(pr, "drive", "log", dir);
 }
 
-export function waiterLogSaysTerminal(pr: string, dir = stateDir()): boolean {
-	for (const path of waiterLogFiles(pr, dir)) {
+export function waiterLogFilesOwnedBy(
+	pr: string,
+	dir: string,
+	owner: { cwd?: string; slug?: string },
+): string[] {
+	return waiterFilesOwnedBy(pr, "drive", "log", dir, owner);
+}
+
+export function waiterLogSaysTerminal(
+	pr: string,
+	dir = stateDir(),
+	owner?: { cwd?: string; slug?: string },
+): boolean {
+	const paths = owner ? waiterLogFilesOwnedBy(pr, dir, owner) : waiterLogFiles(pr, dir);
+	for (const path of paths) {
 		let text = "";
 		try {
 			text = readFileSync(path, "utf8");
@@ -1133,12 +1163,109 @@ export function waiterLogSaysTerminal(pr: string, dir = stateDir()): boolean {
 		if (/^status=landed$/m.test(text)) return true;
 		if (/^next=(done|stop)$/m.test(text)) return true;
 		if (/^pr_state=(MERGED|CLOSED)$/m.test(text)) return true;
+		// REST 404 is unambiguous. GraphQL not-found is also private/no-access and
+		// must not close here — prState checks repo visibility first.
+		if (waiterVerdictIsRestMissingPr(text)) return true;
 	}
 	return false;
 }
 
 export function waiterManualFiles(pr: string, dir = stateDir()): string[] {
 	return waiterFilesFor(pr, "manual", "json", dir);
+}
+
+function waiterFileMiddle(path: string, stem: string, ext: string): string {
+	const name = basename(path);
+	const prefix = `${stem}-`;
+	const suffix = `.${ext}`;
+	return name.slice(prefix.length, name.length - suffix.length);
+}
+
+/** `icemining` from `drive-icemining-9963.pid`; undefined for legacy `drive-9963.pid`. */
+function waiterFileRepoToken(path: string, stem: string, ext: string, pr: string): string | undefined {
+	const number = String(pr ?? "").trim();
+	const middle = waiterFileMiddle(path, stem, ext);
+	if (!number || middle === number) return undefined;
+	const tail = `-${number}`;
+	return middle.endsWith(tail) ? middle.slice(0, -tail.length) : undefined;
+}
+
+/** Repo tokens this latch may own: `repoKey(cwd)` and the slug's repo name. */
+export function waiterOwnerTokens(owner: { cwd?: string; slug?: string }): string[] {
+	const tokens = new Set<string>();
+	const repo = owner.cwd ? repoKey(owner.cwd) : undefined;
+	if (repo) tokens.add(repo);
+	const slug = normalizeGithubSlug(owner.slug);
+	if (slug.includes("/")) tokens.add(slug.slice(slug.lastIndexOf("/") + 1));
+	else if (slug) tokens.add(slug);
+	return [...tokens];
+}
+
+/**
+ * Waiter files for this PR that belong to `owner`'s repository.
+ * Repo-qualified names for another repo are left alone. Legacy `manual-<pr>.json`
+ * is included only when JSON cwd matches the owner. Legacy `drive-<pr>.log` and
+ * `drive-<pr>.pid` have no repository identity and are never claimed.
+ */
+export function waiterFilesOwnedBy(
+	pr: string,
+	stem: string,
+	ext: string,
+	dir: string,
+	owner: { cwd?: string; slug?: string },
+): string[] {
+	const number = String(pr ?? "").trim();
+	if (!number) return [];
+	const all = waiterFilesFor(pr, stem, ext, dir);
+	const tokens = new Set(waiterOwnerTokens(owner));
+	const otherQualified = all.filter((path) => {
+		const token = waiterFileRepoToken(path, stem, ext, number);
+		return Boolean(token && !tokens.has(token));
+	});
+	const owned: string[] = [];
+	for (const path of all) {
+		const middle = waiterFileMiddle(path, stem, ext);
+		if (middle === number) {
+			if (ext === "json") {
+				const state = readLatchFile(path);
+				const cwd = state?.cwd?.replace(/\/+$/, "");
+				const want = owner.cwd?.replace(/\/+$/, "");
+				if (cwd && want && cwd === want) {
+					owned.push(path);
+					continue;
+				}
+				const stateRepo = state?.cwd ? repoKey(state.cwd) : undefined;
+				if (stateRepo && tokens.has(stateRepo)) {
+					owned.push(path);
+					continue;
+				}
+				if (!state?.cwd && otherQualified.length === 0 && tokens.size > 0) owned.push(path);
+				continue;
+			}
+			// No repo identity: a leftover drive-<pr>.log/.pid from another
+			// repository with the same number must not look owned.
+			continue;
+		}
+		const token = waiterFileRepoToken(path, stem, ext, number);
+		if (token && tokens.has(token)) owned.push(path);
+	}
+	return owned;
+}
+
+export function waiterManualFilesOwnedBy(
+	pr: string,
+	dir: string,
+	owner: { cwd?: string; slug?: string },
+): string[] {
+	return waiterFilesOwnedBy(pr, "manual", "json", dir, owner);
+}
+
+export function waiterPidFilesOwnedBy(
+	pr: string,
+	dir: string,
+	owner: { cwd?: string; slug?: string },
+): string[] {
+	return waiterFilesOwnedBy(pr, "drive", "pid", dir, owner);
 }
 
 /** Legacy spelling. Kept for callers that write nothing and know no repo. */

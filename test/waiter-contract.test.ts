@@ -14,15 +14,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import {
 	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	readPid,
+	waiterFilesOwnedBy,
 	waiterLogSaysTerminal,
 	waiterManualFiles,
+	waiterManualFilesOwnedBy,
+	waiterPidFilesOwnedBy,
 	waiterPaths,
 	waiterPidFiles,
 } from "../src/lib/pr-await-core.ts";
@@ -246,6 +249,64 @@ test("a missing state directory answers 'no waiter' instead of throwing", () => 
 		isDriverRunning("2232", dir, () => true),
 		false,
 	);
+});
+
+test("waiterFilesOwnedBy does not claim another repo's same-number files", () => {
+	const dir = tmpStateDir();
+	const ice = join(homedir(), "Dev", "git", "ice-wt", "feat-a");
+	const devops = join(homedir(), "Dev", "git", "devops-wt", "feat-b");
+	try {
+		writeFileSync(join(dir, "manual-9963.json"), JSON.stringify({ pr: "9963", cwd: ice }));
+		writeFileSync(
+			join(dir, "manual-icemining-devops-9963.json"),
+			JSON.stringify({ pr: "9963", cwd: devops }),
+		);
+		writeFileSync(join(dir, "drive-icemining-devops-9963.pid"), "1");
+		writeFileSync(join(dir, "drive-icemining-9963.pid"), "2");
+		const owner = { cwd: ice };
+		assert.deepEqual(
+			waiterManualFilesOwnedBy("9963", dir, owner).map((p) => basename(p)).sort(),
+			["manual-9963.json"],
+		);
+		assert.deepEqual(
+			waiterPidFilesOwnedBy("9963", dir, owner).map((p) => basename(p)),
+			["drive-icemining-9963.pid"],
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("waiterFilesOwnedBy does not claim an ambiguous legacy drive file", () => {
+	const dir = tmpStateDir();
+	const ice = join(homedir(), "Dev", "git", "ice-wt", "feat-legacy-unowned");
+	try {
+		writeFileSync(join(dir, "drive-9964.log"), "next=stop\n");
+		writeFileSync(join(dir, "drive-9964.pid"), "4242");
+		const owner = { cwd: ice };
+		assert.deepEqual(
+			waiterPidFilesOwnedBy("9964", dir, owner).map((p) => basename(p)),
+			[],
+			"legacy drive-9964.pid has no repo identity",
+		);
+		assert.deepEqual(
+			waiterFilesOwnedBy("9964", "drive", "log", dir, owner).map((p) => basename(p)),
+			[],
+			"legacy drive-9964.log has no repo identity",
+		);
+		assert.equal(
+			waiterLogSaysTerminal("9964", dir, owner),
+			false,
+			"a leftover drive-9964.log must not close this latch",
+		);
+		assert.equal(
+			waiterLogSaysTerminal("9964", dir),
+			true,
+			"unscoped callers still scan every spelling",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("P2 F6: a disagreement consumes the verdict — the loop must not restart it every 60s", () => {
