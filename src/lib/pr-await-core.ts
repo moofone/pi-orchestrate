@@ -1203,9 +1203,9 @@ export function waiterOwnerTokens(owner: { cwd?: string; slug?: string }): strin
 
 /**
  * Waiter files for this PR that belong to `owner`'s repository.
- * Repo-qualified names for another repo are left alone. Legacy `manual-<pr>`
- * / `drive-<pr>` is included only when JSON cwd matches or no other-repo
- * qualified sibling exists.
+ * Repo-qualified names for another repo are left alone. Legacy `manual-<pr>.json`
+ * is included only when JSON cwd matches the owner. Legacy `drive-<pr>.log` and
+ * `drive-<pr>.pid` have no repository identity and are never claimed.
  */
 export function waiterFilesOwnedBy(
 	pr: string,
@@ -1242,7 +1242,8 @@ export function waiterFilesOwnedBy(
 				if (!state?.cwd && otherQualified.length === 0 && tokens.size > 0) owned.push(path);
 				continue;
 			}
-			if (otherQualified.length === 0) owned.push(path);
+			// No repo identity: a leftover drive-<pr>.log/.pid from another
+			// repository with the same number must not look owned.
 			continue;
 		}
 		const token = waiterFileRepoToken(path, stem, ext, number);

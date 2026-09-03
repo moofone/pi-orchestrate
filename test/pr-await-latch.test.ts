@@ -1610,6 +1610,29 @@ test("a terminal latch does not delete or SIGTERM another repo's same-number wai
 	}
 });
 
+test("a terminal latch does not SIGTERM an ambiguous legacy same-number pid", async () => {
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "__legacy_pid__");
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT);
+	writeFileSync(join(h.dir, "manual-9964.json"), JSON.stringify({ pr: "9964", cwd: WT }));
+	const child = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+	child.unref();
+	const legacyPid = join(h.dir, "drive-9964.pid");
+	writeFileSync(legacyPid, String(child.pid));
+	try {
+		await h.start({ reason: "reload" });
+		await sleep(120);
+		assert.equal(existsSync(legacyPid), true, "legacy pid file is not this latch's to delete");
+		assert.equal(pidAlive(child.pid!), true, "must not SIGTERM an unowned legacy waiter");
+	} finally {
+		try {
+			if (child.pid) process.kill(child.pid, "SIGTERM");
+		} catch {
+			/* already gone */
+		}
+		h.cleanup();
+	}
+});
+
 test("an OPEN manual latch is never retired", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__keep__");
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), REPO);

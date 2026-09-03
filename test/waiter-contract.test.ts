@@ -21,6 +21,7 @@ import {
 	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	readPid,
+	waiterFilesOwnedBy,
 	waiterLogSaysTerminal,
 	waiterManualFiles,
 	waiterManualFilesOwnedBy,
@@ -270,6 +271,38 @@ test("waiterFilesOwnedBy does not claim another repo's same-number files", () =>
 		assert.deepEqual(
 			waiterPidFilesOwnedBy("9963", dir, owner).map((p) => basename(p)),
 			["drive-icemining-9963.pid"],
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("waiterFilesOwnedBy does not claim an ambiguous legacy drive file", () => {
+	const dir = tmpStateDir();
+	const ice = join(homedir(), "Dev", "git", "ice-wt", "feat-legacy-unowned");
+	try {
+		writeFileSync(join(dir, "drive-9964.log"), "next=stop\n");
+		writeFileSync(join(dir, "drive-9964.pid"), "4242");
+		const owner = { cwd: ice };
+		assert.deepEqual(
+			waiterPidFilesOwnedBy("9964", dir, owner).map((p) => basename(p)),
+			[],
+			"legacy drive-9964.pid has no repo identity",
+		);
+		assert.deepEqual(
+			waiterFilesOwnedBy("9964", "drive", "log", dir, owner).map((p) => basename(p)),
+			[],
+			"legacy drive-9964.log has no repo identity",
+		);
+		assert.equal(
+			waiterLogSaysTerminal("9964", dir, owner),
+			false,
+			"a leftover drive-9964.log must not close this latch",
+		);
+		assert.equal(
+			waiterLogSaysTerminal("9964", dir),
+			true,
+			"unscoped callers still scan every spelling",
 		);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
