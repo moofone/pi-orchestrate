@@ -2184,6 +2184,107 @@ test("P5 F18: a waiter that says the PR is over does get the gh check, and the w
 	}
 });
 
+test("drive log status=landed wakes with no JSON lastNext=done", async () => {
+	// The #2242 shape: the waiter's JSON exists but says only `poll_again` —
+	// not ACTIONABLE (so checkActionable cannot dispatch), not terminal (so the
+	// JSON cannot be the sensor), and present (so the missing-file rule cannot
+	// be the sensor either). Appending `status=landed` to the drive log is the
+	// only terminal signal, and it must be enough under production watchMs.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	const json = waiterState(h.dir);
+	const ghCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(80);
+		writeFileSync(
+			join(h.dir, "manual-icemining-2142.json"),
+			JSON.stringify({ pr: "2142", cwd: REPO, lastNext: "poll_again" }),
+		);
+		assert.equal(h.wakes.length, 0, "must not wake while nothing is terminal");
+		assert.equal(h.dispatches.length, 0);
+
+		view = MERGED;
+		// An ordinary waiter progress write: no log, no terminal JSON. No wake,
+		// and the tick must not even ask GitHub about it (F18).
+		const cur = JSON.parse(readFileSync(json, "utf8")) as Record<string, unknown>;
+		writeFileSync(json, JSON.stringify({ ...cur, round: "2", roundTotal: "5" }));
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			0,
+			`a wake with no log and no terminal JSON is a false wake; got ${h.wakes.join(" | ")}`,
+		);
+		const ghBefore = ghCalls();
+
+		// ONLY `status=landed` — the log alone must wake.
+		writeFileSync(join(h.dir, "drive-icemining-2142.log"), "status=landed\n", { flag: "a" });
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`a landed drive log must wake the parent once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.equal(h.dispatches.length, 1, "the Feature-owned merge dispatches next=done exactly once");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(h.dispatch(0).owner.pr, "2142");
+		assert.ok(ghCalls() > ghBefore, "the log sensor must lead to the gh check, not skip it");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("waiter JSON lastNext=done wakes with no drive log", async () => {
+	// The ghl ddc9ec1 shape: the waiter records the merge in its JSON and
+	// writes nothing to the drive log. The JSON sensor alone must be enough.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(80);
+		assert.equal(h.wakes.length, 0);
+		view = MERGED;
+		// A Feature-owned handoff seeds no waiter file, so this write is the
+		// waiter's own verdict arriving on disk after the arm.
+		writeFileSync(
+			join(h.dir, "manual-icemining-2142.json"),
+			JSON.stringify({ pr: "2142", cwd: REPO, lastNext: "done" }),
+		);
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`JSON lastNext=done with no drive log must wake once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.equal(h.dispatches.length, 1);
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(
+			existsSync(join(h.dir, "drive-icemining-2142.log")),
+			false,
+			"the drive log must not exist — the JSON was the sensor",
+		);
+		assert.equal(existsSync(join(h.dir, "drive-2142.log")), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("P5 F20: nothing in the extension writes a waiter pid file", async () => {
 	const core: Record<string, unknown> = await import("../src/lib/pr-await-core.ts");
 	for (const name of ["writePid", "clearPid"]) {

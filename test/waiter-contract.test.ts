@@ -21,6 +21,7 @@ import {
 	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	readPid,
+	waiterLogSaysTerminal,
 	waiterManualFiles,
 	waiterPaths,
 	waiterPidFiles,
@@ -135,6 +136,54 @@ test("a shorter PR number does not match a longer repo-qualified file", () => {
 		assert.deepEqual(waiterPidFiles("2232", dir).map((p) => basename(p)), [
 			"drive-icemining-2232.pid",
 		]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("waiterLogSaysTerminal reads drive-*.log because lastNext is not on the JSON", () => {
+	const dir = tmpStateDir();
+	try {
+		// The waiter's JSON carries no verdict yet, so the drive log is the only
+		// place a terminal state can show up (the #2242 shape).
+		writeFileSync(join(dir, "manual-icemining-2142.json"), JSON.stringify({ pr: "2142" }));
+
+		writeFileSync(join(dir, "drive-icemining-2142.log"), "");
+		assert.equal(waiterLogSaysTerminal("2142", dir), false, "an empty log is not terminal");
+
+		writeFileSync(
+			join(dir, "drive-icemining-2142.log"),
+			"status=reviewer_active\nnext=poll_again\n",
+		);
+		assert.equal(waiterLogSaysTerminal("2142", dir), false, "a still-waiting log is not terminal");
+
+		const terminalLines = [
+			"status=landed\n",
+			"next=done\n",
+			"next=stop\n",
+			"pr_state=MERGED\n",
+			"pr_state=CLOSED\n",
+		];
+		for (const line of terminalLines) {
+			writeFileSync(join(dir, "drive-icemining-2142.log"), line);
+			assert.equal(waiterLogSaysTerminal("2142", dir), true, `${JSON.stringify(line)} must be terminal`);
+		}
+
+		// Full lines only: a longer key or token is not the verdict.
+		writeFileSync(join(dir, "drive-icemining-2142.log"), "prev_status=landed\nnext=donework\n");
+		assert.equal(waiterLogSaysTerminal("2142", dir), false, "a partial line is not the verdict");
+
+		// The legacy spelling older binaries wrote is read too.
+		const legacy = tmpStateDir();
+		try {
+			writeFileSync(join(legacy, "drive-2142.log"), "next=stop\n");
+			assert.equal(waiterLogSaysTerminal("2142", legacy), true, "legacy drive-2142.log is read");
+		} finally {
+			rmSync(legacy, { recursive: true, force: true });
+		}
+
+		// Another PR's landing says nothing about this one.
+		assert.equal(waiterLogSaysTerminal("2232", dir), false, "#2142's log must not answer for #2232");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
