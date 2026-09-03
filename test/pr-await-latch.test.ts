@@ -6,7 +6,7 @@
  *
  * Run: npm test  (or: node --experimental-strip-types --test test/pr-await-latch.test.ts)
  */
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -63,6 +63,7 @@ const {
 	actionableFingerprint,
 	armObservedLatch,
 	formatWaitElapsed,
+	wakeLiveLatch,
 	formatWaitLine,
 	originSlug,
 	osc8Link,
@@ -107,6 +108,7 @@ function harness(
 	extraHooks: {
 		watchMs?: number;
 		chromeMs?: number;
+		watchStateDir?: boolean;
 		featureOwnedPr?: any;
 		onFeatureActionable?: any;
 		/** Present-and-undefined selects the production pid probe. */
@@ -161,6 +163,7 @@ function harness(
 			: (pr) => running.has(pr),
 		watchMs: extraHooks.watchMs ?? 0,
 		chromeMs: extraHooks.chromeMs ?? 0,
+		watchStateDir: extraHooks.watchStateDir,
 		featureOwnedPr: extraHooks.featureOwnedPr,
 		// Captured, not executed: a real dispatch would spawn a writer child.
 		onFeatureActionable:
@@ -728,33 +731,6 @@ test("a fresh session in the reference checkout does not inherit a worktree latc
 	} finally {
 		h.cleanup();
 	}
-});
-
-test("a later user prompt cancels the deferred-work wake", async () => {
-	let view = OPEN;
-	const h = harness(
-		(cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)),
-		REPO,
-		{ watchMs: 20 },
-	);
-	await h.start();
-	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
-	await h.settle();
-	await sleep(40);
-	assert.equal(h.wakes.length, 0);
-	await h.input("check git-workflow, tdd-worker should not open PRs");
-	view = MERGED;
-	await sleep(80);
-	assert.equal(
-		h.wakes.length,
-		0,
-		`moved-on session must not be told it deferred this merge; got ${h.wakes.join(" | ")}`,
-	);
-	assert.ok(
-		h.notifies.some((n) => /2142/.test(n) && /merged/.test(n)),
-		`toast still reports the merge; got ${h.notifies.join(" | ")}`,
-	);
-	h.cleanup();
 });
 
 test("a latch from another repository is never adopted", async () => {
@@ -2324,6 +2300,168 @@ test("P5 F20: a waiter rewrite is not a latch, even after a reload under the sam
 /** A live wait with fs.watch armed and a backstop far too slow to be the cause. */
 const watchOnly = { watchMs: 600_000, chromeMs: 0 } as const;
 
+test("observed Feature-owned merge wakes once after the user pastes the PR URL", async () => {
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { name: "release-build-timing-record", pr: "2242" });
+	const prUrl2242 = "https://github.com/moofone/icemining/pull/2242";
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2242",
+			cwd: REPO,
+			lastNext: "yield",
+			url: prUrl2242,
+		});
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "must not wake while the PR is still OPEN");
+		await h.input(prUrl2242);
+		assert.equal(h.wakes.length, 0, "pasting the PR URL must not itself wake");
+		view = MERGED;
+		writeFileSync(join(h.dir, "drive-icemining-2242.log"), "status=landed\n");
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`observed Feature merge must wake once after user input; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2242 merged/);
+		assert.match(h.wake(0), /https:\/\/github\.com\/moofone\/icemining\/pull\/2242/);
+		assert.match(h.wake(0), /Feature release-build-timing-record is complete/);
+		assert.match(h.wake(0), /Confirm to the user/);
+		assert.match(h.wake(0), /Do not run git pr-land or git wt-rm/);
+		assert.doesNotMatch(
+			h.wake(0),
+			/Continue the work you deferred/,
+			`Feature-owned wake must not claim deferred work; got ${h.wake(0)}`,
+		);
+		assert.equal(h.dispatches.length, 1, "merge must dispatch next=done exactly once");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		writeFileSync(join(h.dir, "drive-icemining-2242.log"), "status=landed\nnext=done\n", { flag: "a" });
+		await sleep(500);
+		assert.equal(h.wakes.length, 1, `terminalWoken must reject a second wake; got ${h.wakes.join(" | ")}`);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("reconciler archive wakes a live observed Feature latch exactly once", async () => {
+	// L3 #6.7: the reconciler archives in code while this session still holds
+	// an observed latch on the PR. With `gh` OPEN the whole time, neither
+	// `checkTerminal` nor any waiter sensor can be the cause — only the wake
+	// funnel the reconciler calls. A second call plus a gh MERGED (so the
+	// latch's own terminal check fires too) must still wake exactly once:
+	// `terminalWoken` holds across both routes, and `finishTerminal` stays the
+	// only latch end.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { name: "release-build-timing-record", pr: "2242" });
+	const prUrl2242 = "https://github.com/moofone/icemining/pull/2242";
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2242",
+			cwd: REPO,
+			lastNext: "yield",
+			url: prUrl2242,
+		});
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "must not wake while the PR is still OPEN");
+		// "User may have typed": an observed latch stays armed through input.
+		await h.input(prUrl2242);
+		assert.equal(h.wakes.length, 0, "input must not wake an observed latch");
+
+		// gh stays OPEN throughout the wake: checkTerminal cannot be the sensor.
+		wakeLiveLatch(h.ctx, "2242", "merged");
+		await sleep(200);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`reconciler archive must wake the live latch exactly once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2242 merged/);
+		assert.equal(h.dispatches.length, 1, "archive must dispatch next=done exactly once");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(h.dispatch(0).owner.pr, "2242");
+
+		// Second route: another wakeLiveLatch, gh now MERGED, and a terminal log
+		// append so the latch's own checkTerminal would also fire. Still one.
+		view = MERGED;
+		writeFileSync(join(h.dir, "drive-icemining-2242.log"), "status=landed\n");
+		wakeLiveLatch(h.ctx, "2242", "merged");
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`terminalWoken must hold across both routes; got ${h.wakes.join(" | ")}`,
+		);
+		assert.equal(h.dispatches.length, 1, "one closer means one dispatch");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("solo observed merge still wakes after an unrelated prompt", async () => {
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0);
+		await h.input("check git-workflow, tdd-worker should not open PRs");
+		view = MERGED;
+		const path = waiterState(h.dir);
+		const cur = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		writeFileSync(path, JSON.stringify({ ...cur, lastNext: "done" }));
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`solo observed must still wake after an unrelated prompt; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.match(h.wake(0), /Continue the work you deferred/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("adopted latch plus an unrelated prompt does not wake", async () => {
+	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_prompt__");
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok("[]")), WT, watchOnly);
+	writeFileSync(
+		join(h.dir, "pi-DEAD-ADOPT.latch.json"),
+		JSON.stringify({ pr: "2142", cwd: WT, origin: "observed", pid: 999999 }),
+	);
+	try {
+		await h.start({ reason: "reload" });
+		await sleep(120);
+		assert.equal(h.wakes.length, 0, "open adopted latch must not wake yet");
+		await h.input("check git-workflow, tdd-worker should not open PRs");
+		view = MERGED;
+		const path = waiterState(h.dir);
+		const cur = existsSync(path)
+			? (JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>)
+			: { pr: "2142", cwd: WT };
+		writeFileSync(path, JSON.stringify({ ...cur, lastNext: "done" }));
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			0,
+			`adopted latch after a later prompt must toast only; got ${h.wakes.join(" | ")}`,
+		);
+		assert.ok(
+			h.notifies.some((n) => /2142/.test(n) && /merged/.test(n)),
+			`toast still reports the merge; got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("P5 F18: the GitHub backstop is minutes, not the old 15s poll", () => {
 	assert.equal(WATCH_BACKSTOP_MS, 600_000);
 	const src = readFileSync(new URL("../src/pr-await-latch.ts", import.meta.url), "utf8");
@@ -2391,6 +2529,231 @@ test("P5 F18: a waiter that says the PR is over does get the gh check, and the w
 		assert.equal(h.wakes.length, 1, `expected one merge wake; got ${h.wakes.join(" | ")}`);
 		assert.match(h.wake(0), /merged/);
 	} finally {
+		h.cleanup();
+	}
+});
+
+test("drive log status=landed wakes with no JSON lastNext=done", async () => {
+	// The #2242 shape: the waiter's JSON exists but says only `poll_again` —
+	// not ACTIONABLE (so checkActionable cannot dispatch), not terminal (so the
+	// JSON cannot be the sensor), and present (so the missing-file rule cannot
+	// be the sensor either). Appending `status=landed` to the drive log is the
+	// only terminal signal, and it must be enough under production watchMs.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	const json = waiterState(h.dir);
+	const ghCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(80);
+		writeFileSync(
+			join(h.dir, "manual-icemining-2142.json"),
+			JSON.stringify({ pr: "2142", cwd: REPO, lastNext: "poll_again" }),
+		);
+		assert.equal(h.wakes.length, 0, "must not wake while nothing is terminal");
+		assert.equal(h.dispatches.length, 0);
+
+		view = MERGED;
+		// An ordinary waiter progress write: no log, no terminal JSON. No wake,
+		// and the tick must not even ask GitHub about it (F18).
+		const cur = JSON.parse(readFileSync(json, "utf8")) as Record<string, unknown>;
+		writeFileSync(json, JSON.stringify({ ...cur, round: "2", roundTotal: "5" }));
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			0,
+			`a wake with no log and no terminal JSON is a false wake; got ${h.wakes.join(" | ")}`,
+		);
+		const ghBefore = ghCalls();
+
+		// ONLY `status=landed` — the log alone must wake.
+		writeFileSync(join(h.dir, "drive-icemining-2142.log"), "status=landed\n", { flag: "a" });
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`a landed drive log must wake the parent once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.equal(h.dispatches.length, 1, "the Feature-owned merge dispatches next=done exactly once");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(h.dispatch(0).owner.pr, "2142");
+		assert.ok(ghCalls() > ghBefore, "the log sensor must lead to the gh check, not skip it");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("waiter JSON lastNext=done wakes with no drive log", async () => {
+	// The ghl ddc9ec1 shape: the waiter records the merge in its JSON and
+	// writes nothing to the drive log. The JSON sensor alone must be enough.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(80);
+		assert.equal(h.wakes.length, 0);
+		view = MERGED;
+		// A Feature-owned handoff seeds no waiter file, so this write is the
+		// waiter's own verdict arriving on disk after the arm.
+		writeFileSync(
+			join(h.dir, "manual-icemining-2142.json"),
+			JSON.stringify({ pr: "2142", cwd: REPO, lastNext: "done" }),
+		);
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`JSON lastNext=done with no drive log must wake once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.equal(h.dispatches.length, 1);
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(
+			existsSync(join(h.dir, "drive-icemining-2142.log")),
+			false,
+			"the drive log must not exist — the JSON was the sensor",
+		);
+		assert.equal(existsSync(join(h.dir, "drive-2142.log")), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("never-created waiter JSON is not terminal", async () => {
+	// §6 test 6 / L2: a Feature-owned handoff seeds no waiter file, so
+	// `waiterState()` names a path that never existed. Reading its absence as
+	// "landed" made every state-dir event — e.g. the waiter appending a
+	// non-terminal verdict to the drive log — spend a `gh pr view` (F18 undone).
+	// `next=read_comments_and_fix` is deliberately not a terminal log line:
+	// the JSON cannot dispatch it and the log sensor must not either.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	const ghCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(500);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(h.dispatches.length, 0);
+		assert.equal(
+			existsSync(waiterState(h.dir)),
+			false,
+			"the Feature-owned handoff must seed no waiter file",
+		);
+		const before = ghCalls();
+
+		writeFileSync(join(h.dir, "drive-icemining-2142.log"), "next=read_comments_and_fix\n");
+		await sleep(500);
+		assert.equal(
+			ghCalls(),
+			before,
+			"a path that was never existsSync must not be read as terminal: no gh pr view",
+		);
+		assert.equal(h.wakes.length, 0, `got ${h.wakes.join(" | ")}`);
+		assert.equal(h.dispatches.length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("waiter JSON seen then vanished is terminal", async () => {
+	// §5 B row 3: the waiter deletes its own state file once the PR is over, so
+	// a path this latch saw exist and later found gone is the same news as a
+	// terminal `lastNext` — by another route.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		const path = waiterState(h.dir);
+		assert.equal(existsSync(path), true, "the handoff seeds the waiter's state file");
+
+		// A waiter progress write makes the latch actually look at the file:
+		// from here on its existence is known, so its later absence is news.
+		const cur = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		writeFileSync(path, JSON.stringify({ ...cur, round: "2", roundTotal: "5" }));
+		await sleep(500);
+		assert.equal(h.wakes.length, 0, "still open, still silent");
+
+		view = MERGED;
+		rmSync(path);
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`a seen-then-vanished waiter file must wake once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("production backstop fires one gh pr view and one wake", async () => {
+	// §6 test 8: no fs.watch (disabled), no log, no JSON — a Feature-owned
+	// handoff seeds nothing, so a waiter that died without writing anything
+	// leaves the 10-minute backstop as the only sensor. It must cost exactly
+	// one `gh pr view` and produce one wake. Faked timers must see the `unref`
+	// interval; if they ever stop doing that, this test fails and WATCH_BACKSTOP_MS
+	// stays put — a more eager poll is the regression F18 forbids.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, {
+		watchMs: WATCH_BACKSTOP_MS,
+		chromeMs: 0,
+		watchStateDir: false,
+	});
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	const ghCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+	try {
+		await h.start();
+		// Enabled before the arm, so startWatch creates the backstop interval
+		// through the mocked setInterval. `sleep` keeps using real setTimeout.
+		mock.timers.enable({ apis: ["setInterval"] });
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(120);
+		assert.equal(h.wakes.length, 0, "nothing to say yet");
+		assert.equal(existsSync(waiterState(h.dir)), false, "no waiter JSON was ever written");
+		assert.equal(existsSync(join(h.dir, "drive-icemining-2142.log")), false, "no drive log");
+		const before = ghCalls();
+
+		view = MERGED;
+		mock.timers.tick(WATCH_BACKSTOP_MS);
+		await sleep(50);
+		assert.equal(ghCalls(), before + 1, "the backstop spends exactly one gh pr view");
+		assert.equal(h.wakes.length, 1, `expected one backstop wake; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.equal(h.dispatches.length, 1, "the Feature-owned merge dispatches next=done");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+	} finally {
+		mock.timers.reset();
 		h.cleanup();
 	}
 });

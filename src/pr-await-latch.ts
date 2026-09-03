@@ -69,6 +69,7 @@ import {
 	prLabel,
 	prLinkLabel,
 	registerLatchArm,
+	registerLatchWake,
 	readLatchFile,
 	readWaiterVerdict,
 	readLiveRound,
@@ -249,10 +250,21 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	let lastRefusedFingerprint: string | undefined;
 	/**
 	 * True only while this session is actually waiting. absorb / armObservedLatch
-	 * set it; a later user prompt clears it so a merge cannot hijack a chat that
-	 * has moved on (icemining#2150 into an unrelated git-workflow conversation).
+	 * set it for `observed`; adoption sets it for a successor. A later user prompt
+	 * cancels `adopted` / `discovered` so a guess cannot hijack a chat that has
+	 * moved on (icemining#2150). An `observed` latch stays armed — the only
+	 * explicit cancel is `/pr-latch clear`.
 	 */
 	let deferralActive = false;
+	/**
+	 * Waiter state paths this latch has seen exist. A vanished file is terminal
+	 * only when there was something there to lose: a Feature-owned handoff seeds
+	 * no waiter, so `waiterState()` can name a path that never existed, and
+	 * reading its absence as "landed" spent a `gh pr view` on every state-dir
+	 * event (L2, F18 undone). In memory on purpose — a fresh session re-learns
+	 * by looking.
+	 */
+	const seenWaiterPaths = new Set<string>();
 	const watchMs = hooks.watchMs ?? WATCH_BACKSTOP_MS;
 	const chromeMs = hooks.chromeMs ?? (hooks.watchMs === undefined ? 1_000 : 0);
 	const watchStateDir = hooks.watchStateDir ?? true;
@@ -333,6 +345,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			terminalWoken = false;
 			lastActionableFingerprint = undefined;
 			waitStartedAt = 0;
+			seenWaiterPaths.clear();
 			deferralActive = next.origin === "observed";
 		} else if (!next) {
 			deferralActive = false;
@@ -369,12 +382,20 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * `latchFile` is deliberately absent: `pi-<id>.latch.json` is the
 	 * extension's private copy, and treating it as waiter state is the mistake
 	 * ghl-monitor makes when it respawns drivers from it (F3, F20).
+	 *
+	 * Every enumeration is also an observation: paths found on disk are
+	 * recorded in `seenWaiterPaths`, so a later absence can be read as the
+	 * waiter's terminal delete while a path that never existed stays
+	 * non-terminal (L2).
 	 */
 	function waiterStateFiles(): string[] {
 		const files: string[] = [];
 		const own = waiterState();
 		if (own) files.push(own);
 		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
+		for (const path of files) {
+			if (existsSync(path)) seenWaiterPaths.add(path);
+		}
 		return [...new Set(files)];
 	}
 
@@ -492,10 +513,17 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * often is: an unrelated chat once received `Continue the work you deferred`
 	 * for a devops PR it had never heard of.
 	 */
-	function resumeText(s: LatchState, state: "merged" | "closed"): string {
+	function resumeText(s: LatchState, state: "merged" | "closed", owner?: FeaturePrOwner): string {
 		const label = prLabel(s);
 		const where = s.url ? ` (${s.url})` : "";
 		const outcome = state === "merged" ? "merged" : "closed without merging";
+		if (owner) {
+			return (
+				`pr-latch: ${label} ${outcome}${where}. ` +
+				`Feature ${owner.name} is complete. Confirm to the user. ` +
+				`Do not run git pr-land or git wt-rm.`
+			);
+		}
 		if ((s.origin ?? "adopted") === "observed") {
 			return state === "merged"
 				? `pr-latch: ${label} merged${where}. Continue the work you deferred until this merge. Do not wait for another user message.`
@@ -558,7 +586,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		ctx: ExtensionContext,
 		s: LatchState,
 		state: "merged" | "closed",
-		opts: { wake: boolean } = { wake: true },
+		opts: { wake?: boolean; owner?: FeaturePrOwner } = { wake: true },
 	): Promise<void> {
 		if (terminalWoken) return;
 		terminalWoken = true;
@@ -579,7 +607,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		status(ctx);
 		notify(ctx, toastText(s, state));
 		// Wake while deferralActive is still set; setLatch(undefined) clears it.
-		if (opts.wake) wakeParent(ctx, resumeText(s, state));
+		if (opts.wake !== false) wakeParent(ctx, resumeText(s, state, opts.owner));
 		setLatch(undefined);
 	}
 
@@ -617,7 +645,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				);
 			}
 		}
-		await reportTerminal(ctx, s, state, opts);
+		await reportTerminal(ctx, s, state, { ...opts, owner });
 	}
 
 	/**
@@ -625,12 +653,15 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 *
 	 * Asked before spending a `gh pr view`. A waiter that has landed or seen the
 	 * PR closed says so in the file it just wrote — and it deletes that file
-	 * once the PR is terminal, so a state path that has vanished under a live
-	 * latch is the same news by another route.
+	 * once the PR is terminal, so a state path that was seen and then vanished
+	 * under a live latch is the same news by another route. A path that never
+	 * existed is not news at all: for a Feature-owned PR no waiter file is ever
+	 * seeded, and treating its absence as "landed" is what made every log
+	 * append cost a `gh pr view` (L2).
 	 */
 	function waiterSaysTerminal(): boolean {
 		const own = waiterState();
-		if (own && !existsSync(own)) return true;
+		if (own && !existsSync(own) && seenWaiterPaths.has(own)) return true;
 		for (const path of waiterStateFiles()) {
 			const next = readWaiterVerdict(path)?.lastNext;
 			if (next && (TERMINAL_NEXT.has(next) || MECHANICAL.has(next))) return true;
@@ -1006,6 +1037,10 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			// the `--daemon` hop takes no positional PR and reads both out of it.
 			const statePath = waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
 			seedWaiterState(statePath, { pr: latch.pr, cwd: latch.cwd });
+			// The seed is a file coming into existence under this latch: its later
+			// absence is the waiter's terminal delete, even if no read ever got
+			// there between seed and delete.
+			seenWaiterPaths.add(statePath);
 			const result = ensureDriver({
 				pr: latch.pr,
 				stateFile: statePath,
@@ -1063,6 +1098,17 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			origin: "observed",
 		});
 		void handoff(ctx as ExtensionContext, { wakeOnTerminal: true });
+	});
+
+	// The reconciler's archive (`dispatchFeaturePrVerdict`) finishes a PR the
+	// waiter never did — no terminal waiter write will ever fire this latch's
+	// own sensors for it. `finishTerminal` stays the one closer: it dispatches
+	// (idempotently — the archive already wrote status.md) and wakes, and
+	// `terminalWoken` holds across both routes so a second call is refused.
+	registerLatchWake((ctx, pr, state) => {
+		if (disabled || latchOff()) return;
+		if (!latch || latch.pr !== String(pr) || terminalWoken) return;
+		void finishTerminal(ctx as ExtensionContext, latch, state);
 	});
 
 	pi.on("session_start", async (event, ctx) => {
@@ -1125,9 +1171,13 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	pi.on("input", async (event) => {
 		const source =
 			event && typeof event === "object" ? (event as { source?: unknown }).source : undefined;
-		// Our own merge/ACTIONABLE injection is source "extension". A real user
-		// prompt means this session has moved on; toast on merge, do not hijack.
-		if (source !== "extension") deferralActive = false;
+		// Our own merge/ACTIONABLE injection is source "extension". A later prompt
+		// cancels adopted/discovered (missing origin counts as adopted). Observed
+		// stays armed: pasting the PR URL is not "moved on"; `/pr-latch clear` is.
+		if (source !== "extension") {
+			const origin = latch?.origin ?? "adopted";
+			if (origin === "adopted" || origin === "discovered") deferralActive = false;
+		}
 		return { action: "continue" as const };
 	});
 

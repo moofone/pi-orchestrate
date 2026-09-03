@@ -57,6 +57,7 @@ import {
   repoKey,
   spendWaiterVerdict,
   undeliveredWaiterVerdicts,
+  wakeLiveLatch,
   waiterPaths,
   type FeaturePrOwner,
 } from "./lib/pr-await-core.ts";
@@ -4121,6 +4122,11 @@ export async function dispatchFeaturePrVerdict(
     accept();
     upsertStatusFile(paths, { phase: "done", pr, nextAction: "landed" });
     uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
+    // L3 §5 C: this archive is the second half of a finish the waiter never
+    // saw, so the session holding the latch must hear about it now, not at the
+    // 10-minute backstop. Same registry seam as `armObservedLatch` — never an
+    // import of the latch module — and never a throw into the dispatch path.
+    wakeLiveLatch(ctx, pr, result.next === "stop" ? "closed" : "merged");
     return action;
   }
 
@@ -5504,9 +5510,14 @@ export function liveFeatureTaskChain(cwd: string, root?: string): boolean {
 }
 
 /**
- * Forced into the parent system prompt. Skills are progressive-disclosure and
- * models skip the read (git-workflow-guard.ts documents that). Citing the path
- * is not enough — this block is the skill, inlined, for the sessions that need it.
+ * Forced into the parent system prompt. The Feature-parent branch inlines the
+ * git-workflow skill: skills are progressive-disclosure and models skip the
+ * read (git-workflow-guard.ts documents that), so citing the path is not
+ * enough — this block is the skill, for the sessions that need it. The solo
+ * latch-wake branch deliberately does not cite the skill at all (L5): after
+ * `git pr-await` prints `next=yield` the parent just stops, because code
+ * injects the next user message. No "I will not talk until" promise, and no
+ * dependency on the git-workflow skill, covers that wake.
  */
 export function parentGitWorkflowAppend(input: {
   featureLive?: boolean;
@@ -5518,9 +5529,14 @@ export function parentGitWorkflowAppend(input: {
     return undefined;
   }
   const parts: string[] = [];
-  if (input.featureLive || input.latchWake) {
+  if (input.featureLive) {
     parts.push(
       `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`,
+    );
+  }
+  if (input.latchWake) {
+    parts.push(
+      "After git pr-await prints next=yield, stop talking; code injects the next user message.",
     );
   }
   if (input.featureLive) {
