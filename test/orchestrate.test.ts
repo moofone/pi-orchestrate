@@ -5287,6 +5287,46 @@ test("P2 F10: a Context that is the last section of the plan still reaches the P
  * Phase 3 — the Task and QA lifecycle (F11, F12, F13, F14)
  * ---------------------------------------------------------------- */
 
+test("P3 F11: porcelainEntryPath decodes git C-style quoted paths", () => {
+  const backslash = String.fromCharCode(92);
+  const quotedBackslash = `"foo${backslash}${backslash}bar"`; // git: "foo\\bar"
+  assert.equal(orch.porcelainEntryPath(" M src/a.ts"), "src/a.ts");
+  assert.equal(
+    orch.unquoteGitPath(quotedBackslash),
+    `foo${backslash}bar`,
+    "quoted backslash decodes to one backslash, not a still-escaped pathspec",
+  );
+  assert.equal(orch.porcelainEntryPath(` M ${quotedBackslash}`), `foo${backslash}bar`);
+  assert.equal(orch.unquoteGitPath(`"foo${backslash}"bar"`), 'foo"bar');
+  assert.equal(orch.unquoteGitPath(`"foo${backslash}nbar"`), "foo\nbar");
+  assert.equal(orch.unquoteGitPath(`"foo${backslash}001bar"`), "foo\u0001bar");
+  assert.equal(
+    orch.porcelainEntryPath(`R  old.ts -> ${quotedBackslash}`),
+    `foo${backslash}bar`,
+    "rename dest is unquoted too",
+  );
+});
+
+test("P3 F11: quoted porcelain paths are committed decoded, not still-escaped", async () => {
+  const backslash = String.fromCharCode(92);
+  let dirty = ` M "foo${backslash}${backslash}bar"`;
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "commit") {
+      assert.ok(
+        a.includes(`foo${backslash}bar`),
+        `git commit pathspec must be the real path, got ${a.join(" ")}`,
+      );
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "committed");
+});
+
 test("P3 F11: an uncommitted Task is committed by code, not counted as done", async () => {
   const calls: string[] = [];
   let dirty = " M src/a.ts\n?? src/b.ts";

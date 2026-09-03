@@ -3185,6 +3185,69 @@ export async function porcelainStatus(
   }
 }
 
+/** Decode git's C-style quoted pathname (`quote.c` unquote_c_style). */
+export function unquoteGitPath(raw: string): string {
+  if (raw.length < 2 || !raw.startsWith('"') || !raw.endsWith('"')) return raw;
+  const inner = raw.slice(1, -1);
+  let out = "";
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = inner[++i];
+    if (next === undefined) break;
+    if (next === "\\" || next === '"') {
+      out += next;
+      continue;
+    }
+    if (next === "n") {
+      out += "\n";
+      continue;
+    }
+    if (next === "t") {
+      out += "\t";
+      continue;
+    }
+    if (next === "r") {
+      out += "\r";
+      continue;
+    }
+    if (next === "a") {
+      out += "\u0007";
+      continue;
+    }
+    if (next === "b") {
+      out += "\b";
+      continue;
+    }
+    if (next === "f") {
+      out += "\f";
+      continue;
+    }
+    if (next === "v") {
+      out += "\v";
+      continue;
+    }
+    if (next >= "0" && next <= "7") {
+      let oct = next;
+      let count = 1;
+      while (count < 3 && i + 1 < inner.length) {
+        const digit = inner[i + 1];
+        if (digit === undefined || digit < "0" || digit > "7") break;
+        oct += digit;
+        i++;
+        count++;
+      }
+      out += String.fromCharCode(Number.parseInt(oct, 8));
+      continue;
+    }
+    out += next;
+  }
+  return out;
+}
+
 /** Path from one `git status --porcelain` v1 line (rename dest wins). */
 export function porcelainEntryPath(line: string): string {
   if (line.length < 4) return "";
@@ -3192,10 +3255,7 @@ export function porcelainEntryPath(line: string): string {
   const arrow = rest.lastIndexOf(" -> ");
   if (arrow >= 0) rest = rest.slice(arrow + 4);
   rest = rest.trim();
-  if (rest.startsWith('"') && rest.endsWith('"')) {
-    rest = rest.slice(1, -1).replace(/\\"/g, '"');
-  }
-  return rest;
+  return unquoteGitPath(rest);
 }
 
 /**
