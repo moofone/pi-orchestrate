@@ -355,6 +355,32 @@ export function armObservedLatch(ctx: unknown, seed: ObservedLatchSeed): void {
 	}
 }
 
+/** A terminal PR state, as the reconciler's archive branch reports it. */
+export type LatchTerminalState = "merged" | "closed";
+
+export type LatchWakeFn = (ctx: unknown, pr: string, state: LatchTerminalState) => void;
+
+let latchWake: LatchWakeFn | undefined;
+
+/** Latch plugin registers; tests replace. `undefined` unregisters. */
+export function registerLatchWake(fn: LatchWakeFn | undefined): void {
+	latchWake = fn;
+}
+
+/**
+ * Wake the live session's latch for a PR that just finished by a route the
+ * waiter never saw — the reconciler's archive. No-op until the latch plugin
+ * registers, and never throws: the archive must succeed whether or not any
+ * session holds a latch, exactly like `armObservedLatch`.
+ */
+export function wakeLiveLatch(ctx: unknown, pr: string, state: LatchTerminalState): void {
+	try {
+		latchWake?.(ctx, String(pr), state);
+	} catch {
+		// Never take the Feature chain down over the latch.
+	}
+}
+
 /** `moofone/icemining#2142`, else `icemining#2142`, else `PR #2142`. */
 export function prLabel(s: Partial<LatchState>): string {
 	const name = s.slug ?? repoKey(s.cwd ?? "");

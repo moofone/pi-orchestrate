@@ -57,6 +57,7 @@ import {
   repoKey,
   spendWaiterVerdict,
   undeliveredWaiterVerdicts,
+  wakeLiveLatch,
   waiterPaths,
   type FeaturePrOwner,
 } from "./lib/pr-await-core.ts";
@@ -4121,6 +4122,11 @@ export async function dispatchFeaturePrVerdict(
     accept();
     upsertStatusFile(paths, { phase: "done", pr, nextAction: "landed" });
     uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
+    // L3 §5 C: this archive is the second half of a finish the waiter never
+    // saw, so the session holding the latch must hear about it now, not at the
+    // 10-minute backstop. Same registry seam as `armObservedLatch` — never an
+    // import of the latch module — and never a throw into the dispatch path.
+    wakeLiveLatch(ctx, pr, result.next === "stop" ? "closed" : "merged");
     return action;
   }
 

@@ -62,6 +62,7 @@ const {
 	actionableFingerprint,
 	armObservedLatch,
 	formatWaitElapsed,
+	wakeLiveLatch,
 	formatWaitLine,
 	originSlug,
 	osc8Link,
@@ -2049,6 +2050,62 @@ test("observed Feature-owned merge wakes once after the user pastes the PR URL",
 		writeFileSync(join(h.dir, "drive-icemining-2242.log"), "status=landed\nnext=done\n", { flag: "a" });
 		await sleep(500);
 		assert.equal(h.wakes.length, 1, `terminalWoken must reject a second wake; got ${h.wakes.join(" | ")}`);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("reconciler archive wakes a live observed Feature latch exactly once", async () => {
+	// L3 #6.7: the reconciler archives in code while this session still holds
+	// an observed latch on the PR. With `gh` OPEN the whole time, neither
+	// `checkTerminal` nor any waiter sensor can be the cause — only the wake
+	// funnel the reconciler calls. A second call plus a gh MERGED (so the
+	// latch's own terminal check fires too) must still wake exactly once:
+	// `terminalWoken` holds across both routes, and `finishTerminal` stays the
+	// only latch end.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { name: "release-build-timing-record", pr: "2242" });
+	const prUrl2242 = "https://github.com/moofone/icemining/pull/2242";
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2242",
+			cwd: REPO,
+			lastNext: "yield",
+			url: prUrl2242,
+		});
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "must not wake while the PR is still OPEN");
+		// "User may have typed": an observed latch stays armed through input.
+		await h.input(prUrl2242);
+		assert.equal(h.wakes.length, 0, "input must not wake an observed latch");
+
+		// gh stays OPEN throughout the wake: checkTerminal cannot be the sensor.
+		wakeLiveLatch(h.ctx, "2242", "merged");
+		await sleep(200);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`reconciler archive must wake the live latch exactly once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2242 merged/);
+		assert.equal(h.dispatches.length, 1, "archive must dispatch next=done exactly once");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(h.dispatch(0).owner.pr, "2242");
+
+		// Second route: another wakeLiveLatch, gh now MERGED, and a terminal log
+		// append so the latch's own checkTerminal would also fire. Still one.
+		view = MERGED;
+		writeFileSync(join(h.dir, "drive-icemining-2242.log"), "status=landed\n");
+		wakeLiveLatch(h.ctx, "2242", "merged");
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`terminalWoken must hold across both routes; got ${h.wakes.join(" | ")}`,
+		);
+		assert.equal(h.dispatches.length, 1, "one closer means one dispatch");
 	} finally {
 		h.cleanup();
 	}

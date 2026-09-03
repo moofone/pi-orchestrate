@@ -19,7 +19,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
-import { registerLatchArm } from "../src/lib/pr-await-core.ts";
+import { registerLatchArm, registerLatchWake } from "../src/lib/pr-await-core.ts";
 
 const ORCH_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/orchestrate.ts");
 const LIFECYCLE_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/lib/lifecycle.ts");
@@ -3039,6 +3039,60 @@ test("D1: dispatch next=done lands a Feature still stuck on yield", async () => 
   assert.match(status, /phase: done/);
   assert.match(status, /next_action: landed/);
   assert.doesNotMatch(status, /next=yield/);
+});
+
+test("archive verdict wakes the live latch via registerLatchWake", async () => {
+  // L3 §5 C: the reconciler's archive is the second half of a finish the
+  // waiter never saw, so the live latch must hear about it — through the same
+  // registry seam `armObservedLatch` uses, never an import of the latch module.
+  const dir = mkdtempSync(join(tmpdir(), "orch-wake-"));
+  const paths = {
+    repo: "icemining",
+    gitRoot: dir,
+    repoDir: dir,
+    featureDir: dir,
+    planFile: join(dir, "plan.md"),
+    statusFile: join(dir, "status.md"),
+    handoffsDir: join(dir, "handoffs"),
+    archiveDir: join(dir, "archive"),
+  };
+  writeFileSync(paths.planFile, "# Feature: t\n");
+  writeFileSync(
+    paths.statusFile,
+    ["# Status", "", "pause: off", "phase: pr", "pr: 2197", "pr_round: 0", ""].join("\n"),
+  );
+
+  const woken: Array<{ pr: string; state: string }> = [];
+  registerLatchWake((_ctx, pr, state) => {
+    woken.push({ pr, state });
+  });
+  try {
+    const pi = makeFakePi();
+    const { ctx } = makeFakeCtx();
+    const action = (await withDeadline(
+      (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+        pi,
+        ctx,
+        paths,
+        "2197",
+        dir,
+        { next: "done", output: "status=landed\nnext=done\n" },
+      ),
+      2000,
+    )) as string | { reason?: string };
+    assert.notEqual((action as { reason?: string })?.reason, "TEST_TIMEOUT");
+    assert.equal(action, "archive");
+    assert.equal(woken.length, 1, `archive must wake the live latch once; got ${JSON.stringify(woken)}`);
+    assert.equal(woken[0]?.pr, "2197");
+    assert.equal(woken[0]?.state, "merged", "next=done archive means the PR merged");
+    // The wake comes after the status write, so the Feature is already done
+    // when the latch's finishTerminal runs (it re-dispatches idempotently).
+    const status = readFileSync(paths.statusFile, "utf8");
+    assert.match(status, /phase: done/);
+    assert.match(status, /next_action: landed/);
+  } finally {
+    registerLatchWake(undefined);
+  }
 });
 
 test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and never waits", () => {

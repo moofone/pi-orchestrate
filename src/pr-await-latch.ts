@@ -65,6 +65,7 @@ import {
 	prLabel,
 	prLinkLabel,
 	registerLatchArm,
+	registerLatchWake,
 	readLatchFile,
 	readWaiterVerdict,
 	readLiveRound,
@@ -1072,6 +1073,17 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			origin: "observed",
 		});
 		void handoff(ctx as ExtensionContext, { wakeOnTerminal: true });
+	});
+
+	// The reconciler's archive (`dispatchFeaturePrVerdict`) finishes a PR the
+	// waiter never did — no terminal waiter write will ever fire this latch's
+	// own sensors for it. `finishTerminal` stays the one closer: it dispatches
+	// (idempotently — the archive already wrote status.md) and wakes, and
+	// `terminalWoken` holds across both routes so a second call is refused.
+	registerLatchWake((ctx, pr, state) => {
+		if (disabled || latchOff()) return;
+		if (!latch || latch.pr !== String(pr) || terminalWoken) return;
+		void finishTerminal(ctx as ExtensionContext, latch, state);
 	});
 
 	pi.on("session_start", async (event, ctx) => {
