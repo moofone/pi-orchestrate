@@ -61,7 +61,6 @@ import {
 	parsePrState,
 	ghPrViewArgs,
 	githubPrUrlFor,
-	isGraphqlPrNotFound,
 	normalizeGithubSlug,
 	pidAlive,
 	printedLandCommand,
@@ -74,6 +73,7 @@ import {
 	readWaiterVerdict,
 	readLiveRound,
 	waiterLogSaysTerminal,
+	waiterVerdictIsMissingPr,
 	referenceCheckoutFor,
 	repoKey,
 	resolveQueryCwd,
@@ -591,21 +591,21 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (terminalWoken) return;
 		terminalWoken = true;
 		stopWatch();
-		// A `manual-<pr>.json` for a PR that is already over is spent bookkeeping.
-		// Leaving it means every later session in the repo re-adopts the same dead
-		// PR for the next 24h; `manual-2162.json` was still being picked up hours
-		// after that PR merged.
-		if (s.source === "manual") {
-			for (const path of waiterManualFiles(s.pr, stateDir())) {
-				try {
-					rmSync(path, { force: true });
-				} catch {
-					// Cleanup is best-effort; never take the session down over it.
-				}
+		// Spent bookkeeping: a waiter-written `manual-<pr>.json` for a PR that is
+		// already over must not be re-adopted. Leaving it is how
+		// `manual-pi-subagents-2150.json` survived icemining#2150's merge.
+		for (const path of waiterManualFiles(s.pr, stateDir())) {
+			try {
+				rmSync(path, { force: true });
+			} catch {
+				// Cleanup is best-effort; never take the session down over it.
 			}
 		}
 		status(ctx);
 		notify(ctx, toastText(s, state));
+		// A 404 waiter keeps REST-polling after the latch is spent. SIGTERM it
+		// here: `/pr-latch clear` already does, and a terminal PR is the same end.
+		killDriver(s.pr);
 		// Wake while deferralActive is still set; setLatch(undefined) clears it.
 		if (opts.wake !== false) wakeParent(ctx, resumeText(s, state, opts.owner));
 		setLatch(undefined);
@@ -762,6 +762,13 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			break;
 		}
 		if (!hit) return;
+		// Waiter REST 404 on get-a-pull-request is a missing PR, not an env fix.
+		// Live: lastNext=fix_command_or_environment while gh may still look OPEN
+		// (wrong-repo leftover). Close the latch; do not wake a fix.
+		if (waiterVerdictIsMissingPr(hit.verdict)) {
+			await finishTerminal(ctx, latch, "closed");
+			return;
+		}
 		const fp = actionableFingerprint({
 			next: hit.lastNext,
 			verdict: hit.verdict,
@@ -886,9 +893,10 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			const { out, ok } = await sh("gh", args, candidate);
 			const st = parsePrState(out, ok);
 			if (st !== "unknown") return st;
-			// GraphQL uses the same missing-PR string for private/no-access. Only
-			// treat it as closed when we can still see the repository itself.
-			if (isGraphqlPrNotFound(out) && (await repoAccessible(candidate, slug))) return "closed";
+			// GraphQL uses the same missing-PR string for private/no-access; REST
+			// 404 on get-a-pull-request is the waiter's spelling. Only treat it as
+			// closed when we can still see the repository itself.
+			if (waiterVerdictIsMissingPr(out) && (await repoAccessible(candidate, slug))) return "closed";
 		}
 		return "unknown";
 	}

@@ -274,6 +274,17 @@ export function isGraphqlPrNotFound(out: string): boolean {
 	return /Could not resolve to a PullRequest/i.test(out);
 }
 
+/**
+ * Waiter/gh text that means this pull number does not exist — REST 404 on
+ * get-a-pull-request (live `drive-pi-subagents-2150.log`) or GraphQL not-found.
+ * Rate-limit and a real `fix_command_or_environment` (fetch failed, land) stay false.
+ */
+export function waiterVerdictIsMissingPr(text: string | undefined): boolean {
+	if (!text) return false;
+	if (isGraphqlPrNotFound(text)) return true;
+	return /client error 404/i.test(text) && /get-a-pull-request/i.test(text);
+}
+
 /** GitHub PR URL from latch fields, if we have enough to form one. */
 // These four already treat every field but `pr` as optional at runtime — the
 // guards below say so. The types demanded all of them, which forced callers and
@@ -1133,6 +1144,7 @@ export function waiterLogSaysTerminal(pr: string, dir = stateDir()): boolean {
 		if (/^status=landed$/m.test(text)) return true;
 		if (/^next=(done|stop)$/m.test(text)) return true;
 		if (/^pr_state=(MERGED|CLOSED)$/m.test(text)) return true;
+		if (waiterVerdictIsMissingPr(text)) return true;
 	}
 	return false;
 }
