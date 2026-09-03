@@ -4447,6 +4447,8 @@ test("overlay: mapper and sink are exported (no prompt path)", () => {
   assert.equal(typeof orch.overlayTodosFromFeature, "function");
   assert.equal(typeof orch.projectOverlayTodos, "function");
   assert.equal(typeof orch.syncOverlayTodos, "function");
+  assert.equal(typeof orch.overlayWidgetLines, "function");
+  assert.equal(typeof orch.overlayWidgetFactory, "function");
   assert.equal(typeof orch.setOverlayTodoSink, "function");
   const src = readFileSync(ORCH_SRC, "utf8");
   assert.equal(/\bfunction\s+todoSyncBlock\b/.test(src), false);
@@ -4657,6 +4659,39 @@ test("overlay: syncOverlayTodos publishes the snapshot to the sink, not the mode
   } finally {
     orch.setOverlayTodoSink(undefined);
   }
+});
+
+test("overlay: Feature todos paint as a component widget, not a 10-line string array", () => {
+  const painted: Array<{ key: string; value: unknown }> = [];
+  orch.bindOverlayUi({
+    hasUI: true,
+    ui: {
+      setWidget(key: string, value: unknown) {
+        painted.push({ key, value });
+      },
+    },
+  });
+  const plan = [
+    OVERLAY_PLAN_FIVE,
+  ].join("\n");
+  const status = [
+    "phase: implementing",
+    "plan_review: done",
+    "qa_pass: 0",
+    "qa_pass_cap: 2",
+  ].join("\n");
+  orch.syncOverlayTodos(plan, status);
+  assert.equal(painted.at(-1)?.key, orch.OVERLAY_WIDGET_KEY);
+  const factory = painted.at(-1)?.value;
+  assert.equal(typeof factory, "function", "a string array would be clipped at MAX_WIDGET_LINES=10");
+  const widget = (
+    factory as (tui: unknown, theme: unknown) => { render(width: number): string[] }
+  )(undefined, {});
+  const text = widget.render(180).join("\n");
+  assert.match(text, /feature-qa 2\/2/, "the last QA pass must remain visible");
+  assert.doesNotMatch(text, /widget truncated/);
+  const lines = orch.overlayWidgetLines(overlayTodos(plan, status));
+  assert.ok(lines.length > 10);
 });
 
 test("overlay: plan-reviewer in_progress never shares the board with a Task", () => {

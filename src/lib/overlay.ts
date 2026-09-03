@@ -242,3 +242,25 @@ export function projectOverlayTodos(plan: string, status: string): OverlayTodoSt
   const maxId = tasks.reduce((max, todo) => Math.max(max, todo.id), 0);
   return { tasks, nextId: maxId + 1 };
 }
+
+/**
+ * Every Feature row, including the heading. Pi clips string-array widgets at
+ * 10 lines (`MAX_WIDGET_LINES`) and appends "... (widget truncated)"; this
+ * helper is the source of truth for a component widget that bypasses that cap.
+ */
+export function overlayWidgetLines(todos: OverlayTodo[]): string[] {
+  if (todos.length === 0) return [];
+  const done = todos.filter((t) => t.status === "completed").length;
+  const lines = [`Todos (${done}/${todos.length})`];
+  for (let i = 0; i < todos.length; i++) {
+    const t = todos[i];
+    if (!t) continue;
+    const last = i === todos.length - 1;
+    const glyph = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◐" : "○";
+    let row = `${last ? "└─" : "├─"} ${glyph} ${t.subject}`;
+    if (t.status === "in_progress" && t.activeForm) row += ` (${t.activeForm})`;
+    lines.push(row);
+  }
+  lines.push("");
+  return lines;
+}

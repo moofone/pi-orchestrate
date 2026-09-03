@@ -84,7 +84,14 @@ import {
 } from "./lib/lifecycle.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
 import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
-import { overlayTodosFromFeature, projectOverlayTodos, type OverlayTodoState } from "./lib/overlay.ts";
+import { truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  overlayTodosFromFeature,
+  overlayWidgetLines,
+  projectOverlayTodos,
+  type OverlayTodo,
+  type OverlayTodoState,
+} from "./lib/overlay.ts";
 import {
   classifyFeaturePrNext,
   fixSpawnCount,
@@ -1909,14 +1916,88 @@ export interface OverlayTodoSink {
 
 let overlaySink: OverlayTodoSink | undefined;
 let overlayPi: ExtensionAPI | undefined;
+let overlaySessionId = "";
+let overlayUi: {
+  setWidget?: (key: string, value: unknown, opts?: { placement?: string }) => void;
+} | undefined;
+
+/** Same slot as `@juicesharp/rpiv-todo` so Feature state is the visible panel. */
+export const OVERLAY_WIDGET_KEY = "rpiv-todos";
 
 export function setOverlayTodoSink(sink: OverlayTodoSink | undefined): void {
   overlaySink = sink;
 }
 
+export function bindOverlayUi(ctx: {
+  hasUI?: boolean;
+  ui?: {
+    setWidget?: (key: string, value: unknown, opts?: { placement?: string }) => void;
+  };
+  sessionManager?: { getSessionId?: () => string };
+}): void {
+  if (ctx.hasUI === false) {
+    overlayUi = undefined;
+    return;
+  }
+  if (typeof ctx.ui?.setWidget === "function") overlayUi = { setWidget: ctx.ui.setWidget };
+  try {
+    const id = ctx.sessionManager?.getSessionId?.();
+    if (id) overlaySessionId = id;
+  } catch {
+    /* stale ctx */
+  }
+}
+
+function bindOverlayFromCommand(ctx: ExtensionCommandContext | ExtensionContext): void {
+  bindOverlayUi({
+    hasUI: ctx.hasUI,
+    ui: {
+      setWidget: (key, value, opts) => {
+        (ctx.ui.setWidget as (k: string, v: unknown, o?: { placement?: string }) => void)(
+          key,
+          value,
+          opts,
+        );
+      },
+    },
+    sessionManager: ctx.sessionManager,
+  });
+}
+
+/**
+ * Component factory, not a string array. Pi's string-array widgets are clipped
+ * at 10 lines (`MAX_WIDGET_LINES`) with "... (widget truncated)". A typical
+ * Feature is planner + reviewer + approve + N tasks + two QA passes — already
+ * more than 10 rows — so the overlay must be a component.
+ */
+export function overlayWidgetFactory(
+  todos: OverlayTodo[],
+): ((tui: unknown, theme: unknown) => { render(width: number): string[]; invalidate(): void }) | undefined {
+  const lines = overlayWidgetLines(todos);
+  if (lines.length === 0) return undefined;
+  return (_tui, _theme) => ({
+    render(width: number) {
+      if (!(width > 0)) return lines;
+      return lines.map((line) => truncateToWidth(line, width, "…"));
+    },
+    invalidate() {},
+  });
+}
+
+function publishOverlayWidget(todos: OverlayTodo[]): void {
+  const ui = overlayUi;
+  if (!ui?.setWidget) return;
+  try {
+    ui.setWidget(OVERLAY_WIDGET_KEY, overlayWidgetFactory(todos), { placement: "aboveEditor" });
+  } catch {
+    /* stale ctx after /reload */
+  }
+}
+
 export function syncOverlayTodos(plan: string, status: string): OverlayTodoState {
   const snapshot = projectOverlayTodos(plan, status);
-  const sessionId = overlaySink?.getActiveRenderSession() ?? "";
+  const fromSink = overlaySink?.getActiveRenderSession() ?? "";
+  const sessionId = fromSink || overlaySessionId;
   if (overlaySink && sessionId) {
     overlaySink.replaceState(sessionId, snapshot);
     try {
@@ -1925,6 +2006,10 @@ export function syncOverlayTodos(plan: string, status: string): OverlayTodoState
       /* overlay refresh is best-effort */
     }
   }
+  // Pi loads each extension with `jiti({ moduleCache: false })`, so importing
+  // rpiv-todo's store is usually a second Map. Occupy the same widget slot as a
+  // *component* so the panel shows every Feature row instead of clipping at 10.
+  publishOverlayWidget(snapshot.tasks);
   return snapshot;
 }
 
@@ -2041,6 +2126,7 @@ export {
   OVERLAY_REVIEWER_ID,
   OVERLAY_APPROVE_ID,
   overlayTodosFromFeature,
+  overlayWidgetLines,
   projectOverlayTodos,
   type OverlayTodo,
   type OverlayTodoKind,
@@ -6022,8 +6108,9 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   // registration that silently replaced the overlay republish would be a very
   // quiet bug.
   pi.on("session_start", async (_event, ctx) => {
-    republishOverlay();
     lastCtx = ctx;
+    bindOverlayFromCommand(ctx);
+    republishOverlay();
     // The durable half of the PR phase. A session starting anywhere is enough
     // to notice a merged PR, or a verdict the session that opened the PR never
     // lived to see (F1, F8).
