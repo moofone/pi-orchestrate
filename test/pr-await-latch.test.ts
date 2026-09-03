@@ -69,6 +69,7 @@ const {
 	prLinkLabel,
 	prUrl,
 	ghPrViewArgs,
+	parsePrState,
 	isExtensionOwnedStateFile,
 	readLiveRound,
 	repoKey,
@@ -1149,6 +1150,69 @@ test("slug-mismatched open PR still wakes on merge without a waiter", async () =
 	}
 });
 
+test("a 404 at the origin slug is closed, not a waiter loop", async () => {
+	const YIELD_OUT = ["status=handed_off", "next=yield", "pr=2150", "instruction=stop_talking", ""].join("\n");
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok(YIELD_OUT);
+			if (args[1] === "view" && String(args[2]) === "2150") return NOT_IN_THIS_REPO;
+			return NOT_IN_THIS_REPO;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, YIELD_OUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(
+			h.spawns.length,
+			0,
+			`must not daemonize a missing PR; got ${h.spawns.map((s) => s.join(" ")).join(" | ")}`,
+		);
+		assert.equal(h.wakes.length, 1, `404 must wake; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /2150 closed without merging/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("absorb ignores a GitHub URL whose pull number is not the awaited PR", async () => {
+	const YIELD_OUT = [
+		"https://github.com/moofone/icemining/pull/2150",
+		"status=handed_off",
+		"next=yield",
+		"pr=1831",
+		"instruction=stop_talking",
+		"",
+	].join("\n");
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok("[]");
+			if (args[1] === "view" && String(args[2]) === "1831") {
+				return ghRepo(args) === "moofone/icemining" ? NOT_IN_THIS_REPO : OPEN;
+			}
+			return NOT_IN_THIS_REPO;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		await h.bash(`cd ${PI_SUB} && git pr-await 1831`, YIELD_OUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(
+			h.calls.filter((c) => /--repo moofone\/icemining/.test(c)).length,
+			0,
+			`must not query the URL's other PR; got ${h.calls.join(" | ")}`,
+		);
+		assert.equal(h.wakes.length, 0, `1831 is open; got ${h.wakes.join(" | ")}`);
+		assert.equal(h.spawns.length, 1, "same-origin 1831 still gets a waiter");
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("defaultSpawnDriver never falls back to HOME or process.cwd()", async () => {
 	const homeResult = defaultSpawnDriver(join(DRIVER_PROBE_DIR, "home-state.json"), {
 		pr: "2163",
@@ -1908,6 +1972,18 @@ test("ghPrViewArgs passes --repo only when the latch names owner/repo", () => {
 		"--repo",
 		"nicobailon/pi-subagents",
 	]);
+});
+
+test("parsePrState: GraphQL not-found is closed; rate-limit stays unknown", () => {
+	assert.equal(
+		parsePrState(
+			"GraphQL: Could not resolve to a PullRequest with the number of 2150. (repository.pullRequest)",
+			false,
+		),
+		"closed",
+	);
+	assert.equal(parsePrState("API rate limit exceeded", false), "unknown");
+	assert.equal(parsePrState('{"state":"OPEN","mergedAt":null}', true), "open");
 });
 
 test("wait chrome is a Loader factory, not a frozen braille string", async () => {

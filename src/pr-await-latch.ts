@@ -892,7 +892,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const url =
 			output.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/)?.[0] ??
 			parseField(output, "url");
-		const slug = url?.match(/github\.com\/([^\s/]+\/[^\s/]+)\/pull\//)?.[1];
+		const urlPr = url?.match(/\/pull\/(\d+)/)?.[1];
+		// A grep of another PR's URL in the same command output used to retarget
+		// slug/chrome onto that repo (icemining#2150 while awaiting 1831).
+		const urlForThisPr = urlPr === pr ? url : undefined;
+		const slug = urlForThisPr?.match(/github\.com\/([^\s/]+\/[^\s/]+)\/pull\//)?.[1];
 		// First-hand: this session ran the command, so it may later be told that it
 		// deferred work until this PR resolves.
 		setLatch({
@@ -901,7 +905,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			lastNext: next,
 			cwd,
 			head,
-			url,
+			url: urlForThisPr,
 			slug,
 			round,
 			roundTotal,

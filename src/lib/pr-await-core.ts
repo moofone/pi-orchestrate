@@ -835,7 +835,12 @@ export function resolveQueryCwd(cwd: string): string {
 }
 
 export function parsePrState(out: string, ok: boolean): "open" | "merged" | "closed" | "unknown" {
-	if (!ok) return "unknown";
+	if (!ok) {
+		// Distinct from rate-limit / network: gh names the missing number.
+		// Treating this as still-open is what daemonized pi-subagents#2150.
+		if (/Could not resolve to a PullRequest/i.test(out)) return "closed";
+		return "unknown";
+	}
 	try {
 		const json = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
 		if (json.mergedAt) return "merged";
