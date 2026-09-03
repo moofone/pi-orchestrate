@@ -251,6 +251,15 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * explicit cancel is `/pr-latch clear`.
 	 */
 	let deferralActive = false;
+	/**
+	 * Waiter state paths this latch has seen exist. A vanished file is terminal
+	 * only when there was something there to lose: a Feature-owned handoff seeds
+	 * no waiter, so `waiterState()` can name a path that never existed, and
+	 * reading its absence as "landed" spent a `gh pr view` on every state-dir
+	 * event (L2, F18 undone). In memory on purpose — a fresh session re-learns
+	 * by looking.
+	 */
+	const seenWaiterPaths = new Set<string>();
 	const watchMs = hooks.watchMs ?? WATCH_BACKSTOP_MS;
 	const chromeMs = hooks.chromeMs ?? (hooks.watchMs === undefined ? 1_000 : 0);
 	const watchStateDir = hooks.watchStateDir ?? true;
@@ -331,6 +340,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			terminalWoken = false;
 			lastActionableFingerprint = undefined;
 			waitStartedAt = 0;
+			seenWaiterPaths.clear();
 			deferralActive = next.origin === "observed";
 		} else if (!next) {
 			deferralActive = false;
@@ -367,12 +377,20 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * `latchFile` is deliberately absent: `pi-<id>.latch.json` is the
 	 * extension's private copy, and treating it as waiter state is the mistake
 	 * ghl-monitor makes when it respawns drivers from it (F3, F20).
+	 *
+	 * Every enumeration is also an observation: paths found on disk are
+	 * recorded in `seenWaiterPaths`, so a later absence can be read as the
+	 * waiter's terminal delete while a path that never existed stays
+	 * non-terminal (L2).
 	 */
 	function waiterStateFiles(): string[] {
 		const files: string[] = [];
 		const own = waiterState();
 		if (own) files.push(own);
 		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
+		for (const path of files) {
+			if (existsSync(path)) seenWaiterPaths.add(path);
+		}
 		return [...new Set(files)];
 	}
 
@@ -630,12 +648,15 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 *
 	 * Asked before spending a `gh pr view`. A waiter that has landed or seen the
 	 * PR closed says so in the file it just wrote — and it deletes that file
-	 * once the PR is terminal, so a state path that has vanished under a live
-	 * latch is the same news by another route.
+	 * once the PR is terminal, so a state path that was seen and then vanished
+	 * under a live latch is the same news by another route. A path that never
+	 * existed is not news at all: for a Feature-owned PR no waiter file is ever
+	 * seeded, and treating its absence as "landed" is what made every log
+	 * append cost a `gh pr view` (L2).
 	 */
 	function waiterSaysTerminal(): boolean {
 		const own = waiterState();
-		if (own && !existsSync(own)) return true;
+		if (own && !existsSync(own) && seenWaiterPaths.has(own)) return true;
 		for (const path of waiterStateFiles()) {
 			const next = readWaiterVerdict(path)?.lastNext;
 			if (next && (TERMINAL_NEXT.has(next) || MECHANICAL.has(next))) return true;
@@ -990,6 +1011,10 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			// the `--daemon` hop takes no positional PR and reads both out of it.
 			const statePath = waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
 			seedWaiterState(statePath, { pr: latch.pr, cwd: latch.cwd });
+			// The seed is a file coming into existence under this latch: its later
+			// absence is the waiter's terminal delete, even if no read ever got
+			// there between seed and delete.
+			seenWaiterPaths.add(statePath);
 			const result = ensureDriver({
 				pr: latch.pr,
 				stateFile: statePath,

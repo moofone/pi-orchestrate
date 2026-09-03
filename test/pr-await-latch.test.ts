@@ -6,7 +6,7 @@
  *
  * Run: npm test  (or: node --experimental-strip-types --test test/pr-await-latch.test.ts)
  */
-import { test } from "node:test";
+import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -103,6 +103,7 @@ function harness(
 	extraHooks: {
 		watchMs?: number;
 		chromeMs?: number;
+		watchStateDir?: boolean;
 		featureOwnedPr?: any;
 		onFeatureActionable?: any;
 		/** Present-and-undefined selects the production pid probe. */
@@ -157,6 +158,7 @@ function harness(
 			: (pr) => running.has(pr),
 		watchMs: extraHooks.watchMs ?? 0,
 		chromeMs: extraHooks.chromeMs ?? 0,
+		watchStateDir: extraHooks.watchStateDir,
 		featureOwnedPr: extraHooks.featureOwnedPr,
 		// Captured, not executed: a real dispatch would spawn a writer child.
 		onFeatureActionable:
@@ -2281,6 +2283,130 @@ test("waiter JSON lastNext=done wakes with no drive log", async () => {
 		);
 		assert.equal(existsSync(join(h.dir, "drive-2142.log")), false);
 	} finally {
+		h.cleanup();
+	}
+});
+
+test("never-created waiter JSON is not terminal", async () => {
+	// §6 test 6 / L2: a Feature-owned handoff seeds no waiter file, so
+	// `waiterState()` names a path that never existed. Reading its absence as
+	// "landed" made every state-dir event — e.g. the waiter appending a
+	// non-terminal verdict to the drive log — spend a `gh pr view` (F18 undone).
+	// `next=read_comments_and_fix` is deliberately not a terminal log line:
+	// the JSON cannot dispatch it and the log sensor must not either.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	const ghCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+	try {
+		await h.start();
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(500);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(h.dispatches.length, 0);
+		assert.equal(
+			existsSync(waiterState(h.dir)),
+			false,
+			"the Feature-owned handoff must seed no waiter file",
+		);
+		const before = ghCalls();
+
+		writeFileSync(join(h.dir, "drive-icemining-2142.log"), "next=read_comments_and_fix\n");
+		await sleep(500);
+		assert.equal(
+			ghCalls(),
+			before,
+			"a path that was never existsSync must not be read as terminal: no gh pr view",
+		);
+		assert.equal(h.wakes.length, 0, `got ${h.wakes.join(" | ")}`);
+		assert.equal(h.dispatches.length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("waiter JSON seen then vanished is terminal", async () => {
+	// §5 B row 3: the waiter deletes its own state file once the PR is over, so
+	// a path this latch saw exist and later found gone is the same news as a
+	// terminal `lastNext` — by another route.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		const path = waiterState(h.dir);
+		assert.equal(existsSync(path), true, "the handoff seeds the waiter's state file");
+
+		// A waiter progress write makes the latch actually look at the file:
+		// from here on its existence is known, so its later absence is news.
+		const cur = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+		writeFileSync(path, JSON.stringify({ ...cur, round: "2", roundTotal: "5" }));
+		await sleep(500);
+		assert.equal(h.wakes.length, 0, "still open, still silent");
+
+		view = MERGED;
+		rmSync(path);
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			1,
+			`a seen-then-vanished waiter file must wake once; got ${h.wakes.join(" | ")}`,
+		);
+		assert.match(h.wake(0), /#2142 merged/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("production backstop fires one gh pr view and one wake", async () => {
+	// §6 test 8: no fs.watch (disabled), no log, no JSON — a Feature-owned
+	// handoff seeds nothing, so a waiter that died without writing anything
+	// leaves the 10-minute backstop as the only sensor. It must cost exactly
+	// one `gh pr view` and produce one wake. Faked timers must see the `unref`
+	// interval; if they ever stop doing that, this test fails and WATCH_BACKSTOP_MS
+	// stays put — a more eager poll is the regression F18 forbids.
+	let view = OPEN;
+	const h = harness((cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)), REPO, {
+		watchMs: WATCH_BACKSTOP_MS,
+		chromeMs: 0,
+		watchStateDir: false,
+	});
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	const ghCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+	try {
+		await h.start();
+		// Enabled before the arm, so startWatch creates the backstop interval
+		// through the mocked setInterval. `sleep` keeps using real setTimeout.
+		mock.timers.enable({ apis: ["setInterval"] });
+		armObservedLatch(h.ctx, {
+			pr: "2142",
+			cwd: REPO,
+			lastNext: "yield",
+			url: "https://github.com/moofone/icemining/pull/2142",
+		});
+		await sleep(120);
+		assert.equal(h.wakes.length, 0, "nothing to say yet");
+		assert.equal(existsSync(waiterState(h.dir)), false, "no waiter JSON was ever written");
+		assert.equal(existsSync(join(h.dir, "drive-icemining-2142.log")), false, "no drive log");
+		const before = ghCalls();
+
+		view = MERGED;
+		mock.timers.tick(WATCH_BACKSTOP_MS);
+		await sleep(50);
+		assert.equal(ghCalls(), before + 1, "the backstop spends exactly one gh pr view");
+		assert.equal(h.wakes.length, 1, `expected one backstop wake; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.equal(h.dispatches.length, 1, "the Feature-owned merge dispatches next=done");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+	} finally {
+		mock.timers.reset();
 		h.cleanup();
 	}
 });
