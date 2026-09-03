@@ -69,6 +69,7 @@ const {
 	prLinkLabel,
 	prUrl,
 	ghPrViewArgs,
+	githubPrUrlFor,
 	parsePrState,
 	isExtensionOwnedStateFile,
 	readLiveRound,
@@ -1155,7 +1156,8 @@ test("a 404 at the origin slug is closed, not a waiter loop", async () => {
 	const h = harness(
 		(cmd, args) => {
 			if (cmd !== "gh") return ok(YIELD_OUT);
-			if (args[1] === "view" && String(args[2]) === "2150") return NOT_IN_THIS_REPO;
+			if (args[0] === "pr" && args[1] === "view" && String(args[2]) === "2150") return NOT_IN_THIS_REPO;
+			if (args[0] === "repo" && args[1] === "view") return ok('{"name":"pi-subagents"}');
 			return NOT_IN_THIS_REPO;
 		},
 		PI_SUB,
@@ -1208,6 +1210,73 @@ test("absorb ignores a GitHub URL whose pull number is not the awaited PR", asyn
 		);
 		assert.equal(h.wakes.length, 0, `1831 is open; got ${h.wakes.join(" | ")}`);
 		assert.equal(h.spawns.length, 1, "same-origin 1831 still gets a waiter");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("absorb selects a later URL whose pull number matches the awaited PR", async () => {
+	const YIELD_OUT = [
+		"https://github.com/moofone/icemining/pull/2150",
+		"https://github.com/nicobailon/pi-subagents/pull/1831",
+		"status=handed_off",
+		"next=yield",
+		"pr=1831",
+		"",
+	].join("\n");
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok("[]");
+			if (args[0] === "pr" && args[1] === "view" && String(args[2]) === "1831") {
+				return ghRepo(args) === "nicobailon/pi-subagents" ? OPEN : NOT_IN_THIS_REPO;
+			}
+			return NOT_IN_THIS_REPO;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		await h.bash(`cd ${PI_SUB} && git pr-await 1831`, YIELD_OUT);
+		await h.settle();
+		await sleep(80);
+		assert.ok(
+			h.calls.some((c) => /gh pr view 1831\b/.test(c) && /--repo nicobailon\/pi-subagents/.test(c)),
+			`must query the matching URL's repo; got ${h.calls.join(" | ")}`,
+		);
+		assert.equal(
+			h.calls.filter((c) => /--repo moofone\/icemining/.test(c)).length,
+			0,
+			`must not follow the first unrelated URL; got ${h.calls.join(" | ")}`,
+		);
+		assert.equal(h.wakes.length, 0, `1831 is still open; got ${h.wakes.join(" | ")}`);
+		assert.equal(h.spawns.length, 0, "fork slug is not this checkout's origin");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("GraphQL not-found with an inaccessible repo is not a closed wake", async () => {
+	const UNAUTH = {
+		stdout: "",
+		stderr: "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+		code: 1,
+		killed: false,
+	};
+	const YIELD_OUT = ["status=handed_off", "next=yield", "pr=2150", ""].join("\n");
+	const h = harness(
+		(cmd, args) => {
+			if (cmd !== "gh") return ok(YIELD_OUT);
+			if (args[0] === "pr" && args[1] === "view") return NOT_IN_THIS_REPO;
+			return UNAUTH;
+		},
+		PI_SUB,
+	);
+	try {
+		await h.start();
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, YIELD_OUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, `auth failure must not look like a close; got ${h.wakes.join(" | ")}`);
 	} finally {
 		h.cleanup();
 	}
@@ -1974,16 +2043,28 @@ test("ghPrViewArgs passes --repo only when the latch names owner/repo", () => {
 	]);
 });
 
-test("parsePrState: GraphQL not-found is closed; rate-limit stays unknown", () => {
+test("parsePrState: GraphQL not-found stays unknown; rate-limit stays unknown", () => {
 	assert.equal(
 		parsePrState(
 			"GraphQL: Could not resolve to a PullRequest with the number of 2150. (repository.pullRequest)",
 			false,
 		),
-		"closed",
+		"unknown",
 	);
 	assert.equal(parsePrState("API rate limit exceeded", false), "unknown");
 	assert.equal(parsePrState('{"state":"OPEN","mergedAt":null}', true), "open");
+});
+
+test("githubPrUrlFor picks the URL whose pull number matches, not the first URL", () => {
+	const text = [
+		"https://github.com/moofone/icemining/pull/2150",
+		"https://github.com/nicobailon/pi-subagents/pull/1831",
+	].join("\n");
+	assert.deepEqual(githubPrUrlFor("1831", text), {
+		url: "https://github.com/nicobailon/pi-subagents/pull/1831",
+		slug: "nicobailon/pi-subagents",
+	});
+	assert.equal(githubPrUrlFor("1831", "https://github.com/moofone/icemining/pull/2150"), undefined);
 });
 
 test("wait chrome is a Loader factory, not a frozen braille string", async () => {
