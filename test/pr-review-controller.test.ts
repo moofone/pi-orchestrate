@@ -1162,3 +1162,50 @@ test("handoff during launch cannot clobber the writer reservation", async () => 
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("env observation during fixing does not clobber the in-flight fixer", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "env-during-fix");
+		await w.ctrl.reconcile();
+		assert.equal(w.ctrl.status(PR)[0]?.state, "fixing");
+		assert.ok(createReviewStore(w.dir).writerFor(PR), "fixer holds the lock");
+		const env = w.ctrl.observeVerdict({
+			pr: PR,
+			next: "fix_command_or_environment",
+			body: http500(),
+			githubStatus: "http_500",
+		});
+		assert.equal(env.kind, "env");
+		assert.equal(env.accepted, true);
+		assert.equal(w.ctrl.status(PR)[0]?.state, "fixing", "env must not rewrite an in-flight fixer");
+		assert.ok(createReviewStore(w.dir).writerFor(PR), "env must not drop the writer");
+		await finishFixer(w, 1, HEAD2);
+		assert.deepEqual(w.published, [HEAD2], "child exit must still publish");
+		assert.equal(w.launches.length, 1, "must not launch a second fixer");
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("HTTP 500 text in a fix verdict still launches a fixer", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		const ack = w.ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "handle HTTP 500: GitHub unavailable"),
+			githubStatus: "http_500",
+		});
+		assert.equal(ack.kind, "fix", "explicit fix next= must win over HTTP 500 text");
+		const r = await w.ctrl.reconcile();
+		assert.equal(r.launched, 1);
+		assert.equal(w.launches.length, 1);
+		assert.equal(w.ctrl.status(PR)[0]?.state, "fixing");
+	} finally {
+		w.cleanup();
+	}
+});

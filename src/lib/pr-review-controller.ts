@@ -267,8 +267,8 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		observeVerdict(obs) {
 			const body = obs.body ?? "";
 			const head = (obs.head || parseVerdictHead(body)).trim();
-			const github500 = obs.githubStatus === "http_500" || isGithubServerError(body);
-			const kind = github500 ? "env" : classifyVerdictNext(obs.next, body);
+			const kind = classifyVerdictNext(obs.next, body);
+			const github500 = kind === "env" && (obs.githubStatus === "http_500" || isGithubServerError(body));
 			const identity = verdictIdentity({
 				pr: obs.pr,
 				head,
@@ -302,6 +302,19 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				return { accepted: false, identity, kind, reason: ob.state };
 			}
 			if (kind === "env") {
+				if (
+					ob.state === "launching" ||
+					ob.state === "fixing" ||
+					ob.state === "validating" ||
+					ob.state === "publishing"
+				) {
+					return {
+						accepted: true,
+						identity,
+						kind,
+						reason: "env queued; fixer in flight",
+					};
+				}
 				const auth = obs.githubStatus === "auth" || isGithubAuthError(body);
 				ob.lastProgress = { at: now(), note: github500 ? "github 500" : auth ? "auth" : `env: ${obs.next}` };
 				if (ob.state === "retry_scheduled" && (ob.retry?.deadline ?? 0) > now()) {

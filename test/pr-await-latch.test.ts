@@ -1931,6 +1931,65 @@ test("reawait after publish targets the obligation PR, not a later latch", async
 	}
 });
 
+test("ensureWaiter targets the obligation PR, not a later latch", async () => {
+	const originalHead = "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016";
+	const fixerHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const otherHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	const runId = `session-ensure-pr-${process.pid}`;
+	let childComplete = false;
+	const otherOut = [
+		"status=reviewer_active",
+		"next=poll_again",
+		"pr=2150",
+		`head=${otherHead}`,
+		"",
+	].join("\n");
+	const h = harness(
+		(cmd, args, opts) => {
+			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "rev-parse") {
+				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
+				if (opts?.cwd === PI_SUB) return ok(otherHead);
+				return ok("");
+			}
+			return ok(REAL_OUTPUT);
+		},
+		REPO,
+		{
+			driverRunning: () => false,
+			onSessionFixer: () => ({ runId, recovered: false }),
+			publish: async (req: { localHead: string }) => ({ ok: true, remoteHead: req.localHead }),
+		},
+	);
+	const snapDir = piRunDir(runId);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		writePiRunComplete(runId);
+		childComplete = true;
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, otherOut);
+		await h.settle();
+		await sleep(80);
+		const afterPublish = h.spawns.length;
+		await h.settle();
+		await sleep(80);
+		assert.ok(h.spawns.length > afterPublish, "ensureWaiter must spawn after waiting_review with no waiter");
+		const last = h.spawn(h.spawns.length - 1);
+		const stateFile = last[last.indexOf("--state") + 1];
+		assert.equal(
+			stateFile,
+			waiterStatePath("icemining", "2142", h.dir),
+			"ensureWaiter must use the obligation PR/worktree, not the live latch",
+		);
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		h.cleanup();
+	}
+});
+
 test("poll_again and yield do not wake", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	await h.start();

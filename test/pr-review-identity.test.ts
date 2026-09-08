@@ -59,6 +59,16 @@ test("GitHub 500 is an env verdict, not a code fix", () => {
 	assert.equal(classifyVerdictNext("read_comments_and_fix"), "fix");
 });
 
+test("explicit fix next= is not env just because the review body mentions HTTP 500", () => {
+	assert.equal(
+		classifyVerdictNext(
+			"read_comments_and_fix",
+			"next=read_comments_and_fix\ncomment body=retry on HTTP 500 / GitHub unavailable",
+		),
+		"fix",
+	);
+});
+
 test("status=500 and auth bodies classify as environment outcomes", () => {
 	assert.equal(isGithubServerError("status=500"), true);
 	assert.equal(classifyVerdictNext("fix_command_or_environment", "status=500"), "env");

@@ -936,18 +936,24 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				return latch?.head;
 			},
 			waiterHealth: async (prKey) => ({ running: driverRunning(prKey.number) }),
-			ensureWaiter: async (_prKey, worktree) => {
-				const held = latch;
-				if (!held) return;
+			ensureWaiter: async (prKey, worktree) => {
+				const cwd = worktree;
+				if (!cwd) return;
+				const prNum = prKey.number;
 				try {
-					if (featureOwnedPr(held.pr, held)) return;
+					const fake = {
+						pr: prNum,
+						cwd,
+						slug: `${prKey.owner}/${prKey.repo}`,
+					};
+					if (featureOwnedPr(prNum, fake)) return;
 				} catch {
 					return;
 				}
-				const running = driverRunning(held.pr);
-				const statePath = waiterStatePath(repoKey(worktree || held.cwd), held.pr, stateDir());
-				seedWaiterState(statePath, { pr: held.pr, cwd: held.cwd });
-				ensureDriver({ pr: held.pr, stateFile: statePath, spawn: spawnDriver, running });
+				const running = driverRunning(prNum);
+				const statePath = waiterStatePath(repoKey(cwd), prNum, stateDir());
+				seedWaiterState(statePath, { pr: prNum, cwd });
+				ensureDriver({ pr: prNum, stateFile: statePath, spawn: spawnDriver, running });
 			},
 		});
 		return reviewCtrl;
