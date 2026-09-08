@@ -379,21 +379,18 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		},
 	};
 
-	async function withPrLock(pr: PrKey, fn: () => Promise<void>): Promise<void> {
+	function withPrLock(pr: PrKey, fn: () => Promise<void>): Promise<void> {
 		const id = prKeyId(pr);
-		const prev = inflight.get(id);
-		if (prev) await prev;
-		let release: () => void = () => {};
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		inflight.set(id, gate);
-		try {
-			await fn();
-		} finally {
-			release();
-			if (inflight.get(id) === gate) inflight.delete(id);
-		}
+		const prev = inflight.get(id) ?? Promise.resolve();
+		const mine = prev.then(() => fn(), () => fn());
+		inflight.set(
+			id,
+			mine.then(
+				() => undefined,
+				() => undefined,
+			),
+		);
+		return mine;
 	}
 
 	async function reconcileOne(pr: PrKey, report: ReconcileReport): Promise<void> {
@@ -461,10 +458,15 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		}
 
 		if (ob.state === "validating" || ob.state === "publishing") {
+			const key = ob.launch?.runId ?? ob.launch?.idempotencyKey;
+			const snap = key ? await deps.queryRun(key) : undefined;
+			if (!snap || snap.status !== "exited") return;
 			await validateAndPublish(ob, {
-				runId: ob.launch?.runId ?? "",
-				ok: true,
-				localHead: ob.head,
+				runId: snap.runId,
+				ok: snap.ok ?? false,
+				stopped: snap.stopped,
+				handoffWritten: snap.handoffWritten,
+				localHead: snap.head,
 			});
 			return;
 		}
@@ -632,6 +634,22 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			report.launched += 1;
 			return;
 		}
+		const snap =
+			(await deps.queryRun(launched.runId)) ?? (await deps.queryRun(journal.idempotencyKey));
+		if (snap?.status === "exited") {
+			ob.state = "validating";
+			if (ob.writer) ob.writer.runId = launched.runId;
+			save(ob, "fixer already exited");
+			report.launched += 1;
+			await validateAndPublish(ob, {
+				runId: snap.runId,
+				ok: snap.ok ?? false,
+				stopped: snap.stopped,
+				handoffWritten: snap.handoffWritten,
+				localHead: snap.head,
+			});
+			return;
+		}
 		ob.state = "fixing";
 		save(ob, launched.recovered ? "bound recovered run" : "fixer launched");
 		report.launched += 1;
@@ -653,6 +671,20 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			if (!ob.activeVerdictIds.includes(id)) ob.activeVerdictIds.push(id);
 			ob.pendingVerdicts = ob.pendingVerdicts.filter((v) => v.identity !== id);
 		}
+	}
+
+	function failFix(ob: Obligation, reason: string): void {
+		const count = (ob.retry?.count ?? 0) + 1;
+		if (count >= FIX_RETRY_CAP) {
+			ob.state = "recovery_required";
+			ob.failureReason = `${reason} repeatedly`;
+		} else {
+			ob.state = "retry_scheduled";
+			ob.retry = { deadline: now() + BACKOFF_MS * 2 ** count, count, reason };
+		}
+		store.releaseWriter(ob.pr, ob.writer?.holder ?? ob.owner.id);
+		ob.writer = undefined;
+		save(ob, reason);
 	}
 
 	async function validateAndPublish(ob: Obligation, result: ChildResult): Promise<void> {
@@ -681,19 +713,18 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			save(ob);
 			return;
 		}
-		const local = result.localHead ?? ob.head;
-		if (!result.ok && !local) {
-			const count = (ob.retry?.count ?? 0) + 1;
-			if (count >= FIX_RETRY_CAP) {
-				ob.state = "recovery_required";
-				ob.failureReason = "fixer failed repeatedly";
-			} else {
-				ob.state = "retry_scheduled";
-				ob.retry = { deadline: now() + BACKOFF_MS * 2 ** count, count, reason: "fixer failed" };
-			}
-			store.releaseWriter(ob.pr, ob.writer?.holder ?? ob.owner.id);
-			ob.writer = undefined;
-			save(ob);
+		const local = result.localHead;
+		const moved = Boolean(local && local !== ob.head);
+		if (!result.ok && !moved) {
+			failFix(ob, "fixer failed");
+			return;
+		}
+		if (!local) {
+			failFix(ob, "fixer produced no head");
+			return;
+		}
+		if (!moved && result.ok) {
+			failFix(ob, "fixer no-op on current head");
 			return;
 		}
 

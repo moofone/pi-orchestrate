@@ -34,7 +34,7 @@ import {
 	writeSync,
 	type FSWatcher,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -97,6 +97,9 @@ import {
 	type LaunchIntent,
 	type LaunchResult,
 	type OwnerLookup,
+	type PublishRequest,
+	type PublishResult,
+	type RunSnapshot,
 } from "./lib/pr-review-events.ts";
 
 export { ACTIONABLE, MECHANICAL, REPO_ROOT, parseAwaitCall, parseField, printedLandCommand, trailingCd };
@@ -117,6 +120,37 @@ export type SpawnDriver = (argv: string[]) => { pid?: number };
  * session, forever (F18).
  */
 export const WATCH_BACKSTOP_MS = 10 * 60_000;
+
+const TERMINAL_RUN_STATES = new Set([
+	"complete",
+	"completed",
+	"failed",
+	"error",
+	"stopped",
+	"cancelled",
+	"canceled",
+	"rejected",
+	"timeout",
+	"timed_out",
+]);
+const STOPPED_RUN_STATES = new Set(["stopped", "cancelled", "canceled", "rejected"]);
+
+function readPiRunSnapshot(runId: string): { terminal: boolean; ok: boolean; stopped: boolean } | undefined {
+	if (!runId) return undefined;
+	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	const dir = join(tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs", runId);
+	try {
+		const raw = JSON.parse(readFileSync(join(dir, "status.json"), "utf8")) as Record<string, unknown>;
+		const state = typeof raw.state === "string" ? raw.state.toLowerCase() : "";
+		const ended = typeof raw.endedAt === "number" && raw.endedAt > 0;
+		const terminal = ended || TERMINAL_RUN_STATES.has(state);
+		const stopped = STOPPED_RUN_STATES.has(state);
+		const ok = terminal && !stopped && (state === "complete" || state === "completed");
+		return { terminal, ok, stopped };
+	} catch {
+		return undefined;
+	}
+}
 
 /** Waiter verdicts that mean the PR is over, so the `gh` check is worth its cost. */
 const TERMINAL_NEXT = new Set(["done", "stop"]);
@@ -219,6 +253,8 @@ export type LatchHooks = {
 	) => void | string | Promise<void | string>;
 	/** Ordinary-session fixer launch. Default emits `pi.pr-review.launch`. */
 	onSessionFixer?: (intent: LaunchIntent) => Promise<LaunchResult> | LaunchResult;
+	queryRun?: (key: string) => Promise<RunSnapshot | undefined>;
+	publish?: (req: PublishRequest) => Promise<PublishResult>;
 	reviewController?: ReviewController;
 };
 
@@ -726,6 +762,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	let reviewCtrl: ReviewController | undefined = hooks.reviewController;
+	const sessionRuns = new Map<string, RunSnapshot & { key: string }>();
 	function getController(): ReviewController {
 		if (reviewCtrl) return reviewCtrl;
 		const store = createReviewStore(stateDir());
@@ -784,13 +821,75 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					}
 					return { runId: `feature-${intent.idempotencyKey}`, recovered: false, completeRound: true };
 				}
-				if (hooks.onSessionFixer) return await hooks.onSessionFixer(intent);
-				const events = (pi as { events?: { emit: (e: string, d: unknown) => void; on: (e: string, h: (d: any) => void) => () => void } }).events;
-				if (!events) throw new Error("pr-review launch handler is not registered in this runtime");
-				return await requestReviewLaunch(events, intent);
+				const launched = hooks.onSessionFixer
+					? await hooks.onSessionFixer(intent)
+					: await (async (): Promise<LaunchResult> => {
+							const events = (pi as { events?: { emit: (e: string, d: unknown) => void; on: (e: string, h: (d: any) => void) => () => void } }).events;
+							if (!events) throw new Error("pr-review launch handler is not registered in this runtime");
+							return await requestReviewLaunch(events, intent);
+					  })();
+				const rec: RunSnapshot & { key: string } = {
+					runId: launched.runId,
+					status: "running",
+					key: intent.idempotencyKey,
+				};
+				sessionRuns.set(launched.runId, rec);
+				sessionRuns.set(intent.idempotencyKey, rec);
+				return launched;
 			},
-			queryRun: async () => undefined,
-			publish: async (req) => ({ ok: true, remoteHead: req.localHead, already: true }),
+			queryRun:
+				hooks.queryRun ??
+				(async (key) => {
+					const mem =
+						sessionRuns.get(key) ??
+						[...sessionRuns.values()].find((r) => r.runId === key || r.key === key);
+					const runId = mem?.runId ?? key;
+					const snap = readPiRunSnapshot(runId);
+					let head: string | undefined;
+					const cwd = latch?.cwd;
+					if (cwd) {
+						try {
+							const r = await pi.exec("git", ["rev-parse", "HEAD"], { cwd, timeout: SHORT_MS });
+							if (r.code === 0) {
+								const h = String(r.stdout ?? "").trim().split(/\s+/)[0] ?? "";
+								head = /^[0-9a-f]{7,40}$/i.test(h) ? h : undefined;
+							}
+						} catch {
+							/* keep mem */
+						}
+					}
+					if (snap?.terminal) {
+						const out: RunSnapshot & { key: string } = {
+							runId,
+							status: "exited",
+							ok: snap.ok,
+							stopped: snap.stopped,
+							head,
+							key: mem?.key ?? key,
+						};
+						sessionRuns.set(runId, out);
+						return out;
+					}
+					return mem;
+				}),
+			publish:
+				hooks.publish ??
+				(async (req) => {
+					try {
+						const r = await pi.exec("git", ["push", "-u", "origin", "HEAD"], {
+							cwd: req.worktree,
+							timeout: 120_000,
+						});
+						if (r.code === 0) return { ok: true, remoteHead: req.localHead };
+						const err = `${String(r.stderr ?? "")} ${String(r.stdout ?? "")}`;
+						if (/everything up-to-date/i.test(err)) {
+							return { ok: true, already: true, remoteHead: req.localHead };
+						}
+						return { ok: false, reason: err.slice(-600) };
+					} catch (error) {
+						return { ok: false, reason: String(error) };
+					}
+				}),
 			reawait: async () => {
 				const held = latch;
 				if (!held) return;
@@ -807,7 +906,21 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				if (st === "merged" || st === "closed" || st === "open") return st;
 				return "unknown";
 			},
-			currentHead: async () => latch?.head,
+			currentHead: async () => {
+				const cwd = latch?.cwd;
+				if (cwd) {
+					try {
+						const r = await pi.exec("git", ["rev-parse", "HEAD"], { cwd, timeout: SHORT_MS });
+						if (r.code === 0) {
+							const head = String(r.stdout ?? "").trim().split(/\s+/)[0] ?? "";
+							if (/^[0-9a-f]{7,40}$/i.test(head)) return head;
+						}
+					} catch {
+						/* fall through */
+					}
+				}
+				return latch?.head;
+			},
 			waiterHealth: async (prKey) => ({ running: driverRunning(prKey.number) }),
 			ensureWaiter: async (_prKey, worktree) => {
 				const held = latch;
@@ -846,7 +959,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			hit = { path, lastNext: v.lastNext, verdict: v.verdict, round: v.round };
 			break;
 		}
-		if (!hit) return;
+		if (!hit) {
+			try {
+				await getController().reconcile();
+			} catch {
+				/* never take the session down */
+			}
+			return;
+		}
 		// REST 404 and GraphQL not-found are missing-PR *or* private/no-access.
 		// Close only when prState can still see the repository; otherwise keep the latch.
 		if (waiterVerdictIsMissingPr(hit.verdict)) {

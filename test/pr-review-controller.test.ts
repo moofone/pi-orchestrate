@@ -504,6 +504,103 @@ test("todo merge-dependent task is not complete while waiting", () => {
 	}
 });
 
+test("failed fixer does not publish just because obligation head exists", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "fail-no-move");
+		await w.ctrl.reconcile();
+		await w.ctrl.childFinished({ runId: "run-1", ok: false });
+		assert.equal(w.published.length, 0, "a failed round must not publish");
+		const st = w.ctrl.status(PR)[0];
+		assert.ok(
+			st?.state === "retry_scheduled" || st?.state === "recovery_required",
+			`expected retry/recovery, got ${st?.state}`,
+		);
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("failed fixer that moved HEAD still publishes", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "fail-but-moved");
+		await w.ctrl.reconcile();
+		await w.ctrl.childFinished({ runId: "run-1", ok: false, localHead: HEAD2 });
+		assert.deepEqual(w.published, [HEAD2]);
+		assert.equal(w.ctrl.status(PR)[0]?.state, "waiting_review");
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("validating recovery does not hard-code ok and re-publish the old head", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "validating-fake-ok");
+		await w.ctrl.reconcile();
+		const snap = w.runs.get("run-1");
+		assert.ok(snap);
+		snap.status = "exited";
+		snap.ok = false;
+		await w.ctrl.reconcile();
+		assert.equal(w.published.length, 0, "queryRun ok:false must not publish");
+		const st = w.ctrl.status(PR)[0];
+		assert.ok(
+			st?.state === "retry_scheduled" || st?.state === "recovery_required",
+			`must not re-arm as success; got ${st?.state}`,
+		);
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("overlapping reconcile cannot run two launchFixer calls at once", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-lock-"));
+	try {
+		const store = createReviewStore(dir);
+		const launches: LaunchIntent[] = [];
+		let inflight = 0;
+		let max = 0;
+		let seq = 0;
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner() }),
+			launchFixer: async (intent) => {
+				inflight += 1;
+				max = Math.max(max, inflight);
+				await new Promise((r) => setTimeout(r, 30));
+				inflight -= 1;
+				seq += 1;
+				launches.push(intent);
+				return { runId: `run-${seq}`, recovered: false };
+			},
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => HEAD1,
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "overlap"),
+		});
+		await Promise.all([ctrl.reconcile(), ctrl.reconcile(), ctrl.reconcile()]);
+		assert.equal(max, 1, "launchFixer must not overlap");
+		assert.equal(launches.length, 1, "one child per obligation");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("Feature cannot silently adopt a session PR while its writer is reserved", async () => {
 	const w = world();
 	try {

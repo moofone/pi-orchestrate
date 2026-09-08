@@ -116,6 +116,8 @@ function harness(
 		featureOwnedPr?: any;
 		onFeatureActionable?: any;
 		onSessionFixer?: any;
+		queryRun?: any;
+		publish?: any;
 		/** Present-and-undefined selects the production pid probe. */
 		driverRunning?: any;
 	} = {},
@@ -183,6 +185,8 @@ function harness(
 				sessionFixes.push(intent);
 				return { runId: `session-${sessionFixes.length}`, recovered: false };
 			}),
+		queryRun: extraHooks.queryRun,
+		publish: extraHooks.publish,
 	});
 
 	let idle = true;
@@ -1713,6 +1717,40 @@ test("undelivered ACTIONABLE on settle launches a fixer, not the parent", async 
 	assert.equal(h.sessionFixes.length, 1, "controller must launch one session fixer");
 	assert.equal(h.sessionFix(0).next, "read_comments_and_fix");
 	h.cleanup();
+});
+
+test("session fixer exit is observed and published without a parent turn", async () => {
+	const published: string[] = [];
+	let exited = false;
+	const newHead = "2033c56dcccccccccccccccccccccccccccccccc";
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		queryRun: async () =>
+			exited
+				? { runId: "session-1", status: "exited", ok: true, head: newHead }
+				: undefined,
+		publish: async (req: { localHead: string }) => {
+			published.push(req.localHead);
+			return { ok: true, remoteHead: req.localHead };
+		},
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 1);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(published.length, 0, "must not publish while the child is running");
+		exited = true;
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "parent stays idle after the fixer exits");
+		assert.equal(published.length, 1, "controller must publish after the fixer exits");
+		assert.equal(published[0], newHead);
+	} finally {
+		h.cleanup();
+	}
 });
 
 test("poll_again and yield do not wake", async () => {
