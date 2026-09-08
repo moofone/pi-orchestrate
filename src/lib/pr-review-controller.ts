@@ -122,7 +122,7 @@ export type ReviewControllerDeps = {
 	publish: (req: PublishRequest) => Promise<PublishResult>;
 	reawait: (pr: PrKey, worktree: string) => Promise<void>;
 	prState: (pr: PrKey) => Promise<PrLiveState>;
-	currentHead: (pr: PrKey) => Promise<string | undefined>;
+	currentHead: (pr: PrKey, worktree?: string) => Promise<string | undefined>;
 	waiterHealth: (pr: PrKey) => Promise<WaiterHealth>;
 	ensureWaiter: (pr: PrKey, worktree: string) => Promise<void>;
 	notifyTerminal?: (notice: {
@@ -300,18 +300,17 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				save(ob);
 				return { accepted: true, identity, kind, reason: "not a code-fixer verdict" };
 			}
-			if (ob.pendingVerdicts.some((v) => v.identity === identity)) {
-				return { accepted: true, identity, kind, duplicate: true };
-			}
 			if (ob.activeVerdictIds.includes(identity)) {
 				return { accepted: true, identity, kind, duplicate: true };
 			}
-			ob.pendingVerdicts.push(record);
+			const duplicate = ob.pendingVerdicts.some((v) => v.identity === identity);
+			if (!duplicate) ob.pendingVerdicts.push(record);
+			hydratePending(ob);
 			if (ob.state === "waiting_review" || ob.state === "retry_scheduled") {
 				ob.state = "verdict_pending";
 			}
 			save(ob, `observed ${kind} ${identity.slice(0, 8)}`);
-			return { accepted: true, identity, kind };
+			return { accepted: true, identity, kind, duplicate };
 		},
 
 		async reconcile(opts = {}) {
@@ -393,9 +392,23 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		return mine;
 	}
 
+	function hydratePending(ob: Obligation): void {
+		for (const v of store.listInbox(ob.pr)) {
+			if (store.hasReceipt(v.identity)) continue;
+			if (v.kind !== "fix" && v.kind !== "dead_reviewers") continue;
+			if (ob.pendingVerdicts.some((p) => p.identity === v.identity)) continue;
+			if (ob.activeVerdictIds.includes(v.identity)) continue;
+			ob.pendingVerdicts.push(v);
+		}
+		if (ob.pendingVerdicts.length > 0 && ob.state === "waiting_review") {
+			ob.state = "verdict_pending";
+		}
+	}
+
 	async function reconcileOne(pr: PrKey, report: ReconcileReport): Promise<void> {
 		const ob = store.read(pr);
 		if (!ob) return;
+		hydratePending(ob);
 		if (ob.state === "paused" || ob.state === "cancelled") return;
 		if (ob.state === "merged" || ob.state === "closed_unmerged") {
 			notifyOnce(ob);
@@ -510,14 +523,27 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			return;
 		}
 
-		const liveHead = (await deps.currentHead(ob.pr)) ?? ob.head;
+		const liveHead = (await deps.currentHead(ob.pr, ob.worktree)) ?? ob.head;
 		if (pendingFix.head && liveHead && pendingFix.head !== liveHead) {
 			ob.lastProgress = {
 				at: now(),
 				note: `stale verdict against ${pendingFix.head.slice(0, 12)}; live ${liveHead.slice(0, 12)}`,
 			};
 			ob.head = liveHead;
-			save(ob);
+			ob.pendingVerdicts = ob.pendingVerdicts.filter((v) => v.identity !== pendingFix.identity);
+			store.putReceipt({
+				v: 1,
+				identity: pendingFix.identity,
+				pr: prKeyId(ob.pr),
+				ownerGeneration: ob.owner.generation,
+				consumedAt: now(),
+				reason: "stale head",
+			});
+			ob.state = "waiting_review";
+			save(ob, ob.lastProgress.note);
+			await deps.reawait(ob.pr, ob.worktree);
+			report.rearmed += 1;
+			return;
 		}
 
 		if (store.writerFor(ob.pr) && ob.state === "fixing") {
@@ -730,7 +756,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 
 		ob.state = "publishing";
 		save(ob, "publishing");
-		const remoteNow = result.remoteHead ?? (await deps.currentHead(ob.pr));
+		const remoteNow = result.remoteHead ?? (await deps.currentHead(ob.pr, ob.worktree));
 		if (local && remoteNow && local === remoteNow) {
 			// Crash after push: remote already has the result.
 			await rearms(ob, local);
@@ -745,6 +771,8 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			remoteHead: remoteNow,
 		});
 		if (!published.ok && !published.already) {
+			store.releaseWriter(ob.pr, ob.writer?.holder ?? ob.owner.id);
+			ob.writer = undefined;
 			ob.state = "recovery_required";
 			ob.failureReason = published.reason ?? "publish failed";
 			save(ob);

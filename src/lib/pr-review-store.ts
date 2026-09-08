@@ -100,6 +100,7 @@ export type ReviewStore = {
 	list(): Obligation[];
 	putInbox(verdict: VerdictRecord, pr: PrKey): void;
 	readInbox(identity: string): VerdictRecord | undefined;
+	listInbox(pr?: PrKey): VerdictRecord[];
 	putReceipt(receipt: ConsumptionReceipt): boolean;
 	hasReceipt(identity: string): boolean;
 	reserveWriter(pr: PrKey, reservation: WriterReservation): boolean;
@@ -202,6 +203,28 @@ export function createReviewStore(stateDir: string): ReviewStore {
 				return undefined;
 			}
 		},
+		listInbox(pr) {
+			const out: VerdictRecord[] = [];
+			const want = pr ? prKeyId(pr) : undefined;
+			let names: string[] = [];
+			try {
+				names = readdirSync(join(dir, "inbox"));
+			} catch {
+				return out;
+			}
+			for (const name of names) {
+				if (!name.endsWith(".json")) continue;
+				try {
+					const raw = JSON.parse(readFileSync(join(dir, "inbox", name), "utf8")) as VerdictRecord & { pr?: string };
+					if (!raw || typeof raw.identity !== "string") continue;
+					if (want && raw.pr && raw.pr !== want) continue;
+					out.push(raw);
+				} catch {
+					/* skip */
+				}
+			}
+			return out;
+		},
 		putReceipt(receipt) {
 			const path = join(dir, "receipts", `${receipt.identity}.json`);
 			if (existsSync(path)) return false;
@@ -259,8 +282,10 @@ export function createReviewStore(stateDir: string): ReviewStore {
 			if (!target) return undefined;
 			for (const ob of store.list()) {
 				if (ob.worktree.replace(/\/+$/, "") !== target) continue;
-				const reservation = readReservation(ob.pr) ?? ob.writer;
-				if (reservation) return { pr: ob.pr, reservation };
+				const reservation = readReservation(ob.pr);
+				if (!reservation) continue;
+				if (reservation.pid != null && !pidLive(reservation.pid)) continue;
+				return { pr: ob.pr, reservation };
 			}
 			return undefined;
 		},

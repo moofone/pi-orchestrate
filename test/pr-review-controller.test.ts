@@ -296,14 +296,17 @@ test("new verdict while old fixer runs stays pending; old ack cannot erase it", 
 	}
 });
 
-test("stale verdict is re-evaluated against current head", async () => {
+test("stale verdict is dropped and re-awaited, not launched against the live head", async () => {
 	const w = world();
 	try {
 		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
 		observeFix(w, PR, HEAD1, "stale-lines");
 		w.github.head = HEAD2;
 		await w.ctrl.reconcile();
-		assert.equal(w.launches[0]?.expectedHead, HEAD2, "must not launch against the stale head");
+		assert.equal(w.launches.length, 0, "must not launch a fixer for an obsolete head");
+		assert.equal(w.reawaits, 1);
+		assert.equal(w.ctrl.status(PR)[0]?.state, "waiting_review");
+		assert.equal(w.ctrl.status(PR)[0]?.pendingCount, 0);
 	} finally {
 		w.cleanup();
 	}
@@ -598,6 +601,151 @@ test("overlapping reconcile cannot run two launchFixer calls at once", async () 
 		assert.equal(launches.length, 1, "one child per obligation");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("inbox hydrates a verdict lost from a racy obligation write", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-inbox-"));
+	try {
+		const store = createReviewStore(dir);
+		const launches: string[] = [];
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner() }),
+			launchFixer: async (intent) => {
+				launches.push(intent.verdictIds[0] ?? "");
+				return { runId: `run-${launches.length}`, recovered: false };
+			},
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => HEAD1,
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		const a = ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "inbox-a"),
+		});
+		const b = ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "inbox-b"),
+		});
+		assert.notEqual(a.identity, b.identity);
+		const lost = store.read(PR)!;
+		lost.pendingVerdicts = lost.pendingVerdicts.filter((v) => v.identity !== a.identity);
+		store.write(lost);
+		assert.equal(store.read(PR)?.pendingVerdicts.some((v) => v.identity === a.identity), false);
+		await ctrl.reconcile();
+		assert.equal(launches.length, 1, "hydrated obligation still dispatches");
+		const pending = store.read(PR)?.pendingVerdicts.map((v) => v.identity) ?? [];
+		const active = store.read(PR)?.activeVerdictIds ?? [];
+		assert.ok(
+			[...pending, ...active, ...launches].includes(a.identity),
+			"lost verdict A must be recovered from inbox",
+		);
+		assert.ok(
+			[...pending, ...active, ...launches].includes(b.identity),
+			"verdict B must remain",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("publish failure releases the writer reservation", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-pubfail-"));
+	try {
+		const store = createReviewStore(dir);
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner() }),
+			launchFixer: async () => ({ runId: "run-1", recovered: false }),
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: false, reason: "rejected" }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => HEAD1,
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "pub-fail"),
+		});
+		await ctrl.reconcile();
+		await ctrl.childFinished({ runId: "run-1", ok: true, localHead: HEAD2 });
+		assert.equal(ctrl.status(PR)[0]?.state, "recovery_required");
+		assert.equal(store.writerFor(PR), undefined, "lock file must be released");
+		assert.equal(store.writerForWorktree("/wt"), undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("writerForWorktree ignores a persisted writer when the lock file is gone", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-stale-lock-"));
+	try {
+		const store = createReviewStore(dir);
+		store.write({
+			v: 1,
+			pr: PR,
+			generation: "g1",
+			owner: sessionOwner(),
+			worktree: "/wt/feat",
+			head: HEAD1,
+			state: "recovery_required",
+			pendingVerdicts: [],
+			activeVerdictIds: [],
+			writer: { holder: "session:dead", pid: 1, reservedAt: 1 },
+		});
+		assert.equal(store.writerForWorktree("/wt/feat"), undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("currentHead is asked with the obligation worktree", async () => {
+	const w = world();
+	const seen: Array<string | undefined> = [];
+	try {
+		const dir = w.dir;
+		const store = createReviewStore(dir);
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner() }),
+			launchFixer: async () => ({ runId: "run-1", recovered: false }),
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async (_pr, worktree) => {
+				seen.push(worktree);
+				return HEAD1;
+			},
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt/feature", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "cwd"),
+		});
+		await ctrl.reconcile();
+		assert.ok(seen.includes("/wt/feature"));
+	} finally {
+		w.cleanup();
 	}
 });
 

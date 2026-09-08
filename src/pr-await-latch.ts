@@ -906,8 +906,8 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				if (st === "merged" || st === "closed" || st === "open") return st;
 				return "unknown";
 			},
-			currentHead: async () => {
-				const cwd = latch?.cwd;
+			currentHead: async (_prKey, worktree) => {
+				const cwd = worktree || latch?.cwd;
 				if (cwd) {
 					try {
 						const r = await pi.exec("git", ["rev-parse", "HEAD"], { cwd, timeout: SHORT_MS });
