@@ -165,12 +165,29 @@ const WRITER_BLOCKS: { re: RegExp; reason: string }[] = [
  * Writer blocks are checked first: the solo allowlist deliberately waves
  * `git pr-await` through, and for a child that is exactly the wrong answer.
  */
-export function classifyForRole(command: string, opts: { writer: boolean }): GuardVerdict {
+const PARENT_MUTATION =
+	/\bgit\s+(add|commit|push|checkout|restore|reset|rebase|merge|cherry-pick)\b/;
+
+export function isWorktreeMutation(command: string): boolean {
+	return PARENT_MUTATION.test(stripComments(command));
+}
+
+export function classifyForRole(
+	command: string,
+	opts: { writer: boolean; writerReserved?: boolean },
+): GuardVerdict {
 	if (opts.writer) {
 		const text = stripComments(command);
 		for (const rule of WRITER_BLOCKS) {
 			if (rule.re.test(text)) return { block: true, reason: rule.reason };
 		}
+	}
+	if (opts.writerReserved && isWorktreeMutation(command)) {
+		return {
+			block: true,
+			reason:
+				"a fixer holds this worktree; the parent must not mutate it. The controller publishes after the child settles.",
+		};
 	}
 	return classifyGitWorkflowCommand(command);
 }

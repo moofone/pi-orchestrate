@@ -115,6 +115,7 @@ function harness(
 		watchStateDir?: boolean;
 		featureOwnedPr?: any;
 		onFeatureActionable?: any;
+		onSessionFixer?: any;
 		/** Present-and-undefined selects the production pid probe. */
 		driverRunning?: any;
 	} = {},
@@ -126,6 +127,7 @@ function harness(
 	const wakeModes: Array<string | undefined> = [];
 	const spawns: string[][] = [];
 	const dispatches: FeatureDispatch[] = [];
+	const sessionFixes: any[] = [];
 	const running = new Set<string>();
 	const sessionId = `TEST-${process.pid}-${++sessionSeq}`;
 	const dir = mkdtempSync(join(tmpdir(), "ghl-await-h-"));
@@ -175,6 +177,12 @@ function harness(
 			((_ctx: unknown, owner: any, verdict: FeatureDispatch["verdict"]) => {
 				dispatches.push({ owner, verdict });
 			}),
+		onSessionFixer:
+			extraHooks.onSessionFixer ??
+			((intent: unknown) => {
+				sessionFixes.push(intent);
+				return { runId: `session-${sessionFixes.length}`, recovered: false };
+			}),
 	});
 
 	let idle = true;
@@ -220,9 +228,11 @@ function harness(
 		wake: (i = 0) => nth(wakes, i, "wake"),
 		spawn: (i = 0) => nth(spawns, i, "spawn"),
 		dispatch: (i = 0) => nth(dispatches, i, "dispatch"),
+		sessionFix: (i = 0) => nth(sessionFixes, i, "session fixer"),
 		wakeModes,
 		spawns,
 		dispatches,
+		sessionFixes,
 		notifies,
 		widgets,
 		titles,
@@ -1689,24 +1699,19 @@ test("handoff persist does not wipe a waiter ACTIONABLE verdict", async () => {
 	await sleep(40);
 	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 	assert.equal(state.lastNext, "read_comments_and_fix", "persist must not clobber the waiter verdict");
-	assert.equal(state.verdictDelivered, true, "the delivered wake must mark the verdict spent");
 	h.cleanup();
 });
 
-test("undelivered ACTIONABLE on settle wakes the live parent once", async () => {
+test("undelivered ACTIONABLE on settle launches a fixer, not the parent", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
 	writeActionable(h.dir, h.sessionId);
 	await h.settle();
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, `expected one ACTIONABLE wake, got ${h.wakes.length}`);
-	assert.match(h.wake(0), /next=read_comments_and_fix/);
-	assert.match(h.wake(0), /Fix current-head findings/);
-	assert.match(h.wake(0), /Do not wait for another user message/);
-	assert.match(h.wake(0), /comment bot=grok/);
-	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
-	assert.equal(state.verdictDelivered, true);
+	assert.equal(h.wakes.length, 0, `parent must stay idle; got ${h.wakes.join(" | ")}`);
+	assert.equal(h.sessionFixes.length, 1, "controller must launch one session fixer");
+	assert.equal(h.sessionFix(0).next, "read_comments_and_fix");
 	h.cleanup();
 });
 
@@ -1731,17 +1736,18 @@ test("already-delivered ACTIONABLE does not wake", async () => {
 	h.cleanup();
 });
 
-test("same ACTIONABLE verdict does not wake twice", async () => {
+test("same ACTIONABLE verdict does not launch twice", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchMs: 20 });
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
 	writeActionable(h.dir, h.sessionId);
 	await h.settle();
 	await sleep(80);
-	assert.equal(h.wakes.length, 1);
+	assert.equal(h.sessionFixes.length, 1);
+	assert.equal(h.wakes.length, 0);
 	writeActionable(h.dir, h.sessionId, { verdictDelivered: false });
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, "same fingerprint must not re-wake even if delivered was reset");
+	assert.equal(h.sessionFixes.length, 1, "same identity must not launch a second fixer");
 	h.cleanup();
 });
 
@@ -1771,7 +1777,7 @@ test("actionableFingerprint distinguishes later rounds of the same next=", () =>
 	assert.notEqual(first, laterBody, "new findings must not look like the first");
 });
 
-test("same-session reload wakes on undelivered ACTIONABLE", async () => {
+test("same-session reload reconciles undelivered ACTIONABLE without a parent turn", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
@@ -1781,12 +1787,12 @@ test("same-session reload wakes on undelivered ACTIONABLE", async () => {
 	writeActionable(h.dir, h.sessionId);
 	await h.start();
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, "/rreload must deliver the waiting fix verdict");
-	assert.match(h.wake(0), /next=read_comments_and_fix/);
+	assert.equal(h.wakes.length, 0, "/rreload must not make the parent the fixer");
+	assert.equal(h.sessionFixes.length, 1, "/rreload must still launch the fixer");
 	h.cleanup();
 });
 
-test("watch delivers ACTIONABLE written after handoff", async () => {
+test("watch launches a fixer for ACTIONABLE written after handoff", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchMs: 20 });
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
@@ -1795,8 +1801,8 @@ test("watch delivers ACTIONABLE written after handoff", async () => {
 	assert.equal(h.wakes.length, 0, "must not wake while the waiter is still polling");
 	writeActionable(h.dir, h.sessionId);
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, "watch must inject the waiter verdict");
-	assert.match(h.wake(0), /next=read_comments_and_fix/);
+	assert.equal(h.wakes.length, 0, "watch must not inject a parent fix turn");
+	assert.equal(h.sessionFixes.length, 1, "watch must launch a fixer");
 	h.cleanup();
 });
 
@@ -2138,8 +2144,8 @@ test("a Feature with no worktree recorded is reported, not handed to the parent"
 	}
 });
 
-test("a Feature in another repo, or on another PR, does not swallow the solo wake", async () => {
-	// Ownership is `pr:` AND `repo:`. Anything looser would mute the wake a plain
+test("a Feature in another repo, or on another PR, does not swallow the session fixer", async () => {
+	// Ownership is `pr:` AND `repo:`. Anything looser would mute the fixer a plain
 	// session depends on, using a Feature that has nothing to do with this PR.
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	writeFeatureStatus(h.dir, { repo: "icemining-devops", name: "feat-devops", pr: "2142" });
@@ -2151,9 +2157,8 @@ test("a Feature in another repo, or on another PR, does not swallow the solo wak
 		await h.settle();
 		await sleep(80);
 		assert.equal(h.dispatches.length, 0, "neither Feature owns icemining#2142");
-		assert.equal(h.wakes.length, 1, `the solo wake must survive; got ${h.wakes.join(" | ")}`);
-		assert.match(h.wake(0), /Fix current-head findings/);
-		assert.match(h.wake(0), /Do not wait for another user message/);
+		assert.equal(h.wakes.length, 0, `parent must stay idle; got ${h.wakes.join(" | ")}`);
+		assert.equal(h.sessionFixes.length, 1, "session fixer must still launch");
 	} finally {
 		h.cleanup();
 	}
@@ -2811,7 +2816,7 @@ test("P5 F18: the GitHub backstop is minutes, not the old 15s poll", () => {
 	);
 });
 
-test("P5 F18: a waiter verdict wakes the session with no poll in between", async () => {
+test("P5 F18: a waiter verdict launches a fixer with no poll in between", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
 	try {
 		await h.start();
@@ -2822,12 +2827,12 @@ test("P5 F18: a waiter verdict wakes the session with no poll in between", async
 
 		writeActionable(h.dir, h.sessionId);
 		await sleep(500);
+		assert.equal(h.wakes.length, 0, "fs.watch must not inject a parent fix turn");
 		assert.equal(
-			h.wakes.length,
+			h.sessionFixes.length,
 			1,
-			`fs.watch must deliver the verdict; the 10-minute timer cannot have fired`,
+			`fs.watch must launch a fixer; the 10-minute timer cannot have fired`,
 		);
-		assert.match(h.wake(0), /read_comments_and_fix/);
 	} finally {
 		h.cleanup();
 	}

@@ -178,3 +178,10 @@ test("P2 F7: the writer role is read from the env pi-subagents already sets", ()
     "an explicit spawn env is honoured too",
   );
 });
+
+test("parent mutation is blocked while a fixer holds the worktree", () => {
+  assert.equal(classifyForRole("git push", { writer: false, writerReserved: true }).block, true);
+  assert.equal(classifyForRole("git commit -m fix", { writer: false, writerReserved: true }).block, true);
+  assert.equal(classifyForRole("git status", { writer: false, writerReserved: true }).block, false);
+  assert.equal(classifyForRole("git push", { writer: false, writerReserved: false }).block, false);
+});

@@ -6,18 +6,12 @@
  * exists. Mechanical wait is that Rust process (0 tokens). This extension
  * does not poll, land, or spawn `pi --print` one-shots.
  *
- * A *live* parent is woken once when the PR merges or closes, or when the
- * waiter records an undelivered ACTIONABLE verdict (`read_comments_and_fix`,
- * `investigate_dead_reviewers`, `fix_command_or_environment`). Reload of an
- * already-terminal latch notifies only — the user is not in that session —
- * but an undelivered ACTIONABLE verdict still wakes: that is how review
- * fixes continue after `/rreload` without a Stop hook.
- *
- * One exception to that wake: a PR a live `/orchestrate` Feature owns. Its
- * verdict is dispatched to a writer by code, so the session holding the latch
- * gets a toast and nothing else. It is not the fixer — the parent must not
- * implement, and an adopted latch may belong to a chat that never heard of
- * the PR.
+ * A *live* parent is woken once when the PR merges or closes. ACTIONABLE
+ * review verdicts go to the PR review controller, which launches a fixer
+ * without a parent model turn. Reload of an already-terminal latch notifies
+ * only — the user is not in that session — but an undelivered ACTIONABLE
+ * still reconciles so review fixes continue after `/rreload` without a Stop
+ * hook.
  *
  * `session_shutdown` must not kill the waiter.
  *
@@ -95,6 +89,15 @@ import {
 	type FeaturePrOwner,
 	type LatchState,
 } from "./lib/pr-await-core.ts";
+import { parsePrKey } from "./lib/pr-review-identity.ts";
+import { createReviewStore } from "./lib/pr-review-store.ts";
+import { createReviewController, type ReviewController } from "./lib/pr-review-controller.ts";
+import {
+	requestReviewLaunch,
+	type LaunchIntent,
+	type LaunchResult,
+	type OwnerLookup,
+} from "./lib/pr-review-events.ts";
 
 export { ACTIONABLE, MECHANICAL, REPO_ROOT, parseAwaitCall, parseField, printedLandCommand, trailingCd };
 
@@ -214,6 +217,9 @@ export type LatchHooks = {
 		owner: FeaturePrOwner,
 		verdict: { pr: string; next: string; output: string; round?: string },
 	) => void | string | Promise<void | string>;
+	/** Ordinary-session fixer launch. Default emits `pi.pr-review.launch`. */
+	onSessionFixer?: (intent: LaunchIntent) => Promise<LaunchResult> | LaunchResult;
+	reviewController?: ReviewController;
 };
 
 export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
@@ -543,31 +549,6 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		);
 	}
 
-	function actionableResumeText(
-		s: LatchState,
-		next: string,
-		verdict: string | undefined,
-	): string {
-		const label = prLabel(s);
-		const what =
-			next === "read_comments_and_fix"
-				? "Fix current-head findings (red then green), one push, then git pr-await once."
-				: next === "investigate_dead_reviewers"
-					? "Restart reviewers, then git pr-await once."
-					: next === "fix_command_or_environment"
-						? "Fix env, then git pr-await once."
-						: "Act on this verdict, then git pr-await once.";
-		// Adopted is a successor (reload minted a new session id). Imperative, or
-		// `/rreload` repeats the #2163 stall: the model is told it may stay idle.
-		const observedOrSuccessor = s.origin === "observed" || s.origin === "adopted";
-		const originNote = observedOrSuccessor
-			? "Do not wait for another user message."
-			: `This latch was inferred from the branch checked out in ${s.cwd}. ` +
-				`If this session was waiting on that verdict, continue now. ` +
-				`If it was not, do nothing, change no files, and stay idle.`;
-		const body = verdict?.trim() ? `\n\n${verdict.trim()}` : "";
-		return `pr-latch: ${label} next=${next}. ${what} ${originNote}${body}`;
-	}
 
 	function toastText(s: LatchState, state: "merged" | "closed"): string {
 		const label = prLinkLabel(s);
@@ -744,6 +725,107 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 	}
 
+	let reviewCtrl: ReviewController | undefined = hooks.reviewController;
+	function getController(): ReviewController {
+		if (reviewCtrl) return reviewCtrl;
+		const store = createReviewStore(stateDir());
+		reviewCtrl = createReviewController({
+			store,
+			lookupOwner: (prKey): OwnerLookup => {
+				const held = latch;
+				const fake: LatchState = {
+					pr: prKey.number,
+					cwd: held?.cwd ?? "",
+					slug: `${prKey.owner}/${prKey.repo}`,
+					head: held?.head,
+				};
+				try {
+					const feature = featureOwnedPr(prKey.number, fake);
+					if (feature) {
+						return {
+							status: "feature",
+							owner: { kind: "feature", id: feature.dir, generation: feature.dir },
+							worktree: feature.worktree,
+						};
+					}
+				} catch {
+					return { status: "unavailable", reason: "feature owner lookup failed" };
+				}
+				return {
+					status: "session",
+					owner: {
+						kind: "session",
+						id: sessionId ?? "session",
+						generation: sessionId ?? "session",
+					},
+					worktree: held?.cwd,
+				};
+			},
+			launchFixer: async (intent: LaunchIntent): Promise<LaunchResult> => {
+				if (intent.owner.kind === "feature") {
+					const feature = featureOwnedPr(intent.pr.number, {
+						pr: intent.pr.number,
+						cwd: intent.worktree,
+						slug: `${intent.pr.owner}/${intent.pr.repo}`,
+					});
+					if (!feature?.worktree) {
+						throw new Error("feature records no worktree");
+					}
+					const ctx = waitCtx;
+					if (!ctx) throw new Error("no session context for feature dispatch");
+					const action = await onFeatureActionable(ctx, feature, {
+						pr: intent.pr.number,
+						next: intent.next,
+						output: intent.body,
+						round: parseField(intent.body, "round"),
+					});
+					if (!isAcceptedFeaturePrAction(action)) {
+						throw new Error(`refuse:${String(action)}`);
+					}
+					return { runId: `feature-${intent.idempotencyKey}`, recovered: false, completeRound: true };
+				}
+				if (hooks.onSessionFixer) return await hooks.onSessionFixer(intent);
+				const events = (pi as { events?: { emit: (e: string, d: unknown) => void; on: (e: string, h: (d: any) => void) => () => void } }).events;
+				if (!events) throw new Error("pr-review launch handler is not registered in this runtime");
+				return await requestReviewLaunch(events, intent);
+			},
+			queryRun: async () => undefined,
+			publish: async (req) => ({ ok: true, remoteHead: req.localHead, already: true }),
+			reawait: async () => {
+				const held = latch;
+				if (!held) return;
+				const running = driverRunning(held.pr);
+				const statePath = waiterStatePath(repoKey(held.cwd), held.pr, stateDir());
+				seedWaiterState(statePath, { pr: held.pr, cwd: held.cwd });
+				ensureDriver({ pr: held.pr, stateFile: statePath, spawn: spawnDriver, running });
+			},
+			prState: async (prKey) => {
+				const held = latch;
+				const cwd = held?.cwd ?? "";
+				const slug = `${prKey.owner}/${prKey.repo}`;
+				const st = await prState(prKey.number, cwd, slug);
+				if (st === "merged" || st === "closed" || st === "open") return st;
+				return "unknown";
+			},
+			currentHead: async () => latch?.head,
+			waiterHealth: async (prKey) => ({ running: driverRunning(prKey.number) }),
+			ensureWaiter: async (_prKey, worktree) => {
+				const held = latch;
+				if (!held) return;
+				try {
+					if (featureOwnedPr(held.pr, held)) return;
+				} catch {
+					return;
+				}
+				const running = driverRunning(held.pr);
+				const statePath = waiterStatePath(repoKey(worktree || held.cwd), held.pr, stateDir());
+				seedWaiterState(statePath, { pr: held.pr, cwd: held.cwd });
+				ensureDriver({ pr: held.pr, stateFile: statePath, spawn: spawnDriver, running });
+			},
+		});
+		return reviewCtrl;
+	}
+
 	/**
 	 * The Grok/Claude stop-hook injects one undelivered ACTIONABLE verdict on
 	 * Stop. Pi has no Stop hook — the session has already yielded — so the
@@ -751,6 +833,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 */
 	async function checkActionable(ctx: ExtensionContext): Promise<void> {
 		if (disabled || !latch) return;
+		waitCtx = ctx;
 		const pr = latch.pr;
 		const candidates = waiterStateFiles();
 		let hit:
@@ -779,86 +862,87 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			round: hit.round,
 		});
 		if (fp === lastActionableFingerprint) return;
-		// A verdict this session already tried and had refused is re-attempted on
-		// every watch tick — that retry is how it drains when the chain lock is
-		// released — but it must not re-announce itself each time.
 		const repeatOfRefusal = fp === lastRefusedFingerprint;
 		if (!repeatOfRefusal) {
 			status(ctx, `pr-await ${prLabel(latch)} · ${hit.lastNext}`);
 			notify(ctx, `pr-latch: ${prLinkLabel(latch)} ${hit.lastNext}`);
 		}
 
-		// A PR a live Feature owns is fixed by a writer that code dispatches, so
-		// this session is told nothing to do. Waking it would make whoever holds
-		// the latch the fixer: the parent orchestrator, which must not implement,
-		// or — for an adopted latch — a chat that never heard of the PR.
-		let owner: FeaturePrOwner | undefined;
-		try {
-			owner = featureOwnedPr(pr, latch);
-		} catch {
-			// Ownership could not be established. Solo is the pre-Feature behaviour
-			// and the only one that keeps a plain session's fix moving.
-			owner = undefined;
-		}
-		if (owner) {
-			if (!owner.worktree) {
-				notify(
-					ctx,
-					`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} belongs to Feature ${owner.name}, which ` +
-						`records no worktree — nothing dispatched. Set \`worktree:\` in ${owner.statusFile}, ` +
-						`then /orchestrate resume ${owner.name}.`,
-				);
-				return;
-			}
-			// What the verdict costs — a writer, a re-await, nothing — is the
-			// dispatcher's call, and it toasts that itself. This one only says the
-			// verdict left this session.
-			if (!repeatOfRefusal) {
-				notify(
-					ctx,
-					`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} → Feature ${owner.name}: dispatched by ` +
-						`/orchestrate. This session stays idle.`,
-				);
-			}
-			// Dispatch decides whether the verdict was consumed. Marking it first
-			// is F4: a `refuse` while a fixer holds the chain lock threw the
-			// finding away, and the waiter never re-emits it.
-			let action: unknown;
-			try {
-				action = await onFeatureActionable(ctx, owner, {
-					pr,
-					next: hit.lastNext,
-					output: hit.verdict ?? "",
-					round: hit.round,
-				});
-			} catch (err) {
-				// A failed dispatch is reported, never converted into a parent turn:
-				// the session that holds the latch is still not the fixer. The
-				// verdict stays on disk so a later attempt can still find it.
-				lastRefusedFingerprint = fp;
-				notify(
-					ctx,
-					`pr-latch: dispatching ${prLinkLabel(latch)} ${hit.lastNext} to Feature ${owner.name} failed ` +
-						`(${String(err)}). Run /orchestrate resume ${owner.name}.`,
-				);
-				return;
-			}
-			if (!isAcceptedFeaturePrAction(action)) {
-				// Refused: leave every file undelivered. The reconciler and the next
-				// watch tick both retry it once the writer that holds the Feature is
-				// done. `lastActionableFingerprint` stays unset so that retry works.
-				lastRefusedFingerprint = fp;
-				return;
-			}
-			lastActionableFingerprint = fp;
-			lastRefusedFingerprint = undefined;
-			for (const path of candidates) markVerdictDelivered(path);
+		const repo = repoKey(latch.cwd);
+		const key = parsePrKey({
+			pr,
+			slug: latch.slug || originSlug(latch.cwd) || (repo ? `local/${repo}` : undefined),
+		});
+		if (!key) {
+			notify(ctx, `pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} — cannot name owner/repo; recovery-required.`);
 			return;
 		}
-		// Solo: this session is the fixer, so the wake itself is the delivery.
+
+		let feature: FeaturePrOwner | undefined;
+		let featureLookupFailed = false;
+		try {
+			feature = featureOwnedPr(pr, latch);
+		} catch {
+			featureLookupFailed = true;
+		}
+		if (feature && !feature.worktree) {
+			notify(
+				ctx,
+				`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} belongs to Feature ${feature.name}, which ` +
+					`records no worktree — nothing dispatched. Set \`worktree:\` in ${feature.statusFile}, ` +
+					`then /orchestrate resume ${feature.name}.`,
+			);
+			return;
+		}
+		if (feature && !repeatOfRefusal) {
+			notify(
+				ctx,
+				`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} → Feature ${feature.name}: dispatched by ` +
+					`/orchestrate. This session stays idle.`,
+			);
+		}
+
+		const owner = feature
+			? { kind: "feature" as const, id: feature.dir, generation: feature.dir }
+			: {
+					kind: "session" as const,
+					id: sessionId ?? "session",
+					generation: sessionId ?? "session",
+			  };
+		const ctrl = getController();
+		ctrl.handoff({
+			pr: key,
+			owner,
+			worktree: feature?.worktree || latch.cwd,
+			head: latch.head,
+		});
+		const ack = ctrl.observeVerdict({
+			pr: key,
+			next: hit.lastNext,
+			body: hit.verdict,
+			round: hit.round,
+			githubStatus: /HTTP\s*5\d\d/i.test(hit.verdict ?? "") ? "http_500" : undefined,
+		});
+		if (!ack.accepted) return;
+		const report = await ctrl.reconcile({ ownerId: owner.id });
+		if (featureLookupFailed || report.recovery > 0) {
+			lastRefusedFingerprint = fp;
+			notify(
+				ctx,
+				`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} recovery-required` +
+					(featureLookupFailed ? " (feature owner lookup failed; no solo fallback)." : "."),
+			);
+			return;
+		}
+		if (report.refused > 0 && report.launched === 0) {
+			lastRefusedFingerprint = fp;
+			return;
+		}
 		lastActionableFingerprint = fp;
-		for (const path of candidates) markVerdictDelivered(path);
-		wakeParent(ctx, actionableResumeText(latch, hit.lastNext, hit.verdict));
+		lastRefusedFingerprint = undefined;
+		if (report.launched > 0) {
+			for (const path of candidates) markVerdictDelivered(path);
+		}
 	}
 
 	function notify(ctx: ExtensionContext, text: string): void {
@@ -1244,13 +1328,28 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				ctx.ui.notify("pr-latch enabled", "info");
 				return;
 			}
+			const views = (() => {
+				try {
+					return getController().status();
+				} catch {
+					return [];
+				}
+			})();
+			const review =
+				views[0] &&
+				` · review ${views[0].state} head=${(views[0].head || "?").slice(0, 12)} pending=${views[0].pendingCount}` +
+					(views[0].runId ? ` run=${views[0].runId}` : "") +
+					(views[0].failureReason ? ` reason=${views[0].failureReason}` : "");
 			ctx.ui.notify(
 				disabled
 					? "pr-latch: sensor disabled (/pr-latch on to re-enable)"
 					: latch
 						? `pr-latch: PR #${latch.pr} · next=${latch.lastNext ?? "?"} · ` +
-							`${driverRunning(latch.pr) ? "waiter running" : "no waiter"} · ${latch.cwd}`
-						: "pr-latch: no PR latched",
+							`${driverRunning(latch.pr) ? "waiter running" : "no waiter"}` +
+							`${review ?? ""} · ${latch.cwd}`
+						: views[0]
+							? `pr-latch: ${views[0].pr} · ${views[0].state} pending=${views[0].pendingCount}`
+							: "pr-latch: no PR latched",
 				"info",
 			);
 		},

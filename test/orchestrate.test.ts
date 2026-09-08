@@ -2489,7 +2489,8 @@ test("L4: FORBIDDEN / gitWorkflowBlock / resume / pr-open cite the skill and nev
     /not a tdd-worker|never a tdd-worker|tdd-worker never/i,
     "the Feature PR is opened by code, not by tdd-worker",
   );
-  assert.equal(block.includes(GIT_WORKFLOW_SKILL), true, "gitWorkflowBlock must cite the canonical skill path");
+  assert.doesNotMatch(block, /git-workflow\/SKILL\.md/, "gitWorkflowBlock must not cite the retired skill path");
+  assert.match(block, /PR lifecycle controller/, "the block names the controller that owns review");
   assert.match(forbidden, /next=yield/);
   assert.match(
     forbidden,
@@ -2642,9 +2643,9 @@ test("L4: the skill still leaves a solo session its own latch, verdict, and fix"
   );
 });
 
-test("parent PR-phase prompt says code injects the next message", () => {
+test("parent PR-phase prompt says the controller owns the next message", () => {
   const wake = orch.parentGitWorkflowAppend({ latchWake: true }) as string;
-  assert.match(wake, /inject|code/, "says the wake is code-owned");
+  assert.match(wake, /controller owns review/, "says the wake is controller-owned");
   assert.match(wake, /next=yield/);
   assert.doesNotMatch(
     wake,
@@ -2652,17 +2653,15 @@ test("parent PR-phase prompt says code injects the next message", () => {
     "the latch wake does not force a git-workflow skill read",
   );
   assert.doesNotMatch(wake, /I will not talk/, "no idle promise covers a code-owned wake");
-  assert.doesNotMatch(wake, /Stay idle/, "a solo latch wake still gets to fix");
   const idle = orch.parentGitWorkflowAppend({ featureLive: true }) as string;
   assert.match(idle, /Stay idle/, "the Feature parent stays idle");
 });
 
-test("L4: parentGitWorkflowAppend forces a skill read and keeps a Feature parent idle", () => {
+test("L4: parentGitWorkflowAppend injects role/state and keeps a Feature parent idle", () => {
   assert.equal(typeof orch.parentGitWorkflowAppend, "function");
   assert.equal(orch.parentGitWorkflowAppend({}), undefined, "unrelated sessions stay unprompted");
   const idle = orch.parentGitWorkflowAppend({ featureLive: true }) as string;
-  assert.match(idle, /git-workflow\/SKILL\.md/);
-  assert.match(idle, /not optional progressive disclosure/);
+  assert.doesNotMatch(idle, /git-workflow\/SKILL\.md/);
   assert.match(idle, /Do NOT implement product code/);
   assert.match(idle, /Stay idle/);
   assert.match(idle, /keeps dispatching while review data still says read_comments_and_fix/);
@@ -2670,31 +2669,27 @@ test("L4: parentGitWorkflowAppend forces a skill read and keeps a Feature parent
   assert.doesNotMatch(
     wake,
     /git-workflow\/SKILL\.md/,
-    "a solo latch wake is not forced to read the skill (L5)",
+    "a latch wake is not forced to read the skill",
   );
   assert.match(wake, /next=yield/, "the wake says code injects the next turn");
-  assert.doesNotMatch(wake, /Stay idle/, "a solo latch wake still gets to fix");
+  assert.match(wake, /controller owns review/);
 });
 
-test("L4: orchestrate.ts registers resources_discover and before_agent_start for git-workflow", () => {
+test("L4: orchestrate.ts registers resources_discover with an empty skill catalog", () => {
   const src = readFileSync(ORCH_SRC, "utf8");
   assert.match(src, /resources_discover/);
   assert.match(src, /before_agent_start/);
   assert.match(src, /parentGitWorkflowAppend/);
-  assert.match(src, /skillPaths: \[dirname\(GIT_WORKFLOW_SKILL\)\]/);
+  assert.match(src, /skillPaths: \[\] as string\[\]/);
+  assert.doesNotMatch(src, /skillPaths: \[dirname\(GIT_WORKFLOW_SKILL\)\]/);
 });
 
-test("P5 F17: both hooks are kept deliberately, and the source says why", () => {
+test("P5 F17: resources_discover no longer publishes git-workflow", () => {
   const src = readFileSync(ORCH_SRC, "utf8");
-  // F17 asked for these to be deleted *or* gated on a correct predicate.
-  // Phase 1 gave `before_agent_start` the correct predicate; this test pins
-  // the other half so a later reader does not delete the only line that
-  // publishes the skill to pi at all.
   const at = src.indexOf(`pi.on("resources_discover"`);
   assert.notEqual(at, -1);
-  const why = src.slice(Math.max(0, at - 700), at);
-  assert.match(why, /F17/, "the decision names the finding it answers");
-  assert.match(why, /settings\.json/, "and the fact that settles it");
+  const why = src.slice(Math.max(0, at - 500), at);
+  assert.match(why, /empty list|empty catalog|Skill catalog is empty/i);
   assert.match(
     src,
     /liveFeatureNeedsIdleParent\(cwd\)/,

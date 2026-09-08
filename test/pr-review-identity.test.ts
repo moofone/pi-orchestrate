@@ -1,0 +1,59 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+	classifyVerdictNext,
+	isGithubServerError,
+	parsePrKey,
+	prKeyId,
+	samePrKey,
+	stabilizeVerdictBody,
+	verdictIdentity,
+} from "../src/lib/pr-review-identity.ts";
+
+test("same PR number in different repositories are different keys", () => {
+	const a = parsePrKey({ pr: 475, slug: "moofone/icemining" });
+	const b = parsePrKey({ pr: 475, slug: "moofone/icemining-devops" });
+	assert.ok(a && b);
+	assert.notEqual(prKeyId(a), prKeyId(b));
+	assert.equal(samePrKey(a, b), false);
+	assert.equal(prKeyId(a), "github.com/moofone/icemining#475");
+});
+
+test("elapsed-time text is excluded from verdict identity", () => {
+	const pr = parsePrKey({ pr: 2537, slug: "moofone/icemining" })!;
+	const base = [
+		"next=read_comments_and_fix",
+		"head=e9de4b669",
+		"comment_id=1",
+		"brief_finding overflow",
+	].join("\n");
+	const a = verdictIdentity({ pr, next: "read_comments_and_fix", body: `${base}\nelapsed_seconds=12` });
+	const b = verdictIdentity({ pr, next: "read_comments_and_fix", body: `${base}\nelapsed_seconds=20997` });
+	assert.equal(a, b);
+	assert.equal(stabilizeVerdictBody(`${base}\nelapsed_seconds=12`).includes("elapsed_seconds"), false);
+});
+
+test("two findings rounds with the same next= remain distinct", () => {
+	const pr = parsePrKey({ pr: 2537, slug: "moofone/icemining" })!;
+	const round1 = verdictIdentity({
+		pr,
+		next: "read_comments_and_fix",
+		head: "e9de4b669",
+		round: "1",
+		body: "next=read_comments_and_fix\nhead=e9de4b669\nbrief_finding overflow",
+	});
+	const round2 = verdictIdentity({
+		pr,
+		next: "read_comments_and_fix",
+		head: "2033c56dc",
+		round: "2",
+		body: "next=read_comments_and_fix\nhead=2033c56dc\nbrief_finding overflow",
+	});
+	assert.notEqual(round1, round2);
+});
+
+test("GitHub 500 is an env verdict, not a code fix", () => {
+	assert.equal(isGithubServerError("error=HTTP 500: oops"), true);
+	assert.equal(classifyVerdictNext("fix_command_or_environment", "HTTP 500"), "env");
+	assert.equal(classifyVerdictNext("read_comments_and_fix"), "fix");
+});
