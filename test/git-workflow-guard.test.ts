@@ -241,6 +241,18 @@ test("isWorktreeMutation sees verbs after git -C and --work-tree", () => {
   assert.equal(isWorktreeMutation("git -C /wt/feat status"), false);
 });
 
+test("isWorktreeMutation sees a mutating git after a harmless one in the same shell", () => {
+  assert.equal(isWorktreeMutation("git status && git push"), true);
+  assert.equal(isWorktreeMutation("git status; git push origin HEAD"), true);
+  assert.equal(isWorktreeMutation("git log -1 || git commit -m x"), true);
+  assert.equal(isWorktreeMutation("git status && git log -1"), false);
+  assert.equal(
+    classifyForRole("git status && git push", { writer: false, writerReserved: true }).block,
+    true,
+    "a reserved worktree must still block a later push in the compound command",
+  );
+});
+
 test("mutationTargetDirs realpaths a symlink into the reserved worktree", () => {
 	const root = mkdtempSync(join(tmpdir(), "guard-link-"));
 	try {

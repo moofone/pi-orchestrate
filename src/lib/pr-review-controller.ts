@@ -591,13 +591,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 					await deps.ensureWaiter(ob.pr, ob.worktree);
 					save(ob, health.stale ? "restarted stale waiter" : "ensured waiter");
 				} catch (error) {
-					ob.retry = {
-						deadline: now() + BACKOFF_MS * 2 ** (ob.retry?.count ?? 0),
-						count: (ob.retry?.count ?? 0) + 1,
-						reason: `waiter: ${String(error)}`,
-					};
-					ob.state = "retry_scheduled";
-					save(ob);
+					scheduleWaiterRetry(ob, error);
 				}
 			}
 			if (ob.pendingVerdicts.length > 0) ob.state = "verdict_pending";
@@ -647,7 +641,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			});
 			ob.state = "waiting_review";
 			save(ob, ob.lastProgress.note);
-			await deps.reawait(ob.pr, ob.worktree);
+			await armWaiter(ob);
 			report.rearmed += 1;
 			return;
 		}
@@ -696,7 +690,10 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			journal.acceptedAt = journal.acceptedAt ?? now();
 			journal.worktree = journal.worktree || ob.worktree;
 			ob.state = existing.status === "exited" ? "validating" : "fixing";
-			if (ob.writer) ob.writer.runId = existing.runId;
+			if (ob.writer) {
+				ob.writer.runId = existing.runId;
+				store.reserveWriter(ob.pr, ob.writer);
+			}
 			consumeActive(ob);
 			save(ob, existing.status === "exited" ? "recovered exited run" : "recovered live run");
 			if (ob.state === "validating") {
@@ -758,7 +755,10 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		journal.runId = launched.runId;
 		journal.acceptedAt = now();
 		journal.worktree = journal.worktree || ob.worktree;
-		if (ob.writer) ob.writer.runId = launched.runId;
+		if (ob.writer) {
+			ob.writer.runId = launched.runId;
+			store.reserveWriter(ob.pr, ob.writer);
+		}
 		consumeActive(ob);
 		if (launched.completeRound) {
 			store.releaseWriter(ob.pr, ob.writer?.holder ?? ob.owner.id);
@@ -926,7 +926,25 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		ob.writer = undefined;
 		ob.launch = undefined;
 		save(ob, `published ${head.slice(0, 12)}; re-await`);
-		await deps.reawait(ob.pr, ob.worktree);
+		await armWaiter(ob);
+	}
+
+	async function armWaiter(ob: Obligation): Promise<void> {
+		try {
+			await deps.reawait(ob.pr, ob.worktree);
+		} catch (error) {
+			scheduleWaiterRetry(ob, error);
+		}
+	}
+
+	function scheduleWaiterRetry(ob: Obligation, error: unknown): void {
+		ob.retry = {
+			deadline: now() + BACKOFF_MS * 2 ** (ob.retry?.count ?? 0),
+			count: (ob.retry?.count ?? 0) + 1,
+			reason: `waiter: ${String(error)}`,
+		};
+		ob.state = "retry_scheduled";
+		save(ob);
 	}
 
 	function finishTerminal(ob: Obligation, state: "merged" | "closed_unmerged"): void {

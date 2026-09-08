@@ -1688,6 +1688,12 @@ function writePiRunComplete(runId: string): void {
 	writeFileSync(join(dir, "status.json"), JSON.stringify({ state: "complete", endedAt: Date.now() }));
 }
 
+function writePiRunRunning(runId: string): void {
+	const dir = piRunDir(runId);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "status.json"), JSON.stringify({ state: "running" }));
+}
+
 /** Write a verdict the way the waiter does: into the waiter's own state file. */
 function writeActionable(dir: string, _sessionId: string, extra: Record<string, unknown> = {}) {
 	const path = waiterState(dir);
@@ -1928,6 +1934,39 @@ test("reawait after publish targets the obligation PR, not a later latch", async
 	} finally {
 		rmSync(snapDir, { recursive: true, force: true });
 		h.cleanup();
+	}
+});
+
+test("queryRun recovers a live fixer after restart without spawning another", async () => {
+	const runId = `session-live-restart-${process.pid}`;
+	let launched = 0;
+	const h1 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		onSessionFixer: () => {
+			launched += 1;
+			return { runId, recovered: false };
+		},
+	});
+	const snapDir = piRunDir(runId);
+	let h2: ReturnType<typeof harness> | undefined;
+	try {
+		await h1.start();
+		await h1.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h1.dir, h1.sessionId);
+		await h1.settle();
+		await sleep(80);
+		assert.equal(launched, 1);
+		writePiRunRunning(runId);
+		h2 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO);
+		await h2.start();
+		await h2.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		cpSync(join(h1.dir, "review"), join(h2.dir, "review"), { recursive: true });
+		await h2.settle();
+		await sleep(80);
+		assert.equal(h2.sessionFixes.length, 0, "live disk snapshot must recover, not spawn a second fixer");
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		h2?.cleanup();
+		h1.cleanup();
 	}
 });
 

@@ -60,15 +60,16 @@ test("combined Goal/latch harness: unrelated or duplicate PR outcomes do not inf
 	const dir = mkdtempSync(join(tmpdir(), "wait-goal-"));
 	try {
 		const goal = {
-			id: "goal-unrelated",
-			paused: true,
+			id: "goal-wait-1",
+			paused: false,
 			allowance: 3,
 			consumed: 1,
 			modelRequests: 0,
-			waitIdentity: waitOutcomeIdentity("dependency", "goal-unrelated"),
+			waitIdentity: waitOutcomeIdentity("dependency", "goal-wait-1"),
 		};
 
 		function onWaitOutcome(event: WaitOutcomeNotice): void {
+			if (!claimWaitDelivery(dir, event)) return;
 			if (event.identity !== goal.waitIdentity) return;
 			if (goal.paused) return;
 			goal.modelRequests += 1;
@@ -76,24 +77,26 @@ test("combined Goal/latch harness: unrelated or duplicate PR outcomes do not inf
 		}
 
 		const prMerged = notice();
-		assert.equal(claimWaitDelivery(dir, prMerged), true);
 		onWaitOutcome(prMerged);
 		assert.equal(goal.modelRequests, 0, "unrelated PR must not start Goal inference");
 		assert.equal(goal.consumed, 1, "unrelated PR must not spend or reset Goal allowance");
 		assert.equal(goal.allowance, 3);
 
-		assert.equal(claimWaitDelivery(dir, prMerged), false);
-		onWaitOutcome(prMerged);
-		assert.equal(goal.modelRequests, 0, "duplicate terminal must not infer");
-
-		const staleOwner = notice({
-			owner: { kind: "feature", id: "/orch/icemining/gone" },
-			generation: "stale",
+		const own = notice({
+			owner: { kind: "dependency", id: goal.id },
+			source: "dependency",
+			identity: goal.waitIdentity,
+			generation: "g1",
+			outcome: "ready",
 		});
-		assert.equal(claimWaitDelivery(dir, staleOwner), true);
-		onWaitOutcome(staleOwner);
-		assert.equal(goal.paused, true);
-		assert.equal(goal.modelRequests, 0);
+		onWaitOutcome(own);
+		assert.equal(goal.modelRequests, 1, "matching WaitOutcomeNotice must infer once");
+		assert.equal(goal.consumed, 2);
+
+		onWaitOutcome(own);
+		assert.equal(goal.modelRequests, 1, "claimWaitDelivery must gate a duplicate matching outcome");
+		onWaitOutcome(prMerged);
+		assert.equal(goal.modelRequests, 1, "duplicate unrelated PR must not infer");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -102,20 +105,32 @@ test("combined Goal/latch harness: unrelated or duplicate PR outcomes do not inf
 test("a registered dependency owner may act on its own outcome without touching others", () => {
 	const dir = mkdtempSync(join(tmpdir(), "wait-dep-"));
 	try {
-		const goal = { modelRequests: 0, consumed: 0 };
-		const own = notice({
-			owner: { kind: "dependency", id: "goal-wait-1" },
-			identity: waitOutcomeIdentity("dependency", "goal-wait-1"),
-			generation: "g1",
-			outcome: "ready",
-		});
-		assert.equal(claimWaitDelivery(dir, own), true);
-		if (own.owner.id === "goal-wait-1") {
+		const goal = {
+			id: "goal-wait-1",
+			modelRequests: 0,
+			consumed: 0,
+			waitIdentity: waitOutcomeIdentity("dependency", "goal-wait-1"),
+		};
+		function onWaitOutcome(event: WaitOutcomeNotice): void {
+			if (!claimWaitDelivery(dir, event)) return;
+			if (event.identity !== goal.waitIdentity) return;
 			goal.modelRequests += 1;
 			goal.consumed += 1;
 		}
+		const foreign = notice();
+		onWaitOutcome(foreign);
+		assert.equal(goal.modelRequests, 0, "a foreign PR owner must not drive this Goal");
+		const own = notice({
+			owner: { kind: "dependency", id: goal.id },
+			source: "dependency",
+			identity: goal.waitIdentity,
+			generation: "g1",
+			outcome: "ready",
+		});
+		onWaitOutcome(own);
 		assert.equal(goal.modelRequests, 1);
-		assert.equal(claimWaitDelivery(dir, own), false);
+		onWaitOutcome(own);
+		assert.equal(goal.modelRequests, 1, "duplicate own outcome is already claimed");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

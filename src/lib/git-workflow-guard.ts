@@ -193,8 +193,12 @@ function gitVerb(command: string): string | undefined {
 }
 
 export function isWorktreeMutation(command: string): boolean {
-	const verb = gitVerb(command);
-	return Boolean(verb && PARENT_MUTATION_VERB.test(verb));
+	const text = stripComments(command);
+	const parts = text.split(/\s*(?:&&|\|\||;|\n)\s*/);
+	return parts.some((part) => {
+		const verb = gitVerb(part);
+		return Boolean(verb && PARENT_MUTATION_VERB.test(verb));
+	});
 }
 
 function captureDirArgs(prefix: string, text: string): string[] {

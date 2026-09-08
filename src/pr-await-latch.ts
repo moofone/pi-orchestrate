@@ -34,7 +34,7 @@ import {
 	writeSync,
 	type FSWatcher,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -90,7 +90,7 @@ import {
 	type LatchState,
 } from "./lib/pr-await-core.ts";
 import { classifyGithubStatus, parsePrKey, parseVerdictHead, verdictIdentity } from "./lib/pr-review-identity.ts";
-import { createReviewStore } from "./lib/pr-review-store.ts";
+import { createReviewStore, readPiRunDisk } from "./lib/pr-review-store.ts";
 import { createReviewController, type ReviewController } from "./lib/pr-review-controller.ts";
 import {
 	requestReviewLaunch,
@@ -121,34 +121,18 @@ export type SpawnDriver = (argv: string[]) => { pid?: number };
  */
 export const WATCH_BACKSTOP_MS = 10 * 60_000;
 
-const TERMINAL_RUN_STATES = new Set([
-	"complete",
-	"completed",
-	"failed",
-	"error",
-	"stopped",
-	"cancelled",
-	"canceled",
-	"rejected",
-	"timeout",
-	"timed_out",
-]);
-const STOPPED_RUN_STATES = new Set(["stopped", "cancelled", "canceled", "rejected"]);
-
-function readPiRunSnapshot(runId: string): { terminal: boolean; ok: boolean; stopped: boolean } | undefined {
-	if (!runId) return undefined;
-	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-	const dir = join(tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs", runId);
-	try {
-		const raw = JSON.parse(readFileSync(join(dir, "status.json"), "utf8")) as Record<string, unknown>;
-		const state = typeof raw.state === "string" ? raw.state.toLowerCase() : "";
-		const ended = typeof raw.endedAt === "number" && raw.endedAt > 0;
-		const terminal = ended || TERMINAL_RUN_STATES.has(state);
-		const stopped = STOPPED_RUN_STATES.has(state);
-		const ok = terminal && !stopped && (state === "complete" || state === "completed");
-		return { terminal, ok, stopped };
-	} catch {
-		return undefined;
+function persistLaunchRun(intent: LaunchIntent, runId: string): void {
+	const store = createReviewStore(stateDir());
+	for (const ob of store.list()) {
+		if (ob.launch?.idempotencyKey !== intent.idempotencyKey && ob.launch?.runId !== runId) continue;
+		if (!ob.launch) continue;
+		ob.launch.runId = runId;
+		ob.launch.worktree = ob.launch.worktree || intent.worktree || ob.worktree;
+		if (ob.writer) {
+			ob.writer.runId = runId;
+			store.reserveWriter(ob.pr, ob.writer);
+		}
+		store.write(ob);
 	}
 }
 
@@ -836,6 +820,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				};
 				sessionRuns.set(launched.runId, rec);
 				sessionRuns.set(intent.idempotencyKey, rec);
+				persistLaunchRun(intent, launched.runId);
 				return launched;
 			},
 			queryRun:
@@ -844,19 +829,20 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					const mem =
 						sessionRuns.get(key) ??
 						[...sessionRuns.values()].find((r) => r.runId === key || r.key === key);
-					const runId = mem?.runId ?? key;
-					const snap = readPiRunSnapshot(runId);
-					let head: string | undefined;
-					// HEAD is the fixer's worktree, not the live latch cwd. A later
-					// `git pr-await` on another PR would otherwise publish the wrong SHA.
 					const stored = createReviewStore(stateDir())
 						.list()
 						.find(
 							(item) =>
-								item.launch?.runId === runId ||
+								item.launch?.runId === key ||
+								item.launch?.runId === mem?.runId ||
 								item.launch?.idempotencyKey === key ||
 								item.launch?.idempotencyKey === mem?.key,
 						);
+					const runId = mem?.runId || stored?.launch?.runId || key;
+					const snap = readPiRunDisk(runId);
+					let head: string | undefined;
+					// HEAD is the fixer's worktree, not the live latch cwd. A later
+					// `git pr-await` on another PR would otherwise publish the wrong SHA.
 					const cwd = mem?.worktree || stored?.launch?.worktree || stored?.worktree;
 					if (cwd) {
 						try {
@@ -876,7 +862,19 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 							ok: snap.ok,
 							stopped: snap.stopped,
 							head,
-							key: mem?.key ?? key,
+							key: mem?.key ?? stored?.launch?.idempotencyKey ?? key,
+							worktree: cwd,
+						};
+						sessionRuns.set(runId, out);
+						sessionRuns.set(out.key, out);
+						return out;
+					}
+					if (snap) {
+						const out: RunSnapshot & { key: string } = {
+							runId,
+							status: "running",
+							head,
+							key: mem?.key ?? stored?.launch?.idempotencyKey ?? key,
 							worktree: cwd,
 						};
 						sessionRuns.set(runId, out);

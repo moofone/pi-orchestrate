@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -295,6 +295,49 @@ test("same holder in a different live process cannot steal the reservation", asy
 	}
 });
 
+test("a dead parent pid does not free the lock while the child run is live", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-run-lock-"));
+	const runId = `live-child-${process.pid}`;
+	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	const snapDir = join(tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs", runId);
+	try {
+		mkdirSync(snapDir, { recursive: true });
+		writeFileSync(join(snapDir, "status.json"), JSON.stringify({ state: "running" }));
+		const store = createReviewStore(dir);
+		store.write({
+			v: 1,
+			pr: PR,
+			generation: "g1",
+			owner: sessionOwner(),
+			worktree: "/wt",
+			head: HEAD1,
+			state: "fixing",
+			pendingVerdicts: [],
+			activeVerdictIds: [],
+		});
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:dead", pid: 2_000_000_000, reservedAt: 1, runId }),
+			true,
+		);
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:successor", pid: process.pid, reservedAt: 2 }),
+			false,
+			"unreaped fixer run must keep the lock after the parent dies",
+		);
+		assert.equal(store.writerFor(PR)?.runId, runId);
+		assert.ok(store.writerForWorktree("/wt"), "parent mutation must stay blocked while the child runs");
+		writeFileSync(join(snapDir, "status.json"), JSON.stringify({ state: "complete", endedAt: Date.now() }));
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:successor", pid: process.pid, reservedAt: 3 }),
+			true,
+			"a finished child may be reclaimed",
+		);
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("new verdict while old fixer runs stays pending; old ack cannot erase it", async () => {
 	const w = world();
 	try {
@@ -394,6 +437,45 @@ test("crash after push before persist: remote-head reconciliation does not doubl
 		assert.equal(w.ctrl.status(PR)[0]?.state, "waiting_review");
 	} finally {
 		w.cleanup();
+	}
+});
+
+test("reawait throw after a successful publish does not become recovery_required", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-reawait-throw-"));
+	try {
+		const store = createReviewStore(dir);
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner() }),
+			launchFixer: async () => ({ runId: "run-1", recovered: false }),
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true, remoteHead: HEAD2 }),
+			reawait: async () => {
+				throw new Error("waiter down");
+			},
+			prState: async () => "open",
+			currentHead: async () => HEAD1,
+			waiterHealth: async () => ({ running: false }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "reawait-throw"),
+		});
+		await ctrl.reconcile();
+		await ctrl.childFinished({ runId: "run-1", ok: true, localHead: HEAD2 });
+		const st = store.read(PR);
+		assert.notEqual(st?.state, "recovery_required", "a pushed head must not be stranded");
+		assert.ok(
+			st?.state === "retry_scheduled" || st?.state === "waiting_review",
+			`expected waiter retry, got ${st?.state}`,
+		);
+		assert.equal(store.writerFor(PR), undefined, "publish must still drop the writer");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
 

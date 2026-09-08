@@ -10,6 +10,7 @@
  * cannot erase consumption.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import {
@@ -116,6 +117,50 @@ export function reviewStoreDir(stateDir: string): string {
 	return join(stateDir, "review");
 }
 
+const TERMINAL_RUN_STATES = new Set([
+	"complete",
+	"completed",
+	"failed",
+	"error",
+	"stopped",
+	"cancelled",
+	"canceled",
+	"rejected",
+	"timeout",
+	"timed_out",
+]);
+const STOPPED_RUN_STATES = new Set(["stopped", "cancelled", "canceled", "rejected"]);
+
+export function piSubagentRunDir(runId: string): string {
+	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	return join(tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs", runId);
+}
+
+export function readPiRunDisk(
+	runId: string | undefined,
+): { terminal: boolean; ok: boolean; stopped: boolean } | undefined {
+	if (!runId) return undefined;
+	try {
+		const raw = JSON.parse(readFileSync(join(piSubagentRunDir(runId), "status.json"), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		const state = typeof raw.state === "string" ? raw.state.toLowerCase() : "";
+		const ended = typeof raw.endedAt === "number" && raw.endedAt > 0;
+		const terminal = ended || TERMINAL_RUN_STATES.has(state);
+		const stopped = STOPPED_RUN_STATES.has(state);
+		const ok = terminal && !stopped && (state === "complete" || state === "completed");
+		return { terminal, ok, stopped };
+	} catch {
+		return undefined;
+	}
+}
+
+export function runSnapshotLive(runId: string | undefined): boolean {
+	const snap = readPiRunDisk(runId);
+	return Boolean(snap && !snap.terminal);
+}
+
 function withoutTrailingSlash(p: string): string {
 	if (!p || p === "/") return p || "";
 	return p.replace(/\/+$/, "");
@@ -197,6 +242,11 @@ export function createReviewStore(stateDir: string): ReviewStore {
 		} catch {
 			return false;
 		}
+	}
+
+	function reservationLive(reservation: WriterReservation): boolean {
+		if (runSnapshotLive(reservation.runId)) return true;
+		return pidLive(reservation.pid);
 	}
 
 	const store: ReviewStore = {
@@ -292,18 +342,16 @@ export function createReviewStore(stateDir: string): ReviewStore {
 					existing.holder === reservation.holder &&
 					existing.pid != null &&
 					reservation.pid != null &&
-					existing.pid === reservation.pid;
-				if (sameProcess && pidLive(existing.pid)) {
+					existing.pid === reservation.pid &&
+					pidLive(existing.pid);
+				if (sameProcess) {
 					atomicWriteJson(path, reservation);
 					return true;
 				}
-				if (existing.pid != null && !pidLive(existing.pid)) {
-					try {
-						rmSync(path, { force: true });
-					} catch {
-						return false;
-					}
-				} else {
+				if (reservationLive(existing)) return false;
+				try {
+					rmSync(path, { force: true });
+				} catch {
 					return false;
 				}
 			}
@@ -342,6 +390,7 @@ export function createReviewStore(stateDir: string): ReviewStore {
 				if (!worktreeOwnsPath(ob.worktree, target)) continue;
 				const reservation = readReservation(ob.pr);
 				if (!reservation) continue;
+				if (runSnapshotLive(reservation.runId)) return { pr: ob.pr, reservation };
 				if (reservation.pid != null && !pidLive(reservation.pid)) continue;
 				return { pr: ob.pr, reservation };
 			}
