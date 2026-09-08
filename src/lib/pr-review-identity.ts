@@ -30,9 +30,33 @@ const VOLATILE_VERDICT_KEYS = new Set([
 
 const DEFAULT_HOST = "github.com";
 
+const GITHUB_OWNER = /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/;
+const GITHUB_REPO = /^[a-z0-9._-]{1,100}$/;
+const GITHUB_HOST = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
+
 export function normalizeHost(host: string | undefined): string {
 	const h = (host ?? DEFAULT_HOST).trim().toLowerCase();
 	return h || DEFAULT_HOST;
+}
+
+function isGithubOwner(s: string): boolean {
+	return GITHUB_OWNER.test(s);
+}
+
+function isGithubRepo(s: string): boolean {
+	if (s === "." || s === "..") return false;
+	return GITHUB_REPO.test(s);
+}
+
+function isGithubHost(s: string): boolean {
+	if (s === "." || s === ".." || s.includes("..")) return false;
+	return GITHUB_HOST.test(s);
+}
+
+function fileTokenPart(s: string): string {
+	return s.toLowerCase().replace(/[^a-z0-9._-]+/g, (chunk) =>
+		[...chunk].map((ch) => `%${ch.charCodeAt(0).toString(16).padStart(2, "0")}`).join(""),
+	);
 }
 
 export function normalizePrNumber(pr: string | number | undefined): string {
@@ -44,17 +68,18 @@ export function parseGithubSlug(raw: string | undefined): { host: string; owner:
 	const s = (raw ?? "").trim().replace(/\.git$/i, "");
 	if (!s) return undefined;
 	const parts = s.split("/").filter(Boolean);
+	if (parts.some((p) => p === "." || p === ".." || p.includes("\\"))) return undefined;
 	if (parts.length === 2) {
 		const owner = parts[0]!.toLowerCase();
 		const repo = parts[1]!.toLowerCase();
-		if (!owner || !repo) return undefined;
+		if (!isGithubOwner(owner) || !isGithubRepo(repo)) return undefined;
 		return { host: DEFAULT_HOST, owner, repo };
 	}
 	if (parts.length >= 3) {
 		const host = normalizeHost(parts[0]);
 		const owner = parts[parts.length - 2]!.toLowerCase();
 		const repo = parts[parts.length - 1]!.toLowerCase();
-		if (!owner || !repo) return undefined;
+		if (!isGithubHost(host) || !isGithubOwner(owner) || !isGithubRepo(repo)) return undefined;
 		return { host, owner, repo };
 	}
 	return undefined;
@@ -70,12 +95,11 @@ export function parsePrKey(input: {
 	const number = normalizePrNumber(input.pr);
 	if (!number || !/^\d+$/.test(number)) return undefined;
 	if (input.owner && input.repo) {
-		return {
-			host: normalizeHost(input.host),
-			owner: input.owner.trim().toLowerCase(),
-			repo: input.repo.trim().toLowerCase().replace(/\.git$/i, ""),
-			number,
-		};
+		const host = normalizeHost(input.host);
+		const owner = input.owner.trim().toLowerCase();
+		const repo = input.repo.trim().toLowerCase().replace(/\.git$/i, "");
+		if (!isGithubHost(host) || !isGithubOwner(owner) || !isGithubRepo(repo)) return undefined;
+		return { host, owner, repo, number };
 	}
 	const parsed = parseGithubSlug(input.slug);
 	if (!parsed) return undefined;
@@ -87,7 +111,12 @@ export function prKeyId(key: PrKey): string {
 }
 
 export function prKeyFileToken(key: PrKey): string {
-	return `${normalizeHost(key.host)}--${key.owner.toLowerCase()}--${key.repo.toLowerCase()}--${normalizePrNumber(key.number)}`;
+	return [
+		fileTokenPart(normalizeHost(key.host)),
+		fileTokenPart(key.owner),
+		fileTokenPart(key.repo),
+		fileTokenPart(normalizePrNumber(key.number)),
+	].join("--");
 }
 
 export function samePrKey(a: PrKey, b: PrKey): boolean {

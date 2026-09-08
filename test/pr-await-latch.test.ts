@@ -60,6 +60,8 @@ const {
 	parseField,
 	trailingCd,
 } = await import("../src/pr-await-latch.ts");
+const { parsePrKey } = await import("../src/lib/pr-review-identity.ts");
+const { createReviewStore, emptyObligation } = await import("../src/lib/pr-review-store.ts");
 const {
 	actionableFingerprint,
 	armObservedLatch,
@@ -2177,6 +2179,47 @@ test("a Feature with no worktree recorded is reported, not handed to the parent"
 			h.notifies.some((n) => /worktree/i.test(n)),
 			`the stall must be visible; got ${h.notifies.join(" | ")}`,
 		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("refused ownership handoff retains the waiter verdict", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		const key = parsePrKey({ pr: "2142", slug: originSlug(REPO) ?? "moofone/icemining" })!;
+		const store = createReviewStore(h.dir);
+		store.write(
+			emptyObligation({
+				pr: key,
+				owner: { kind: "session", id: "other-session", generation: "g-other" },
+				worktree: "/wt/other",
+				head: "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016",
+			}),
+		);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "must not launch against someone else's obligation");
+		assert.equal(h.wakes.length, 0, "parent must stay idle");
+		assert.equal(
+			store.read(key)?.pendingVerdicts.length ?? 0,
+			0,
+			"must not queue a verdict onto an obligation this session does not own",
+		);
+		assert.ok(
+			h.notifies.some((n) => /ownership refused|owned by/i.test(n)),
+			`refusal must be visible; got ${h.notifies.join(" | ")}`,
+		);
+		const first = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(first.verdictDelivered, false, "refused handoff must not spend the verdict");
+		await h.settle();
+		await sleep(80);
+		const again = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(again.verdictDelivered, false, "retry must still see the undelivered verdict");
+		assert.equal(h.sessionFixes.length, 0);
 	} finally {
 		h.cleanup();
 	}

@@ -1038,12 +1038,22 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					generation: sessionId ?? "session",
 			  };
 		const ctrl = getController();
-		ctrl.handoff({
+		const handed = ctrl.handoff({
 			pr: key,
 			owner,
 			worktree: feature?.worktree || latch.cwd,
 			head: latch.head,
 		});
+		if (!handed.ok) {
+			lastRefusedFingerprint = fp;
+			if (!repeatOfRefusal) {
+				notify(
+					ctx,
+					`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} — ownership refused (${handed.reason ?? "busy"}); verdict retained.`,
+				);
+			}
+			return;
+		}
 		const ack = ctrl.observeVerdict({
 			pr: key,
 			next: hit.lastNext,

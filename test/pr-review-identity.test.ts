@@ -4,6 +4,7 @@ import {
 	classifyVerdictNext,
 	isGithubServerError,
 	parsePrKey,
+	prKeyFileToken,
 	prKeyId,
 	samePrKey,
 	stabilizeVerdictBody,
@@ -56,4 +57,23 @@ test("GitHub 500 is an env verdict, not a code fix", () => {
 	assert.equal(isGithubServerError("error=HTTP 500: oops"), true);
 	assert.equal(classifyVerdictNext("fix_command_or_environment", "HTTP 500"), "env");
 	assert.equal(classifyVerdictNext("read_comments_and_fix"), "fix");
+});
+
+test("parsePrKey rejects owner/repo that would escape the store directory", () => {
+	assert.equal(parsePrKey({ pr: 1, owner: "../etc", repo: "passwd" }), undefined);
+	assert.equal(parsePrKey({ pr: 1, owner: "moofone", repo: "ice/../../tmp" }), undefined);
+	assert.equal(parsePrKey({ pr: 1, owner: "..", repo: "icemining" }), undefined);
+	assert.equal(parsePrKey({ pr: 1, owner: "moofone", repo: ".." }), undefined);
+	assert.equal(parsePrKey({ pr: 1, owner: "moofone\\..", repo: "x" }), undefined);
+	assert.equal(parsePrKey({ pr: 1, slug: "foo/../../etc/passwd" }), undefined);
+	assert.ok(parsePrKey({ pr: 1, owner: "moofone", repo: "icemining" }));
+	assert.ok(parsePrKey({ pr: 1, slug: "moofone/.github" }));
+	const token = prKeyFileToken({
+		host: "github.com",
+		owner: "../etc",
+		repo: "passwd",
+		number: "1",
+	});
+	assert.equal(token.includes("/"), false);
+	assert.equal(token.includes("\\"), false);
 });
