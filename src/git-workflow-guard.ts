@@ -12,6 +12,7 @@ import {
 	classifyForRole,
 	classifyViewRepeat,
 	isWorktreeMutation,
+	mutationTargetDirs,
 	isWriterRole,
 	viewRepeatKey,
 } from "./lib/git-workflow-guard.ts";
@@ -24,6 +25,7 @@ export {
 	classifyViewRepeat,
 	extractPrNumber,
 	isWorktreeMutation,
+	mutationTargetDirs,
 	isWriterRole,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
@@ -44,10 +46,13 @@ export default function (pi: ExtensionAPI) {
 		let writerReserved = false;
 		if (!writer && isWorktreeMutation(command)) {
 			try {
-				const cwd =
+				const fallback =
 					(typeof (event as { cwd?: string }).cwd === "string" && (event as { cwd?: string }).cwd) ||
 					process.cwd();
-				writerReserved = Boolean(createReviewStore(stateDir()).writerForWorktree(cwd));
+				const store = createReviewStore(stateDir());
+				writerReserved = mutationTargetDirs(command, fallback).some((dir) =>
+					Boolean(store.writerForWorktree(dir)),
+				);
 			} catch {
 				writerReserved = false;
 			}

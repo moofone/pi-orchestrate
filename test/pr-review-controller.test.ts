@@ -749,6 +749,62 @@ test("currentHead is asked with the obligation worktree", async () => {
 	}
 });
 
+test("local worktree HEAD is not treated as remote; publish still runs", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-localhead-"));
+	try {
+		const store = createReviewStore(dir);
+		const published: string[] = [];
+		let live = HEAD1;
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner() }),
+			launchFixer: async () => ({ runId: "run-1", recovered: false }),
+			queryRun: async () => undefined,
+			publish: async (req) => {
+				published.push(req.localHead);
+				return { ok: true, remoteHead: req.localHead };
+			},
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => live,
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "local-not-remote"),
+		});
+		await ctrl.reconcile();
+		live = HEAD2;
+		await ctrl.childFinished({ runId: "run-1", ok: true, localHead: HEAD2 });
+		assert.deepEqual(published, [HEAD2], "must publish even when local HEAD already matches the child");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("failed fixer retries the same verdict after backoff", async () => {
+	let t = 1_000;
+	const w = world({ now: () => t });
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "retry-me");
+		await w.ctrl.reconcile();
+		assert.equal(w.launches.length, 1);
+		await w.ctrl.childFinished({ runId: "run-1", ok: false });
+		assert.equal(w.ctrl.status(PR)[0]?.state, "retry_scheduled");
+		assert.equal(w.launches.length, 1);
+		t += 10_000;
+		await w.ctrl.reconcile();
+		assert.equal(w.launches.length, 2, "same finding must launch again after failFix");
+	} finally {
+		w.cleanup();
+	}
+});
+
 test("Feature cannot silently adopt a session PR while its writer is reserved", async () => {
 	const w = world();
 	try {

@@ -204,12 +204,14 @@ export function launchIdempotencyKey(input: {
 	ownerGeneration: string;
 	head: string;
 	verdictIds: string[];
+	attempt?: number;
 }): string {
 	const material = [
 		prKeyId(input.pr),
 		input.ownerGeneration,
 		input.head.toLowerCase(),
 		[...input.verdictIds].sort().join(","),
+		`a${input.attempt ?? 0}`,
 	].join("\n");
 	return createHash("sha256").update(material, "utf8").digest("hex").slice(0, 32);
 }

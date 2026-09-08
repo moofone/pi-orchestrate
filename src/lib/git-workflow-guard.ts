@@ -172,6 +172,18 @@ export function isWorktreeMutation(command: string): boolean {
 	return PARENT_MUTATION.test(stripComments(command));
 }
 
+/** Worktrees a bash command would mutate: `cd DIR && git …`, `git -C DIR`, fallback cwd. */
+export function mutationTargetDirs(command: string, fallbackCwd?: string): string[] {
+	const text = stripComments(command);
+	const dirs: string[] = [];
+	const cd = text.match(/\bcd\s+['"]?(\/[^'";\s&|]+)['"]?/);
+	if (cd?.[1]) dirs.push(cd[1].replace(/\/+$/, ""));
+	const gitC = text.match(/\bgit\s+-C\s+['"]?(\/[^'";\s]+)['"]?/);
+	if (gitC?.[1]) dirs.push(gitC[1].replace(/\/+$/, ""));
+	if (fallbackCwd) dirs.push(fallbackCwd.replace(/\/+$/, ""));
+	return [...new Set(dirs)];
+}
+
 export function classifyForRole(
 	command: string,
 	opts: { writer: boolean; writerReserved?: boolean },

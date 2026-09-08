@@ -10,6 +10,7 @@ import {
 	classifyViewRepeat,
 	extractPrNumber,
 	isWriterRole,
+	mutationTargetDirs,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
 } from "../src/lib/git-workflow-guard.ts";
@@ -184,4 +185,15 @@ test("parent mutation is blocked while a fixer holds the worktree", () => {
   assert.equal(classifyForRole("git commit -m fix", { writer: false, writerReserved: true }).block, true);
   assert.equal(classifyForRole("git status", { writer: false, writerReserved: true }).block, false);
   assert.equal(classifyForRole("git push", { writer: false, writerReserved: false }).block, false);
+});
+
+test("mutationTargetDirs sees cd and git -C, not only the event cwd", () => {
+  assert.deepEqual(mutationTargetDirs("cd /wt/feat && git commit -m x", "/elsewhere"), [
+    "/wt/feat",
+    "/elsewhere",
+  ]);
+  assert.deepEqual(mutationTargetDirs("git -C /wt/feat commit -m x", "/elsewhere"), [
+    "/wt/feat",
+    "/elsewhere",
+  ]);
 });

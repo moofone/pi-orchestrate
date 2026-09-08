@@ -564,6 +564,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			ownerGeneration: ob.owner.generation,
 			head: liveHead || pendingFix.head,
 			verdictIds: ids,
+			attempt: ob.retry?.count ?? 0,
 		});
 		ob.launch = { idempotencyKey: key, intentAt: now() };
 		ob.state = "launching";
@@ -699,8 +700,21 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		}
 	}
 
+	function unconsume(ob: Obligation): void {
+		for (const id of [...ob.activeVerdictIds]) {
+			store.deleteReceipt(id);
+			const rec = store.readInbox(id);
+			if (rec && !ob.pendingVerdicts.some((p) => p.identity === id)) {
+				ob.pendingVerdicts.unshift(rec);
+			}
+		}
+		ob.activeVerdictIds = [];
+		ob.launch = undefined;
+	}
+
 	function failFix(ob: Obligation, reason: string): void {
 		const count = (ob.retry?.count ?? 0) + 1;
+		unconsume(ob);
 		if (count >= FIX_RETRY_CAP) {
 			ob.state = "recovery_required";
 			ob.failureReason = `${reason} repeatedly`;
@@ -756,9 +770,11 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 
 		ob.state = "publishing";
 		save(ob, "publishing");
-		const remoteNow = result.remoteHead ?? (await deps.currentHead(ob.pr, ob.worktree));
+		// Only an explicit remote head is evidence of a prior push. currentHead is
+		// the local worktree (git rev-parse HEAD) and matches `local` after a
+		// successful fixer — that must not skip publish.
+		const remoteNow = result.remoteHead;
 		if (local && remoteNow && local === remoteNow) {
-			// Crash after push: remote already has the result.
 			await rearms(ob, local);
 			return;
 		}

@@ -103,6 +103,7 @@ export type ReviewStore = {
 	listInbox(pr?: PrKey): VerdictRecord[];
 	putReceipt(receipt: ConsumptionReceipt): boolean;
 	hasReceipt(identity: string): boolean;
+	deleteReceipt(identity: string): void;
 	reserveWriter(pr: PrKey, reservation: WriterReservation): boolean;
 	releaseWriter(pr: PrKey, holder: string): void;
 	writerFor(pr: PrKey): WriterReservation | undefined;
@@ -237,6 +238,13 @@ export function createReviewStore(stateDir: string): ReviewStore {
 		},
 		hasReceipt(identity) {
 			return existsSync(join(dir, "receipts", `${identity}.json`));
+		},
+		deleteReceipt(identity) {
+			try {
+				rmSync(join(dir, "receipts", `${identity}.json`), { force: true });
+			} catch {
+				/* best-effort */
+			}
 		},
 		reserveWriter(pr, reservation) {
 			const path = lockPath(pr);
