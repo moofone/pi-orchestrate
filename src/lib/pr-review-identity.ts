@@ -134,6 +134,16 @@ export function stabilizeVerdictBody(body: string): string {
 		.join("\n");
 }
 
+/** Prefix-equal git SHAs: waiter `head=` may be 7–40 hex, `rev-parse` is usually 40. */
+export function sameGitHead(a: string, b: string): boolean {
+	const x = String(a ?? "").trim().toLowerCase();
+	const y = String(b ?? "").trim().toLowerCase();
+	if (!x || !y) return false;
+	if (!/^[0-9a-f]{7,40}$/.test(x) || !/^[0-9a-f]{7,40}$/.test(y)) return x === y;
+	const n = Math.min(x.length, y.length);
+	return x.slice(0, n) === y.slice(0, n);
+}
+
 export function parseVerdictHead(body: string): string {
 	for (const line of String(body ?? "").split(/\r?\n/)) {
 		const trimmed = line.trim();

@@ -9,8 +9,8 @@
  * This store never rewrites those files. Receipts live here so a re-await
  * cannot erase consumption.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 import {
 	PR_REVIEW_PROTOCOL_VERSION,
@@ -116,10 +116,38 @@ export function reviewStoreDir(stateDir: string): string {
 	return join(stateDir, "review");
 }
 
+function withoutTrailingSlash(p: string): string {
+	if (!p || p === "/") return p || "";
+	return p.replace(/\/+$/, "");
+}
+
+/** Lexical resolve, then realpath. Missing tails keep the existing ancestor's real path. */
+export function canonicalizePath(input: string): string {
+	const lexical = withoutTrailingSlash(resolve(String(input ?? "")));
+	if (!lexical || lexical === "/") return lexical || "/";
+	try {
+		return withoutTrailingSlash(realpathSync(lexical));
+	} catch {
+		const missing: string[] = [];
+		let cur = lexical;
+		while (cur && cur !== "/") {
+			missing.unshift(basename(cur));
+			cur = dirname(cur);
+			try {
+				const real = withoutTrailingSlash(realpathSync(cur)) || "/";
+				return join(real, ...missing);
+			} catch {
+				/* keep walking */
+			}
+		}
+		return lexical;
+	}
+}
+
 /** True when `target` is `reserved` or a path inside it (not a sibling prefix). */
 export function worktreeOwnsPath(reserved: string, target: string): boolean {
-	const a = resolve(String(reserved ?? "")).replace(/\/+$/, "");
-	const b = resolve(String(target ?? "")).replace(/\/+$/, "");
+	const a = canonicalizePath(reserved);
+	const b = canonicalizePath(target);
 	if (!a || !b || a === "/") return false;
 	return b === a || b.startsWith(`${a}/`);
 }

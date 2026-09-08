@@ -15,6 +15,7 @@ import {
 	launchIdempotencyKey,
 	parseVerdictHead,
 	prKeyId,
+	sameGitHead,
 	verdictIdentity,
 	type PrKey,
 	type VerdictKind,
@@ -158,6 +159,15 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 
 	function save(ob: Obligation, note?: string): Obligation {
 		if (note) ob.lastProgress = { at: now(), note };
+		const latest = store.read(ob.pr);
+		if (latest) {
+			for (const v of latest.pendingVerdicts) {
+				if (ob.pendingVerdicts.some((p) => p.identity === v.identity)) continue;
+				if (ob.activeVerdictIds.includes(v.identity)) continue;
+				if (store.hasReceipt(v.identity)) continue;
+				ob.pendingVerdicts.push(v);
+			}
+		}
 		store.write(ob);
 		return ob;
 	}
@@ -620,7 +630,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		}
 
 		const liveHead = (await deps.currentHead(ob.pr, ob.worktree)) ?? ob.head;
-		if (pendingFix.head && liveHead && pendingFix.head !== liveHead) {
+		if (pendingFix.head && liveHead && !sameGitHead(pendingFix.head, liveHead)) {
 			ob.lastProgress = {
 				at: now(),
 				note: `stale verdict against ${pendingFix.head.slice(0, 12)}; live ${liveHead.slice(0, 12)}`,

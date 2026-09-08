@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -331,6 +331,27 @@ test("stale verdict is dropped and re-awaited, not launched against the live hea
 		assert.equal(w.reawaits, 1);
 		assert.equal(w.ctrl.status(PR)[0]?.state, "waiting_review");
 		assert.equal(w.ctrl.status(PR)[0]?.pendingCount, 0);
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("short waiter SHA matching live HEAD still launches a fixer", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		w.ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1.slice(0, 12),
+			body: finding(HEAD1.slice(0, 12), "short-sha"),
+		});
+		w.github.head = HEAD1;
+		const r = await w.ctrl.reconcile();
+		assert.equal(r.launched, 1, "abbrev SHA of the live head is not stale");
+		assert.equal(w.launches.length, 1);
+		assert.equal(w.reawaits, 0);
+		assert.equal(w.ctrl.status(PR)[0]?.state, "fixing");
 	} finally {
 		w.cleanup();
 	}
@@ -798,6 +819,40 @@ test("writerForWorktree matches a subdirectory of the reserved worktree", () => 
 	}
 });
 
+test("writerForWorktree matches a symlink into the reserved worktree", () => {
+	const root = mkdtempSync(join(tmpdir(), "pr-review-symlink-"));
+	try {
+		const reserved = join(root, "feat");
+		mkdirSync(reserved);
+		const link = join(root, "link");
+		symlinkSync(reserved, link);
+		const store = createReviewStore(root);
+		store.write({
+			v: 1,
+			pr: PR,
+			generation: "g1",
+			owner: sessionOwner(),
+			worktree: reserved,
+			head: HEAD1,
+			state: "fixing",
+			pendingVerdicts: [],
+			activeVerdictIds: [],
+		});
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:a", pid: process.pid, reservedAt: 1 }),
+			true,
+		);
+		assert.ok(store.writerForWorktree(link), "symlink to the reserved worktree must match");
+		assert.ok(
+			store.writerForWorktree(join(link, "src")),
+			"path through the symlink into a descendant must match",
+		);
+		assert.equal(realpathSync(link), realpathSync(reserved));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("writerForWorktree ignores a persisted writer when the lock file is gone", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pr-review-stale-lock-"));
 	try {
@@ -1158,6 +1213,65 @@ test("handoff during launch cannot clobber the writer reservation", async () => 
 		assert.equal(transfer.ok, false, "must not steal a PR while reconcile holds the lock");
 		assert.ok(store.writerFor(PR), "launch reservation must survive the raced handoff");
 		assert.equal(store.read(PR)?.owner.id, "session-1");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("observe during launchFixer wait is not overwritten by a stale save", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-launch-stale-"));
+	try {
+		const store = createReviewStore(dir);
+		let releaseLaunch: () => void = () => {};
+		const holdLaunch = new Promise<void>((resolve) => {
+			releaseLaunch = resolve;
+		});
+		let markLaunched: () => void = () => {};
+		const launched = new Promise<void>((resolve) => {
+			markLaunched = resolve;
+		});
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner("session-1") }),
+			launchFixer: async () => {
+				markLaunched();
+				await holdLaunch;
+				return { runId: "run-1", recovered: false };
+			},
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => HEAD1,
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner("session-1"), worktree: "/wt", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "first-round"),
+		});
+		const recon = ctrl.reconcile();
+		await launched;
+		const concurrent = ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "second-finding"),
+			round: "2",
+		});
+		assert.equal(concurrent.accepted, true);
+		releaseLaunch();
+		await recon;
+		const ob = store.read(PR);
+		assert.equal(ob?.state, "fixing");
+		assert.equal(
+			ob?.pendingVerdicts.length,
+			1,
+			"concurrent finding must survive the launch save",
+		);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

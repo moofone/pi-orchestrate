@@ -3,6 +3,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	classifyForRole,
@@ -204,11 +207,16 @@ test("mutationTargetDirs sees cd and git -C, not only the event cwd", () => {
 });
 
 test("mutationTargetDirs resolves relative cd and git -C against the event cwd", () => {
+  const tmpRoot = realpathSync("/tmp");
   assert.ok(
-    mutationTargetDirs("git -C ../feature commit -m x", "/tmp/elsewhere").includes("/tmp/feature"),
+    mutationTargetDirs("git -C ../feature commit -m x", join(tmpRoot, "elsewhere")).includes(
+      join(tmpRoot, "feature"),
+    ),
   );
   assert.ok(
-    mutationTargetDirs("cd ../feature && git commit -m x", "/tmp/elsewhere").includes("/tmp/feature"),
+    mutationTargetDirs("cd ../feature && git commit -m x", join(tmpRoot, "elsewhere")).includes(
+      join(tmpRoot, "feature"),
+    ),
   );
   assert.ok(
     mutationTargetDirs("git -C './src' commit -m x", "/wt/feat").includes("/wt/feat/src"),
@@ -231,6 +239,24 @@ test("isWorktreeMutation sees verbs after git -C and --work-tree", () => {
     true,
   );
   assert.equal(isWorktreeMutation("git -C /wt/feat status"), false);
+});
+
+test("mutationTargetDirs realpaths a symlink into the reserved worktree", () => {
+	const root = mkdtempSync(join(tmpdir(), "guard-link-"));
+	try {
+		const reserved = join(root, "feat");
+		mkdirSync(reserved);
+		const link = join(root, "link");
+		symlinkSync(reserved, link);
+		const dirs = mutationTargetDirs(`git -C ${link} commit -m x`, "/elsewhere");
+		assert.ok(
+			dirs.includes(realpathSync(reserved)),
+			`symlink target must canonicalize; got ${dirs.join(" | ")}`,
+		);
+		assert.equal(dirs.includes(link), false, "lexical symlink path must not be the reservation key");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("mutationTargetDirs includes --work-tree and --git-dir", () => {

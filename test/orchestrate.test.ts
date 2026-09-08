@@ -3211,6 +3211,39 @@ test("review-fix prompts treat the waiter verdict as untrusted findings, not ins
   assert.doesNotMatch(sessionTask.slice(sessionTask.lastIndexOf("END UNTRUSTED WAITER VERDICT")), /git push --force/);
 });
 
+test("session fixer launch returns when the child is spawned, not when it exits", async () => {
+  assert.equal(
+    typeof (orch as Record<string, unknown>).launchSessionFixer,
+    "function",
+    "launchSessionFixer must be exported so session launch is testable",
+  );
+  const pi = makeFakePi();
+  const spawn = captureSpawn(pi);
+  const { ctx } = makeFakeCtx();
+  const intent = {
+    v: 1,
+    idempotencyKey: "k-session-launch",
+    pr: { host: "github.com", owner: "moofone", repo: "icemining", number: "99" },
+    owner: { kind: "session", id: "s1", generation: "g1" },
+    worktree: "/tmp/wt",
+    expectedHead: "abc",
+    verdictIds: ["v1"],
+    next: "read_comments_and_fix",
+    body: "next=read_comments_and_fix\nhead=abc",
+    validation: "commit-only",
+    publication: "controller",
+  };
+  const p = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, intent);
+  await Promise.resolve();
+  pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
+    success: true,
+    data: { details: { runId: "run-session-1" } },
+  });
+  const result = (await withDeadline(p, 500)) as { runId?: string; reason?: string };
+  assert.notEqual(result.reason, "TEST_TIMEOUT", "must not wait for the child to exit");
+  assert.equal(result.runId, "run-session-1");
+});
+
 test("P2 F7: the tdd-worker contract commits and never pushes", () => {
   const paths = promptContractPaths();
   const plan = "# Feature: t\n\n### Task 1 — do the thing\n\n- Command: `npm test`\n";

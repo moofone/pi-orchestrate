@@ -99,7 +99,7 @@ import {
   fixerSettleAction,
   type FeaturePrAction,
 } from "./lib/feature-pr.ts";
-import { registerReviewLaunch, type LaunchIntent } from "./lib/pr-review-events.ts";
+import { registerReviewLaunch, type LaunchIntent, type LaunchResult } from "./lib/pr-review-events.ts";
 import {
   featureTitle,
   isApproved,
@@ -3919,6 +3919,35 @@ export function sessionFixLaunchParams(intent: LaunchIntent): Record<string, unk
 }
 
 /**
+ * Spawn a session fixer and return as soon as the child has a runId.
+ * Waiting for exit would hold reconcile's per-PR lock and drop concurrent
+ * observations when the stale in-memory obligation is saved.
+ */
+export async function launchSessionFixer(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  intent: LaunchIntent,
+): Promise<LaunchResult> {
+  const params = sessionFixLaunchParams(intent);
+  const ceiling = applyPhaseCeiling(pi, ctx, "implement");
+  try {
+    const policy = applySpawnPolicy(params);
+    if (policy.action === "reject") {
+      throw new Error(policy.reason ?? "spawn rejected");
+    }
+    const reply = await rpcCall(pi, "spawn", params);
+    if (!reply.success) throw new Error(rpcErrorText(reply));
+    const runId = reply.data?.details?.runId;
+    if (typeof runId !== "string" || !runId) {
+      throw new Error("spawn reply carried no runId");
+    }
+    return { runId, recovered: false };
+  } finally {
+    ceiling?.dispose();
+  }
+}
+
+/**
  * Whether a writer still owns this Feature according to disk.
  *
  * `RUNNING_CHAINS` only knows about this process: a session that died mid-fix
@@ -6329,18 +6358,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   if (events) {
     registerReviewLaunch(async (intent) => {
       if (!lastCtx) throw new Error("pr-review launch handler: no session context");
-      const params = sessionFixLaunchParams(intent);
-      let runId = intent.idempotencyKey;
-      await runChildInPhase(
-        pi,
-        lastCtx as ExtensionCommandContext,
-        "implement",
-        params,
-        (id) => {
-          runId = id;
-        },
-      );
-      return { runId, recovered: false };
+      return await launchSessionFixer(pi, lastCtx as ExtensionCommandContext, intent);
     }, events);
   }
   setChainReleaseHook((featureDir) => {

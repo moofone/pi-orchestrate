@@ -6,6 +6,7 @@ import {
 	parsePrKey,
 	prKeyFileToken,
 	prKeyId,
+	sameGitHead,
 	samePrKey,
 	stabilizeVerdictBody,
 	verdictIdentity,
@@ -51,6 +52,15 @@ test("two findings rounds with the same next= remain distinct", () => {
 		body: "next=read_comments_and_fix\nhead=2033c56dc\nbrief_finding overflow",
 	});
 	assert.notEqual(round1, round2);
+});
+
+test("sameGitHead treats a waiter short SHA as the live full SHA", () => {
+	const full = "e9de4b669aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	assert.equal(sameGitHead(full.slice(0, 12), full), true);
+	assert.equal(sameGitHead(full, full.slice(0, 7)), true);
+	assert.equal(sameGitHead(full, "2033c56dcccccccccccccccccccccccccccccccc"), false);
+	assert.equal(sameGitHead("e9de4b669", "e9de4b660aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), false);
+	assert.equal(sameGitHead("", full), false);
 });
 
 test("GitHub 500 is an env verdict, not a code fix", () => {

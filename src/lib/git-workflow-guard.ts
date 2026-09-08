@@ -7,6 +7,7 @@
  * push/fetch-alone) is untouched.
  */
 import { resolve } from "node:path";
+import { canonicalizePath } from "./pr-review-store.ts";
 
 export type GuardVerdict = { block: false } | { block: true; reason: string };
 
@@ -225,7 +226,8 @@ function resolveMutationDir(dir: string, fallbackCwd?: string): string {
 	const trimmed = dir.replace(/\/+$/, "").replace(/\/\.git$/, "");
 	if (!trimmed) return "";
 	const base = fallbackCwd?.replace(/\/+$/, "") || process.cwd();
-	return resolve(trimmed.startsWith("/") ? trimmed : resolve(base, trimmed)).replace(/\/+$/, "");
+	const lexical = resolve(trimmed.startsWith("/") ? trimmed : resolve(base, trimmed)).replace(/\/+$/, "");
+	return canonicalizePath(lexical);
 }
 
 /** Worktrees a bash command would mutate: `cd DIR && git …`, `git -C DIR`, fallback cwd. */
@@ -242,7 +244,7 @@ export function mutationTargetDirs(command: string, fallbackCwd?: string): strin
 		const resolved = resolveMutationDir(raw, fallbackCwd);
 		if (resolved) dirs.push(resolved);
 	}
-	if (fallbackCwd) dirs.push(resolve(fallbackCwd.replace(/\/+$/, "")).replace(/\/+$/, ""));
+	if (fallbackCwd) dirs.push(canonicalizePath(resolve(fallbackCwd.replace(/\/+$/, "")).replace(/\/+$/, "")));
 	return [...new Set(dirs)];
 }
 
