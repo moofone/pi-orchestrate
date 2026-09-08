@@ -198,8 +198,16 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				return { ok: false, reason: "owner generation changed" };
 			}
 		}
-		if (ob.owner.kind === "session" && lookup.status === "feature") {
-			return { ok: false, reason: "session still holds this PR; feature transfer requires release" };
+		if (ob.owner.kind === "session") {
+			if (lookup.status === "feature") {
+				return { ok: false, reason: "session still holds this PR; feature transfer requires release" };
+			}
+			if (lookup.status !== "session" || lookup.owner.id !== ob.owner.id) {
+				return { ok: false, reason: "session owner mismatch" };
+			}
+			if (lookup.owner.generation !== ob.owner.generation) {
+				return { ok: false, reason: "owner generation changed" };
+			}
 		}
 		return { ok: true, lookup };
 	}

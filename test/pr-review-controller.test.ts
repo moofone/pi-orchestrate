@@ -392,6 +392,39 @@ test("owner lookup failure does not solo-fallback or drop the obligation", async
 	}
 });
 
+test("a different session cannot reconcile another session's obligation", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner("session-1"), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "foreign-session");
+		w.owner = { status: "session", owner: sessionOwner("session-2") };
+		const r = await w.ctrl.reconcile();
+		assert.equal(r.launched, 0, "must not launch a fixer for someone else's session");
+		assert.equal(r.recovery, 0, "mismatch is not a missing-adapter recovery");
+		assert.equal(w.ctrl.status(PR)[0]?.pendingCount, 1);
+		assert.notEqual(w.ctrl.status(PR)[0]?.state, "recovery_required");
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("session generation change admits no new writer", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner("session-1"), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "gen-change");
+		w.owner = {
+			status: "session",
+			owner: { kind: "session", id: "session-1", generation: "g-other" },
+		};
+		const r = await w.ctrl.reconcile();
+		assert.equal(r.launched, 0);
+		assert.equal(w.launches.length, 0);
+	} finally {
+		w.cleanup();
+	}
+});
+
 test("pause / cancel / generation change admit no new writer", async () => {
 	const w = world();
 	try {
@@ -450,8 +483,8 @@ test("merge notifies the owner once; only merge completes a merge-dependent todo
 test("same PR number in another repo is a different obligation", async () => {
 	const w = world();
 	try {
-		w.ctrl.handoff({ pr: PR, owner: sessionOwner("ice"), worktree: "/wt/ice", head: HEAD1 });
-		w.ctrl.handoff({ pr: OTHER, owner: sessionOwner("devops"), worktree: "/wt/dev", head: HEAD1 });
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt/ice", head: HEAD1 });
+		w.ctrl.handoff({ pr: OTHER, owner: sessionOwner(), worktree: "/wt/dev", head: HEAD1 });
 		observeFix(w, PR, HEAD1, "ice");
 		observeFix(w, OTHER, HEAD1, "devops");
 		await w.ctrl.reconcile();

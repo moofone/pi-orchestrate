@@ -9,6 +9,7 @@ import {
 	classifyGitWorkflowCommand,
 	classifyViewRepeat,
 	extractPrNumber,
+	isWorktreeMutation,
 	isWriterRole,
 	mutationTargetDirs,
 	viewRepeatKey,
@@ -200,4 +201,25 @@ test("mutationTargetDirs sees cd and git -C, not only the event cwd", () => {
     "/wt/feat/src",
     "/elsewhere",
   ]);
+});
+
+test("mutationTargetDirs resolves relative cd and git -C against the event cwd", () => {
+  assert.ok(
+    mutationTargetDirs("git -C ../feature commit -m x", "/tmp/elsewhere").includes("/tmp/feature"),
+  );
+  assert.ok(
+    mutationTargetDirs("cd ../feature && git commit -m x", "/tmp/elsewhere").includes("/tmp/feature"),
+  );
+  assert.ok(
+    mutationTargetDirs("git -C './src' commit -m x", "/wt/feat").includes("/wt/feat/src"),
+  );
+});
+
+test("isWorktreeMutation covers rm/mv/clean/switch, not only commit/push", () => {
+  assert.equal(isWorktreeMutation("git rm src/a.ts"), true);
+  assert.equal(isWorktreeMutation("git mv a.ts b.ts"), true);
+  assert.equal(isWorktreeMutation("git clean -fd"), true);
+  assert.equal(isWorktreeMutation("git switch feat/x"), true);
+  assert.equal(isWorktreeMutation("git status"), false);
+  assert.equal(isWorktreeMutation("git log -1"), false);
 });

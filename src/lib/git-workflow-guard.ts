@@ -6,6 +6,8 @@
  * allowlist for wait/worktree/land. Ordinary git (status/diff/log/add/commit/
  * push/fetch-alone) is untouched.
  */
+import { resolve } from "node:path";
+
 export type GuardVerdict = { block: false } | { block: true; reason: string };
 
 const RUST = {
@@ -166,21 +168,38 @@ const WRITER_BLOCKS: { re: RegExp; reason: string }[] = [
  * `git pr-await` through, and for a child that is exactly the wrong answer.
  */
 const PARENT_MUTATION =
-	/\bgit\s+(add|commit|push|checkout|restore|reset|rebase|merge|cherry-pick)\b/;
+	/\bgit\s+(add|commit|push|checkout|restore|reset|rebase|merge|cherry-pick|rm|mv|clean|switch)\b/;
 
 export function isWorktreeMutation(command: string): boolean {
 	return PARENT_MUTATION.test(stripComments(command));
+}
+
+function captureDirArgs(prefix: string, text: string): string[] {
+	const out: string[] = [];
+	const re = new RegExp(`${prefix}\\s+(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
+	for (const m of text.matchAll(re)) {
+		const raw = (m[1] ?? m[2] ?? "").trim();
+		if (raw && raw !== "-" && !raw.startsWith("-")) out.push(raw);
+	}
+	return out;
+}
+
+function resolveMutationDir(dir: string, fallbackCwd?: string): string {
+	const trimmed = dir.replace(/\/+$/, "");
+	if (!trimmed) return "";
+	const base = fallbackCwd?.replace(/\/+$/, "") || process.cwd();
+	return resolve(trimmed.startsWith("/") ? trimmed : resolve(base, trimmed)).replace(/\/+$/, "");
 }
 
 /** Worktrees a bash command would mutate: `cd DIR && git …`, `git -C DIR`, fallback cwd. */
 export function mutationTargetDirs(command: string, fallbackCwd?: string): string[] {
 	const text = stripComments(command);
 	const dirs: string[] = [];
-	const cd = text.match(/\bcd\s+['"]?(\/[^'";\s&|]+)['"]?/);
-	if (cd?.[1]) dirs.push(cd[1].replace(/\/+$/, ""));
-	const gitC = text.match(/\bgit\s+-C\s+['"]?(\/[^'";\s]+)['"]?/);
-	if (gitC?.[1]) dirs.push(gitC[1].replace(/\/+$/, ""));
-	if (fallbackCwd) dirs.push(fallbackCwd.replace(/\/+$/, ""));
+	for (const raw of [...captureDirArgs("\\bcd", text), ...captureDirArgs("\\bgit\\s+-C", text)]) {
+		const resolved = resolveMutationDir(raw, fallbackCwd);
+		if (resolved) dirs.push(resolved);
+	}
+	if (fallbackCwd) dirs.push(resolve(fallbackCwd.replace(/\/+$/, "")).replace(/\/+$/, ""));
 	return [...new Set(dirs)];
 }
 
