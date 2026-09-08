@@ -223,3 +223,27 @@ test("isWorktreeMutation covers rm/mv/clean/switch, not only commit/push", () =>
   assert.equal(isWorktreeMutation("git status"), false);
   assert.equal(isWorktreeMutation("git log -1"), false);
 });
+
+test("isWorktreeMutation sees verbs after git -C and --work-tree", () => {
+  assert.equal(isWorktreeMutation("git -C /wt/feat add ."), true);
+  assert.equal(
+    isWorktreeMutation("git --git-dir=/wt/feat/.git --work-tree=/wt/feat commit -m x"),
+    true,
+  );
+  assert.equal(isWorktreeMutation("git -C /wt/feat status"), false);
+});
+
+test("mutationTargetDirs includes --work-tree and --git-dir", () => {
+  assert.ok(
+    mutationTargetDirs(
+      "git --work-tree=/wt/feat commit -m x",
+      "/elsewhere",
+    ).includes("/wt/feat"),
+  );
+  assert.ok(
+    mutationTargetDirs(
+      "git --git-dir=/wt/feat/.git add .",
+      "/elsewhere",
+    ).some((d) => d === "/wt/feat" || d.startsWith("/wt/feat/")),
+  );
+});

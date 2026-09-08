@@ -392,6 +392,27 @@ test("owner lookup failure does not solo-fallback or drop the obligation", async
 	}
 });
 
+test("successor session can take over an idle session obligation", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner("session-1"), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "reload-successor");
+		const transfer = w.ctrl.handoff({
+			pr: PR,
+			owner: sessionOwner("session-2"),
+			worktree: "/wt",
+			head: HEAD1,
+		});
+		assert.equal(transfer.ok, true, "reload successor must adopt an idle session PR");
+		assert.equal(transfer.transferred, true);
+		w.owner = { status: "session", owner: sessionOwner("session-2") };
+		const r = await w.ctrl.reconcile();
+		assert.equal(r.launched, 1);
+	} finally {
+		w.cleanup();
+	}
+});
+
 test("a different session cannot reconcile another session's obligation", async () => {
 	const w = world();
 	try {

@@ -2253,7 +2253,7 @@ test("refused ownership handoff retains the waiter verdict", async () => {
 		store.write(
 			emptyObligation({
 				pr: key,
-				owner: { kind: "session", id: "other-session", generation: "g-other" },
+				owner: { kind: "feature", id: "/orch/icemining/feat-other", generation: "fg-other" },
 				worktree: "/wt/other",
 				head: "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016",
 			}),
@@ -2279,6 +2279,35 @@ test("refused ownership handoff retains the waiter verdict", async () => {
 		const again = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 		assert.equal(again.verdictDelivered, false, "retry must still see the undelivered verdict");
 		assert.equal(h.sessionFixes.length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("dead-reviewer ACTIONABLE is marked delivered after re-arm", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeFileSync(
+			waiterState(h.dir),
+			JSON.stringify({
+				pr: "2142",
+				lastNext: "investigate_dead_reviewers",
+				verdict: [
+					"status=action_required",
+					"next=investigate_dead_reviewers",
+					"pr=2142",
+					"head=47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016",
+				].join("\n"),
+				verdictDelivered: false,
+			}),
+		);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "dead reviewers re-arm the waiter, they do not launch a fixer");
+		const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(state.verdictDelivered, true, "consumed dead-reviewer verdict must not replay");
 	} finally {
 		h.cleanup();
 	}

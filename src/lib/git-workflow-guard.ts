@@ -167,11 +167,33 @@ const WRITER_BLOCKS: { re: RegExp; reason: string }[] = [
  * Writer blocks are checked first: the solo allowlist deliberately waves
  * `git pr-await` through, and for a child that is exactly the wrong answer.
  */
-const PARENT_MUTATION =
-	/\bgit\s+(add|commit|push|checkout|restore|reset|rebase|merge|cherry-pick|rm|mv|clean|switch)\b/;
+const PARENT_MUTATION_VERB =
+	/^(add|commit|push|checkout|restore|reset|rebase|merge|cherry-pick|rm|mv|clean|switch)$/;
+
+function gitVerb(command: string): string | undefined {
+	const m = stripComments(command).match(/\bgit\b([\s\S]*)/);
+	if (!m) return undefined;
+	const tokens = m[1]!.trim().split(/\s+/).filter(Boolean);
+	for (let i = 0; i < tokens.length; i++) {
+		const t = tokens[i]!;
+		if (t === "--") return tokens[i + 1];
+		if (t.startsWith("--")) {
+			if (!t.includes("=") && i + 1 < tokens.length && !tokens[i + 1]!.startsWith("-")) i += 1;
+			continue;
+		}
+		if (t.startsWith("-") && t.length === 2) {
+			if (i + 1 < tokens.length && !tokens[i + 1]!.startsWith("-")) i += 1;
+			continue;
+		}
+		if (t.startsWith("-")) continue;
+		return t;
+	}
+	return undefined;
+}
 
 export function isWorktreeMutation(command: string): boolean {
-	return PARENT_MUTATION.test(stripComments(command));
+	const verb = gitVerb(command);
+	return Boolean(verb && PARENT_MUTATION_VERB.test(verb));
 }
 
 function captureDirArgs(prefix: string, text: string): string[] {
@@ -184,8 +206,23 @@ function captureDirArgs(prefix: string, text: string): string[] {
 	return out;
 }
 
+function captureFlagPaths(flag: string, text: string): string[] {
+	const out: string[] = [];
+	const eq = new RegExp(`${flag}=(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
+	for (const m of text.matchAll(eq)) {
+		const raw = (m[1] ?? m[2] ?? "").trim();
+		if (raw) out.push(raw);
+	}
+	const spaced = new RegExp(`${flag}\\s+(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
+	for (const m of text.matchAll(spaced)) {
+		const raw = (m[1] ?? m[2] ?? "").trim();
+		if (raw && !raw.startsWith("-")) out.push(raw);
+	}
+	return out;
+}
+
 function resolveMutationDir(dir: string, fallbackCwd?: string): string {
-	const trimmed = dir.replace(/\/+$/, "");
+	const trimmed = dir.replace(/\/+$/, "").replace(/\/\.git$/, "");
 	if (!trimmed) return "";
 	const base = fallbackCwd?.replace(/\/+$/, "") || process.cwd();
 	return resolve(trimmed.startsWith("/") ? trimmed : resolve(base, trimmed)).replace(/\/+$/, "");
@@ -195,7 +232,13 @@ function resolveMutationDir(dir: string, fallbackCwd?: string): string {
 export function mutationTargetDirs(command: string, fallbackCwd?: string): string[] {
 	const text = stripComments(command);
 	const dirs: string[] = [];
-	for (const raw of [...captureDirArgs("\\bcd", text), ...captureDirArgs("\\bgit\\s+-C", text)]) {
+	const raws = [
+		...captureDirArgs("\\bcd", text),
+		...captureDirArgs("\\bgit\\s+-C", text),
+		...captureFlagPaths("--work-tree", text),
+		...captureFlagPaths("--git-dir", text),
+	];
+	for (const raw of raws) {
 		const resolved = resolveMutationDir(raw, fallbackCwd);
 		if (resolved) dirs.push(resolved);
 	}

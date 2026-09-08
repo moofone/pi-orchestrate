@@ -1093,7 +1093,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 		lastActionableFingerprint = fp;
 		lastRefusedFingerprint = undefined;
-		if (report.launched > 0 || ack.duplicate) {
+		if (report.launched > 0 || ack.duplicate || report.rearmed > 0) {
 			for (const path of candidates) markVerdictDelivered(path);
 		}
 	}

@@ -237,7 +237,9 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			}
 			const sessionToFeature =
 				existing.owner.kind === "session" && req.owner.kind === "feature";
-			if (!sessionToFeature && existing.owner.kind !== "observer") {
+			const sessionToSession =
+				existing.owner.kind === "session" && req.owner.kind === "session";
+			if (!sessionToFeature && !sessionToSession && existing.owner.kind !== "observer") {
 				return {
 					ok: false,
 					state: existing.state,
