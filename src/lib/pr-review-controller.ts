@@ -154,6 +154,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 	const pid = deps.pid ?? process.pid;
 	const store = deps.store;
 	const inflight = new Map<string, Promise<void>>();
+	const locked = new Set<string>();
 
 	function save(ob: Obligation, note?: string): Obligation {
 		if (note) ob.lastProgress = { at: now(), note };
@@ -214,6 +215,14 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 
 	const controller: ReviewController = {
 		handoff(req) {
+			if (locked.has(prKeyId(req.pr))) {
+				const existing = store.read(req.pr);
+				return {
+					ok: false,
+					state: existing?.state ?? "waiting_review",
+					reason: "reconcile in progress",
+				};
+			}
 			if (req.owner.kind === "observer") {
 				return { ok: false, state: "cancelled", reason: "observer has no mutation authority" };
 			}
@@ -376,6 +385,12 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			await withPrLock(found.pr, async () => {
 				const ob = store.read(found.pr);
 				if (!ob) return;
+				if (ob.state === "paused" || ob.state === "cancelled") {
+					store.releaseWriter(ob.pr, ob.writer?.holder ?? ob.owner.id);
+					ob.writer = undefined;
+					save(ob, `child ${result.runId} exited while ${ob.state}`);
+					return;
+				}
 				if (ob.state !== "fixing" && ob.state !== "launching" && ob.state !== "validating") return;
 				ob.state = "validating";
 				save(ob, `child ${result.runId} exited`);
@@ -389,11 +404,20 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		},
 
 		pause(pr, reason) {
-			const ob = store.read(pr);
-			if (!ob) return;
-			ob.state = "paused";
-			ob.failureReason = reason;
-			save(ob, `paused: ${reason}`);
+			const apply = (): void => {
+				const ob = store.read(pr);
+				if (!ob) return;
+				ob.state = "paused";
+				ob.failureReason = reason;
+				store.releaseWriter(pr, ob.writer?.holder ?? ob.owner.id);
+				ob.writer = undefined;
+				save(ob, `paused: ${reason}`);
+			};
+			if (locked.has(prKeyId(pr))) {
+				void withPrLock(pr, async () => apply());
+				return;
+			}
+			apply();
 		},
 
 		cancel(pr, reason) {
@@ -410,7 +434,24 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 	function withPrLock(pr: PrKey, fn: () => Promise<void>): Promise<void> {
 		const id = prKeyId(pr);
 		const prev = inflight.get(id) ?? Promise.resolve();
-		const mine = prev.then(() => fn(), () => fn());
+		const mine = prev.then(
+			async () => {
+				locked.add(id);
+				try {
+					await fn();
+				} finally {
+					locked.delete(id);
+				}
+			},
+			async () => {
+				locked.add(id);
+				try {
+					await fn();
+				} finally {
+					locked.delete(id);
+				}
+			},
+		);
 		inflight.set(
 			id,
 			mine.then(

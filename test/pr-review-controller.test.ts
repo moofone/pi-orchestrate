@@ -1038,7 +1038,7 @@ test("Feature cannot silently adopt a session PR while its writer is reserved", 
 		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
 		observeFix(w, PR, HEAD1, "held");
 		await w.ctrl.reconcile();
-		const transfer = w.ctrl.handoff({
+		const transfer = await w.ctrl.handoff({
 			pr: PR,
 			owner: featureOwner(),
 			worktree: "/wt",
@@ -1048,5 +1048,68 @@ test("Feature cannot silently adopt a session PR while its writer is reserved", 
 		assert.match(transfer.reason ?? "", /writer/);
 	} finally {
 		w.cleanup();
+	}
+});
+
+test("pause during fixing releases the writer so the parent is not blocked after the child exits", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		observeFix(w, PR, HEAD1, "pause-lock");
+		await w.ctrl.reconcile();
+		assert.equal(w.ctrl.status(PR)[0]?.state, "fixing");
+		assert.ok(createReviewStore(w.dir).writerFor(PR), "fixer holds the lock");
+		await w.ctrl.pause(PR, "budget");
+		assert.equal(w.ctrl.status(PR)[0]?.state, "paused");
+		assert.equal(createReviewStore(w.dir).writerFor(PR), undefined, "pause must drop the lock file");
+		assert.equal(createReviewStore(w.dir).writerForWorktree("/wt"), undefined);
+		await w.ctrl.childFinished({ runId: "run-1", ok: true, localHead: HEAD2 });
+		assert.equal(w.ctrl.status(PR)[0]?.state, "paused", "child exit must not unpause");
+		assert.equal(createReviewStore(w.dir).writerFor(PR), undefined);
+		assert.equal(w.published.length, 0, "paused child must not publish");
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("handoff during launch cannot clobber the writer reservation", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-handoff-lock-"));
+	try {
+		const store = createReviewStore(dir);
+		let transfer: { ok: boolean; reason?: string } | undefined;
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner("session-1") }),
+			launchFixer: async () => ({ runId: "run-1", recovered: false }),
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => {
+				transfer = await ctrl.handoff({
+					pr: PR,
+					owner: sessionOwner("session-2"),
+					worktree: "/wt",
+					head: HEAD1,
+				});
+				return HEAD1;
+			},
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		await ctrl.handoff({ pr: PR, owner: sessionOwner("session-1"), worktree: "/wt", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "handoff-race"),
+		});
+		await ctrl.reconcile();
+		assert.ok(transfer, "handoff ran during reconcile");
+		assert.equal(transfer.ok, false, "must not steal a PR while reconcile holds the lock");
+		assert.ok(store.writerFor(PR), "launch reservation must survive the raced handoff");
+		assert.equal(store.read(PR)?.owner.id, "session-1");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
