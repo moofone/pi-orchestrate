@@ -221,7 +221,8 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				save(existing, "handoff refresh");
 				return { ok: true, state: existing.state };
 			}
-			const writer = store.writerFor(req.pr) ?? existing.writer;
+			const writer = store.writerFor(req.pr);
+			if (existing.writer && !writer) existing.writer = undefined;
 			if (writer) {
 				return { ok: false, state: existing.state, reason: "writer still holds this PR" };
 			}
@@ -299,6 +300,15 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				}
 				save(ob);
 				return { accepted: true, identity, kind, reason: "not a code-fixer verdict" };
+			}
+			if (kind === "terminal") {
+				consumeRecord(ob, record, "terminal verdict");
+				ob.lastProgress = { at: now(), note: `terminal ${obs.next}` };
+				if (ob.state === "verdict_pending" && ob.pendingVerdicts.length === 0) {
+					ob.state = "waiting_review";
+				}
+				save(ob, `observed terminal ${obs.next}`);
+				return { accepted: true, identity, kind, reason: "terminal; not a fixer" };
 			}
 			if (ob.activeVerdictIds.includes(identity)) {
 				return { accepted: true, identity, kind, duplicate: true };
@@ -519,7 +529,13 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				ob.state = "waiting_review";
 				save(ob, "re-armed waiter for dead reviewers");
 				report.rearmed += 1;
+				return;
 			}
+			const leftover = ob.pendingVerdicts.filter((v) => v.kind !== "fix" && v.kind !== "dead_reviewers");
+			for (const v of leftover) consumeRecord(ob, v, v.kind === "terminal" ? "terminal verdict" : "not a fixer");
+			if (leftover.some((v) => v.kind === "terminal")) report.terminal += leftover.filter((v) => v.kind === "terminal").length;
+			ob.state = ob.pendingVerdicts.length ? "verdict_pending" : "waiting_review";
+			save(ob, leftover.length ? "drained non-fixer verdicts" : "empty pending");
 			return;
 		}
 
@@ -710,6 +726,20 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		}
 		ob.activeVerdictIds = [];
 		ob.launch = undefined;
+	}
+
+	function consumeRecord(ob: Obligation, record: VerdictRecord, reason: string): void {
+		if (!store.hasReceipt(record.identity)) {
+			store.putReceipt({
+				v: 1,
+				identity: record.identity,
+				pr: prKeyId(ob.pr),
+				ownerGeneration: ob.owner.generation,
+				consumedAt: now(),
+				reason,
+			});
+		}
+		ob.pendingVerdicts = ob.pendingVerdicts.filter((v) => v.identity !== record.identity);
 	}
 
 	function failFix(ob: Obligation, reason: string): void {

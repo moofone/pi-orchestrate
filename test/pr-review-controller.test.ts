@@ -805,6 +805,67 @@ test("failed fixer retries the same verdict after backoff", async () => {
 	}
 });
 
+test("terminal verdict is consumed, not left pending", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		const ack = w.ctrl.observeVerdict({
+			pr: PR,
+			next: "done",
+			head: HEAD1,
+			body: "status=landed\nnext=done\npr=2537\n",
+		});
+		assert.equal(ack.kind, "terminal");
+		await w.ctrl.reconcile();
+		const st = w.ctrl.status(PR)[0];
+		assert.equal(st?.pendingCount, 0, "terminal must not sit in the queue");
+		assert.notEqual(st?.state, "verdict_pending");
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("stale persisted writer does not block Feature handoff", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-stale-writer-"));
+	try {
+		const store = createReviewStore(dir);
+		store.write({
+			v: 1,
+			pr: PR,
+			generation: "g1",
+			owner: sessionOwner(),
+			worktree: "/wt",
+			head: HEAD1,
+			state: "waiting_review",
+			pendingVerdicts: [],
+			activeVerdictIds: [],
+			writer: { holder: "session:dead", pid: 1, reservedAt: 1 },
+		});
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "feature", owner: featureOwner() }),
+			launchFixer: async () => ({ runId: "run-1", recovered: false }),
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => HEAD1,
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		const transfer = ctrl.handoff({
+			pr: PR,
+			owner: featureOwner(),
+			worktree: "/wt/feat",
+			head: HEAD1,
+		});
+		assert.equal(transfer.ok, true, "lock file gone means no live writer");
+		assert.equal(transfer.transferred, true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("Feature cannot silently adopt a session PR while its writer is reserved", async () => {
 	const w = world();
 	try {

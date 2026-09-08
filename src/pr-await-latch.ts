@@ -1005,6 +1005,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		} catch {
 			featureLookupFailed = true;
 		}
+		if (featureLookupFailed) {
+			lastRefusedFingerprint = fp;
+			notify(
+				ctx,
+				`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} recovery-required (feature owner lookup failed; no solo fallback).`,
+			);
+			return;
+		}
 		if (feature && !feature.worktree) {
 			notify(
 				ctx,
@@ -1045,12 +1053,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		});
 		if (!ack.accepted) return;
 		const report = await ctrl.reconcile({ ownerId: owner.id });
-		if (featureLookupFailed || report.recovery > 0) {
+		if (report.recovery > 0) {
 			lastRefusedFingerprint = fp;
 			notify(
 				ctx,
-				`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} recovery-required` +
-					(featureLookupFailed ? " (feature owner lookup failed; no solo fallback)." : "."),
+				`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} recovery-required.`,
 			);
 			return;
 		}

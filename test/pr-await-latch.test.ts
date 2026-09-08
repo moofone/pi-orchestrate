@@ -2182,6 +2182,30 @@ test("a Feature with no worktree recorded is reported, not handed to the parent"
 	}
 });
 
+test("featureOwnedPr throw does not launch a session fixer", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		featureOwnedPr: () => {
+			throw new Error("jiti isolate: no handler");
+		},
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "must not solo-fallback when Feature lookup throws");
+		assert.equal(h.dispatches.length, 0);
+		assert.equal(h.wakes.length, 0, "parent must stay idle");
+		assert.ok(
+			h.notifies.some((n) => /lookup failed|recovery-required/i.test(n)),
+			`stall must be visible; got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("a Feature in another repo, or on another PR, does not swallow the session fixer", async () => {
 	// Ownership is `pr:` AND `repo:`. Anything looser would mute the fixer a plain
 	// session depends on, using a Feature that has nothing to do with this PR.
