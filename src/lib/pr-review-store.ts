@@ -10,7 +10,7 @@
  * cannot erase consumption.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import {
 	PR_REVIEW_PROTOCOL_VERSION,
@@ -112,6 +112,14 @@ export type ReviewStore = {
 
 export function reviewStoreDir(stateDir: string): string {
 	return join(stateDir, "review");
+}
+
+/** True when `target` is `reserved` or a path inside it (not a sibling prefix). */
+export function worktreeOwnsPath(reserved: string, target: string): boolean {
+	const a = resolve(String(reserved ?? "")).replace(/\/+$/, "");
+	const b = resolve(String(target ?? "")).replace(/\/+$/, "");
+	if (!a || !b || a === "/") return false;
+	return b === a || b.startsWith(`${a}/`);
 }
 
 export function createReviewStore(stateDir: string): ReviewStore {
@@ -298,10 +306,10 @@ export function createReviewStore(stateDir: string): ReviewStore {
 			return readReservation(pr);
 		},
 		writerForWorktree(worktree) {
-			const target = worktree.replace(/\/+$/, "");
+			const target = String(worktree ?? "").trim();
 			if (!target) return undefined;
 			for (const ob of store.list()) {
-				if (ob.worktree.replace(/\/+$/, "") !== target) continue;
+				if (!worktreeOwnsPath(ob.worktree, target)) continue;
 				const reservation = readReservation(ob.pr);
 				if (!reservation) continue;
 				if (reservation.pid != null && !pidLive(reservation.pid)) continue;

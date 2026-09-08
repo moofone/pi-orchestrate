@@ -716,6 +716,34 @@ test("publish failure releases the writer reservation", async () => {
 	}
 });
 
+test("writerForWorktree matches a subdirectory of the reserved worktree", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-subdir-lock-"));
+	try {
+		const store = createReviewStore(dir);
+		store.write({
+			v: 1,
+			pr: PR,
+			generation: "g1",
+			owner: sessionOwner(),
+			worktree: "/wt/feat",
+			head: HEAD1,
+			state: "fixing",
+			pendingVerdicts: [],
+			activeVerdictIds: [],
+		});
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:a", pid: process.pid, reservedAt: 1 }),
+			true,
+		);
+		assert.ok(store.writerForWorktree("/wt/feat"), "root of the reserved worktree");
+		assert.ok(store.writerForWorktree("/wt/feat/src"), "subdirectory is still the reserved worktree");
+		assert.equal(store.writerForWorktree("/wt/feat-other"), undefined, "sibling prefix must not match");
+		assert.equal(store.writerForWorktree("/wt"), undefined, "parent directory is not reserved");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("writerForWorktree ignores a persisted writer when the lock file is gone", () => {
 	const dir = mkdtempSync(join(tmpdir(), "pr-review-stale-lock-"));
 	try {

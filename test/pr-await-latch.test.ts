@@ -9,7 +9,7 @@
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1719,6 +1719,34 @@ test("undelivered ACTIONABLE on settle launches a fixer, not the parent", async 
 	assert.equal(h.sessionFixes.length, 1, "controller must launch one session fixer");
 	assert.equal(h.sessionFix(0).next, "read_comments_and_fix");
 	h.cleanup();
+});
+
+test("already-consumed waiter verdict is marked delivered on recovery", async () => {
+	const h1 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h1.start();
+		await h1.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h1.dir, h1.sessionId);
+		await h1.settle();
+		await sleep(80);
+		assert.equal(h1.sessionFixes.length, 1);
+		const h2 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+		try {
+			await h2.start();
+			await h2.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+			cpSync(join(h1.dir, "review"), join(h2.dir, "review"), { recursive: true });
+			writeActionable(h2.dir, h2.sessionId);
+			await h2.settle();
+			await sleep(80);
+			assert.equal(h2.sessionFixes.length, 0, "receipt means the fixer already launched");
+			const state = JSON.parse(readFileSync(waiterState(h2.dir), "utf8"));
+			assert.equal(state.verdictDelivered, true, "duplicate consumption must spend the waiter verdict");
+		} finally {
+			h2.cleanup();
+		}
+	} finally {
+		h1.cleanup();
+	}
 });
 
 test("session fixer exit is observed and published without a parent turn", async () => {

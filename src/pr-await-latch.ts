@@ -89,7 +89,7 @@ import {
 	type FeaturePrOwner,
 	type LatchState,
 } from "./lib/pr-await-core.ts";
-import { classifyGithubStatus, parsePrKey } from "./lib/pr-review-identity.ts";
+import { classifyGithubStatus, parsePrKey, parseVerdictHead, verdictIdentity } from "./lib/pr-review-identity.ts";
 import { createReviewStore } from "./lib/pr-review-store.ts";
 import { createReviewController, type ReviewController } from "./lib/pr-review-controller.ts";
 import {
@@ -1046,6 +1046,18 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		});
 		if (!handed.ok) {
 			lastRefusedFingerprint = fp;
+			const body = hit.verdict ?? "";
+			const identity = verdictIdentity({
+				pr: key,
+				head: parseVerdictHead(body),
+				next: hit.lastNext,
+				body,
+				round: hit.round,
+			});
+			if (createReviewStore(stateDir()).hasReceipt(identity)) {
+				for (const path of candidates) markVerdictDelivered(path);
+				return;
+			}
 			if (!repeatOfRefusal) {
 				notify(
 					ctx,
@@ -1081,7 +1093,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 		lastActionableFingerprint = fp;
 		lastRefusedFingerprint = undefined;
-		if (report.launched > 0) {
+		if (report.launched > 0 || ack.duplicate) {
 			for (const path of candidates) markVerdictDelivered(path);
 		}
 	}

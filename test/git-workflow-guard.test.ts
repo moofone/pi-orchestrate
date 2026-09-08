@@ -196,4 +196,8 @@ test("mutationTargetDirs sees cd and git -C, not only the event cwd", () => {
     "/wt/feat",
     "/elsewhere",
   ]);
+  assert.deepEqual(mutationTargetDirs("cd /wt/feat/src && git commit -m x", "/elsewhere"), [
+    "/wt/feat/src",
+    "/elsewhere",
+  ]);
 });
