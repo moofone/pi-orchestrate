@@ -832,6 +832,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					runId: launched.runId,
 					status: "running",
 					key: intent.idempotencyKey,
+					worktree: intent.worktree,
 				};
 				sessionRuns.set(launched.runId, rec);
 				sessionRuns.set(intent.idempotencyKey, rec);
@@ -846,7 +847,17 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					const runId = mem?.runId ?? key;
 					const snap = readPiRunSnapshot(runId);
 					let head: string | undefined;
-					const cwd = latch?.cwd;
+					// HEAD is the fixer's worktree, not the live latch cwd. A later
+					// `git pr-await` on another PR would otherwise publish the wrong SHA.
+					const stored = createReviewStore(stateDir())
+						.list()
+						.find(
+							(item) =>
+								item.launch?.runId === runId ||
+								item.launch?.idempotencyKey === key ||
+								item.launch?.idempotencyKey === mem?.key,
+						);
+					const cwd = mem?.worktree || stored?.launch?.worktree || stored?.worktree;
 					if (cwd) {
 						try {
 							const r = await pi.exec("git", ["rev-parse", "HEAD"], { cwd, timeout: SHORT_MS });
@@ -866,8 +877,10 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 							stopped: snap.stopped,
 							head,
 							key: mem?.key ?? key,
+							worktree: cwd,
 						};
 						sessionRuns.set(runId, out);
+						sessionRuns.set(out.key, out);
 						return out;
 					}
 					return mem;

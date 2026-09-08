@@ -642,7 +642,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			verdictIds: ids,
 			attempt: ob.retry?.count ?? 0,
 		});
-		ob.launch = { idempotencyKey: key, intentAt: now() };
+		ob.launch = { idempotencyKey: key, intentAt: now(), worktree: ob.worktree };
 		ob.state = "launching";
 		ob.head = liveHead || pendingFix.head;
 		save(ob, "launch intent");
@@ -664,6 +664,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		if (existing) {
 			journal.runId = existing.runId;
 			journal.acceptedAt = journal.acceptedAt ?? now();
+			journal.worktree = journal.worktree || ob.worktree;
 			ob.state = existing.status === "exited" ? "validating" : "fixing";
 			if (ob.writer) ob.writer.runId = existing.runId;
 			consumeActive(ob);
@@ -726,6 +727,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		}
 		journal.runId = launched.runId;
 		journal.acceptedAt = now();
+		journal.worktree = journal.worktree || ob.worktree;
 		if (ob.writer) ob.writer.runId = launched.runId;
 		consumeActive(ob);
 		if (launched.completeRound) {

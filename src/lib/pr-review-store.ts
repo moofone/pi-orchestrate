@@ -63,6 +63,8 @@ export type LaunchJournal = {
 	intentAt: number;
 	runId?: string;
 	acceptedAt?: number;
+	/** Worktree this run mutates. queryRun must rev-parse here, not latch.cwd. */
+	worktree?: string;
 };
 
 export type Obligation = {

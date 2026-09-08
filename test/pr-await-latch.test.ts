@@ -1677,6 +1677,17 @@ const ACTIONABLE_VERDICT = [
 	"comment bot=grok path=a.ts line=1 body=fix",
 ].join("\n");
 
+function piRunDir(runId: string): string {
+	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	return join(tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs", runId);
+}
+
+function writePiRunComplete(runId: string): void {
+	const dir = piRunDir(runId);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "status.json"), JSON.stringify({ state: "complete", endedAt: Date.now() }));
+}
+
 /** Write a verdict the way the waiter does: into the waiter's own state file. */
 function writeActionable(dir: string, _sessionId: string, extra: Record<string, unknown> = {}) {
 	const path = waiterState(dir);
@@ -1779,6 +1790,73 @@ test("session fixer exit is observed and published without a parent turn", async
 		assert.equal(published.length, 1, "controller must publish after the fixer exits");
 		assert.equal(published[0], newHead);
 	} finally {
+		h.cleanup();
+	}
+});
+
+test("queryRun rev-parses the fixer worktree, not a later latch cwd", async () => {
+	const originalHead = "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016";
+	const fixerHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const otherHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	const runId = `session-query-wt-${process.pid}`;
+	const published: string[] = [];
+	const revParseCwds: string[] = [];
+	let childComplete = false;
+	const otherOut = [
+		"status=reviewer_active",
+		"next=poll_again",
+		"pr=2150",
+		`head=${otherHead}`,
+		"",
+	].join("\n");
+	const h = harness(
+		(cmd, args, opts) => {
+			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "rev-parse") {
+				revParseCwds.push(String(opts?.cwd ?? ""));
+				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
+				if (opts?.cwd === PI_SUB) return ok(otherHead);
+				return ok("");
+			}
+			return ok(REAL_OUTPUT);
+		},
+		REPO,
+		{
+			onSessionFixer: (intent: unknown) => {
+				assert.equal((intent as { worktree: string }).worktree, REPO);
+				return { runId, recovered: false };
+			},
+			publish: async (req: { localHead: string }) => {
+				published.push(req.localHead);
+				return { ok: true, remoteHead: req.localHead };
+			},
+		},
+	);
+	const snapDir = piRunDir(runId);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(published.length, 0, "must not publish while the child is running");
+		writePiRunComplete(runId);
+		childComplete = true;
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, otherOut);
+		await h.settle();
+		await sleep(80);
+		assert.ok(
+			revParseCwds.includes(REPO),
+			`must rev-parse the fixer worktree; got ${revParseCwds.join(" | ") || "(none)"}`,
+		);
+		assert.equal(published.length, 1, "controller must publish after the fixer exits");
+		assert.equal(
+			published[0],
+			fixerHead,
+			"must publish the fixer worktree HEAD, not the later latch cwd",
+		);
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
 		h.cleanup();
 	}
 });

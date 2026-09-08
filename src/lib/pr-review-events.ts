@@ -46,6 +46,8 @@ export type RunSnapshot = {
 	stopped?: boolean;
 	handoffWritten?: boolean;
 	exitCode?: number;
+	/** Checkout this run mutates. queryRun must rev-parse here, not the live latch cwd. */
+	worktree?: string;
 };
 
 export type PublishRequest = {
