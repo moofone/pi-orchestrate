@@ -421,13 +421,20 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		},
 
 		cancel(pr, reason) {
-			const ob = store.read(pr);
-			if (!ob) return;
-			ob.state = "cancelled";
-			ob.failureReason = reason;
-			store.releaseWriter(pr, ob.writer?.holder ?? ob.owner.id);
-			ob.writer = undefined;
-			save(ob, `cancelled: ${reason}`);
+			const apply = (): void => {
+				const ob = store.read(pr);
+				if (!ob) return;
+				ob.state = "cancelled";
+				ob.failureReason = reason;
+				store.releaseWriter(pr, ob.writer?.holder ?? ob.owner.id);
+				ob.writer = undefined;
+				save(ob, `cancelled: ${reason}`);
+			};
+			if (locked.has(prKeyId(pr))) {
+				void withPrLock(pr, async () => apply());
+				return;
+			}
+			apply();
 		},
 	};
 

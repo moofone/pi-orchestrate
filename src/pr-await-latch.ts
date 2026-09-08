@@ -903,13 +903,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 						return { ok: false, reason: String(error) };
 					}
 				}),
-			reawait: async () => {
-				const held = latch;
-				if (!held) return;
-				const running = driverRunning(held.pr);
-				const statePath = waiterStatePath(repoKey(held.cwd), held.pr, stateDir());
-				seedWaiterState(statePath, { pr: held.pr, cwd: held.cwd });
-				ensureDriver({ pr: held.pr, stateFile: statePath, spawn: spawnDriver, running });
+			reawait: async (pr, worktree) => {
+				const cwd = worktree;
+				if (!cwd) return;
+				const prNum = pr.number;
+				const running = driverRunning(prNum);
+				const statePath = waiterStatePath(repoKey(cwd), prNum, stateDir());
+				seedWaiterState(statePath, { pr: prNum, cwd });
+				ensureDriver({ pr: prNum, stateFile: statePath, spawn: spawnDriver, running });
 			},
 			prState: async (prKey) => {
 				const held = latch;

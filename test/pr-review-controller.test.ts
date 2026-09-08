@@ -1072,6 +1072,55 @@ test("pause during fixing releases the writer so the parent is not blocked after
 	}
 });
 
+test("cancel during launch waits for the lock so reconcile cannot revive the obligation", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-cancel-lock-"));
+	try {
+		const store = createReviewStore(dir);
+		let releaseLaunch: () => void = () => {};
+		const holdLaunch = new Promise<void>((resolve) => {
+			releaseLaunch = resolve;
+		});
+		let markLaunched: () => void = () => {};
+		const launched = new Promise<void>((resolve) => {
+			markLaunched = resolve;
+		});
+		const ctrl = createReviewController({
+			store,
+			lookupOwner: () => ({ status: "session", owner: sessionOwner("session-1") }),
+			launchFixer: async () => {
+				markLaunched();
+				await holdLaunch;
+				return { runId: "run-1", recovered: false };
+			},
+			queryRun: async () => undefined,
+			publish: async () => ({ ok: true }),
+			reawait: async () => {},
+			prState: async () => "open",
+			currentHead: async () => HEAD1,
+			waiterHealth: async () => ({ running: true }),
+			ensureWaiter: async () => {},
+		});
+		ctrl.handoff({ pr: PR, owner: sessionOwner("session-1"), worktree: "/wt", head: HEAD1 });
+		ctrl.observeVerdict({
+			pr: PR,
+			next: "read_comments_and_fix",
+			head: HEAD1,
+			body: finding(HEAD1, "cancel-race"),
+		});
+		const recon = ctrl.reconcile();
+		await launched;
+		ctrl.cancel(PR, "user");
+		releaseLaunch();
+		await recon;
+		await Promise.resolve();
+		assert.equal(store.read(PR)?.state, "cancelled", "reconcile must not overwrite cancel");
+		assert.equal(store.writerFor(PR), undefined, "cancel must drop the writer");
+		assert.equal(store.read(PR)?.failureReason, "user");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("handoff during launch cannot clobber the writer reservation", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pr-review-handoff-lock-"));
 	try {
