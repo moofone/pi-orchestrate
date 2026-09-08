@@ -250,7 +250,12 @@ export function createReviewStore(stateDir: string): ReviewStore {
 			const path = lockPath(pr);
 			const existing = readReservation(pr);
 			if (existing) {
-				if (existing.holder === reservation.holder) {
+				const sameProcess =
+					existing.holder === reservation.holder &&
+					existing.pid != null &&
+					reservation.pid != null &&
+					existing.pid === reservation.pid;
+				if (sameProcess && pidLive(existing.pid)) {
 					atomicWriteJson(path, reservation);
 					return true;
 				}
@@ -269,7 +274,14 @@ export function createReviewStore(stateDir: string): ReviewStore {
 				return true;
 			} catch {
 				const raced = readReservation(pr);
-				return raced?.holder === reservation.holder;
+				if (!raced) return false;
+				return (
+					raced.holder === reservation.holder &&
+					raced.pid != null &&
+					reservation.pid != null &&
+					raced.pid === reservation.pid &&
+					pidLive(raced.pid)
+				);
 			}
 		},
 		releaseWriter(pr, holder) {

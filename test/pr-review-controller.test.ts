@@ -271,6 +271,30 @@ test("two processes claiming the same PR: one writer, the other refused", async 
 	}
 });
 
+test("same holder in a different live process cannot steal the reservation", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pr-review-holder-"));
+	try {
+		const store = createReviewStore(dir);
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:a", pid: process.pid, reservedAt: 1 }),
+			true,
+		);
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:a", pid: process.pid, reservedAt: 2 }),
+			true,
+			"same process may refresh",
+		);
+		assert.equal(
+			store.reserveWriter(PR, { holder: "session:a", pid: process.ppid, reservedAt: 3 }),
+			false,
+			"a second live pid with the same holder must not overwrite",
+		);
+		assert.equal(store.writerFor(PR)?.pid, process.pid);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("new verdict while old fixer runs stays pending; old ack cannot erase it", async () => {
 	const w = world();
 	try {
@@ -800,6 +824,66 @@ test("failed fixer retries the same verdict after backoff", async () => {
 		t += 10_000;
 		await w.ctrl.reconcile();
 		assert.equal(w.launches.length, 2, "same finding must launch again after failFix");
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("dead-reviewer verdict is consumed so hydrate cannot re-arm it", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		const ack = w.ctrl.observeVerdict({
+			pr: PR,
+			next: "investigate_dead_reviewers",
+			head: HEAD1,
+			body: "status=action_required\nnext=investigate_dead_reviewers\nhead=" + HEAD1 + "\n",
+		});
+		assert.equal(ack.kind, "dead_reviewers");
+		const r1 = await w.ctrl.reconcile();
+		assert.equal(r1.rearmed, 1);
+		assert.equal(w.ctrl.status(PR)[0]?.pendingCount, 0);
+		assert.equal(w.ctrl.status(PR)[0]?.state, "waiting_review");
+		const r2 = await w.ctrl.reconcile();
+		assert.equal(r2.rearmed, 0, "receipt must stop hydratePending from replaying the same verdict");
+		assert.equal(w.ctrl.status(PR)[0]?.pendingCount, 0);
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("env verdict without githubStatus still schedules a retry", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		const five = w.ctrl.observeVerdict({
+			pr: PR,
+			next: "fix_command_or_environment",
+			head: HEAD1,
+			body: "status=500\nnext=fix_command_or_environment\n",
+		});
+		assert.equal(five.kind, "env");
+		const st = w.ctrl.status(PR)[0];
+		assert.equal(st?.state, "retry_scheduled");
+		assert.ok(st?.retry, "status=500 must retry even without githubStatus");
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("auth env body without githubStatus still schedules a retry", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/wt", head: HEAD1 });
+		const auth = w.ctrl.observeVerdict({
+			pr: PR,
+			next: "fix_command_or_environment",
+			head: HEAD1,
+			body: "status=error\nnext=fix_command_or_environment\nerror=Bad credentials\n",
+		});
+		assert.equal(auth.kind, "env");
+		assert.equal(w.ctrl.status(PR)[0]?.state, "retry_scheduled");
+		assert.equal(w.ctrl.status(PR)[0]?.retry?.reason, "auth");
 	} finally {
 		w.cleanup();
 	}

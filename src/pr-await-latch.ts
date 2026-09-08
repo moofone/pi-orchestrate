@@ -89,7 +89,7 @@ import {
 	type FeaturePrOwner,
 	type LatchState,
 } from "./lib/pr-await-core.ts";
-import { parsePrKey } from "./lib/pr-review-identity.ts";
+import { classifyGithubStatus, parsePrKey } from "./lib/pr-review-identity.ts";
 import { createReviewStore } from "./lib/pr-review-store.ts";
 import { createReviewController, type ReviewController } from "./lib/pr-review-controller.ts";
 import {
@@ -1059,10 +1059,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			next: hit.lastNext,
 			body: hit.verdict,
 			round: hit.round,
-			githubStatus: /HTTP\s*5\d\d/i.test(hit.verdict ?? "") ? "http_500" : undefined,
+			githubStatus: classifyGithubStatus(hit.verdict ?? ""),
 		});
 		if (!ack.accepted) return;
 		const report = await ctrl.reconcile({ ownerId: owner.id });
+		if (ack.kind === "env") {
+			lastRefusedFingerprint = fp;
+			return;
+		}
 		if (report.recovery > 0) {
 			lastRefusedFingerprint = fp;
 			notify(

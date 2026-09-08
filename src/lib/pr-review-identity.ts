@@ -204,6 +204,22 @@ export function isGithubServerError(body: string): boolean {
 	return false;
 }
 
+export function isGithubAuthError(body: string): boolean {
+	const text = String(body ?? "");
+	if (/\bHTTP\s*40[13]\b/i.test(text)) return true;
+	if (/\bstatus[=:]?\s*40[13]\b/i.test(text)) return true;
+	if (/\b(bad credentials|unauthorized|authentication failed|auth(?:entication)? error|login required)\b/i.test(text)) return true;
+	return false;
+}
+
+export function classifyGithubStatus(
+	body: string,
+): "http_500" | "auth" | undefined {
+	if (isGithubServerError(body)) return "http_500";
+	if (isGithubAuthError(body)) return "auth";
+	return undefined;
+}
+
 export function verdictIdentity(input: {
 	pr: PrKey;
 	head?: string;

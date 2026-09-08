@@ -59,6 +59,12 @@ test("GitHub 500 is an env verdict, not a code fix", () => {
 	assert.equal(classifyVerdictNext("read_comments_and_fix"), "fix");
 });
 
+test("status=500 and auth bodies classify as environment outcomes", () => {
+	assert.equal(isGithubServerError("status=500"), true);
+	assert.equal(classifyVerdictNext("fix_command_or_environment", "status=500"), "env");
+	assert.equal(classifyVerdictNext("fix_command_or_environment", "error=Bad credentials"), "env");
+});
+
 test("parsePrKey rejects owner/repo that would escape the store directory", () => {
 	assert.equal(parsePrKey({ pr: 1, owner: "../etc", repo: "passwd" }), undefined);
 	assert.equal(parsePrKey({ pr: 1, owner: "moofone", repo: "ice/../../tmp" }), undefined);

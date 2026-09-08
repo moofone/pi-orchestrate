@@ -2184,6 +2184,37 @@ test("a Feature with no worktree recorded is reported, not handed to the parent"
 	}
 });
 
+test("env ACTIONABLE is retried, not marked handled", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeFileSync(
+			waiterState(h.dir),
+			JSON.stringify({
+				pr: "2142",
+				lastNext: "fix_command_or_environment",
+				verdict: ["status=500", "next=fix_command_or_environment", "error=GitHub unavailable"].join("\n"),
+				verdictDelivered: false,
+			}),
+		);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "env is not a code fixer");
+		const key = parsePrKey({ pr: "2142", slug: originSlug(REPO) ?? "moofone/icemining" })!;
+		assert.equal(createReviewStore(h.dir).read(key)?.state, "retry_scheduled");
+		const first = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(first.verdictDelivered, false, "env must stay undelivered so it can retry");
+		await h.settle();
+		await sleep(80);
+		const again = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(again.verdictDelivered, false);
+		assert.equal(h.sessionFixes.length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("refused ownership handoff retains the waiter verdict", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	try {

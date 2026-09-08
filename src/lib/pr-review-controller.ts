@@ -10,6 +10,7 @@
  */
 import {
 	classifyVerdictNext,
+	isGithubAuthError,
 	isGithubServerError,
 	launchIdempotencyKey,
 	parseVerdictHead,
@@ -282,21 +283,29 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				return { accepted: false, identity, kind, reason: ob.state };
 			}
 			if (kind === "env") {
-				ob.lastProgress = { at: now(), note: github500 ? "github 500" : `env: ${obs.next}` };
-				if (obs.githubStatus === "auth") {
+				const auth = obs.githubStatus === "auth" || isGithubAuthError(body);
+				ob.lastProgress = { at: now(), note: github500 ? "github 500" : auth ? "auth" : `env: ${obs.next}` };
+				if (ob.state === "retry_scheduled" && (ob.retry?.deadline ?? 0) > now()) {
+					save(ob);
+					return { accepted: true, identity, kind, reason: "env retry already scheduled" };
+				}
+				if (auth) {
 					const count = (ob.retry?.count ?? 0) + 1;
 					if (count >= AUTH_FAIL_CAP) {
 						ob.state = "recovery_required";
 						ob.failureReason = "repeated auth/config failure";
 					} else {
 						ob.retry = { deadline: now() + BACKOFF_MS * 2 ** count, count, reason: "auth" };
+						ob.state = "retry_scheduled";
 					}
-				} else if (github500) {
+				} else {
+					const count = (ob.retry?.count ?? 0) + 1;
 					ob.retry = {
-						deadline: now() + BACKOFF_MS,
-						count: (ob.retry?.count ?? 0) + 1,
-						reason: "github 500",
+						deadline: now() + BACKOFF_MS * 2 ** Math.min(count - 1, 8),
+						count,
+						reason: github500 ? "github 500" : "env",
 					};
+					ob.state = "retry_scheduled";
 				}
 				save(ob);
 				return { accepted: true, identity, kind, reason: "not a code-fixer verdict" };
@@ -525,7 +534,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			const dead = ob.pendingVerdicts.find((v) => v.kind === "dead_reviewers");
 			if (dead) {
 				await deps.ensureWaiter(ob.pr, ob.worktree);
-				ob.pendingVerdicts = ob.pendingVerdicts.filter((v) => v.identity !== dead.identity);
+				consumeRecord(ob, dead, "dead reviewers");
 				ob.state = "waiting_review";
 				save(ob, "re-armed waiter for dead reviewers");
 				report.rearmed += 1;
