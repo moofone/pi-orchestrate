@@ -3,13 +3,18 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	classifyForRole,
 	classifyGitWorkflowCommand,
 	classifyViewRepeat,
 	extractPrNumber,
+	isWorktreeMutation,
 	isWriterRole,
+	mutationTargetDirs,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
 } from "../src/lib/git-workflow-guard.ts";
@@ -176,5 +181,107 @@ test("P2 F7: the writer role is read from the env pi-subagents already sets", ()
     isWriterRole({ ORCHESTRATE_ROLE: "writer" }),
     true,
     "an explicit spawn env is honoured too",
+  );
+});
+
+test("parent mutation is blocked while a fixer holds the worktree", () => {
+  assert.equal(classifyForRole("git push", { writer: false, writerReserved: true }).block, true);
+  assert.equal(classifyForRole("git commit -m fix", { writer: false, writerReserved: true }).block, true);
+  assert.equal(classifyForRole("git status", { writer: false, writerReserved: true }).block, false);
+  assert.equal(classifyForRole("git push", { writer: false, writerReserved: false }).block, false);
+});
+
+test("mutationTargetDirs sees cd and git -C, not only the event cwd", () => {
+  assert.deepEqual(mutationTargetDirs("cd /wt/feat && git commit -m x", "/elsewhere"), [
+    "/wt/feat",
+    "/elsewhere",
+  ]);
+  assert.deepEqual(mutationTargetDirs("git -C /wt/feat commit -m x", "/elsewhere"), [
+    "/wt/feat",
+    "/elsewhere",
+  ]);
+  assert.deepEqual(mutationTargetDirs("cd /wt/feat/src && git commit -m x", "/elsewhere"), [
+    "/wt/feat/src",
+    "/elsewhere",
+  ]);
+});
+
+test("mutationTargetDirs resolves relative cd and git -C against the event cwd", () => {
+  const tmpRoot = realpathSync("/tmp");
+  assert.ok(
+    mutationTargetDirs("git -C ../feature commit -m x", join(tmpRoot, "elsewhere")).includes(
+      join(tmpRoot, "feature"),
+    ),
+  );
+  assert.ok(
+    mutationTargetDirs("cd ../feature && git commit -m x", join(tmpRoot, "elsewhere")).includes(
+      join(tmpRoot, "feature"),
+    ),
+  );
+  assert.ok(
+    mutationTargetDirs("git -C './src' commit -m x", "/wt/feat").includes("/wt/feat/src"),
+  );
+});
+
+test("isWorktreeMutation covers rm/mv/clean/switch, not only commit/push", () => {
+  assert.equal(isWorktreeMutation("git rm src/a.ts"), true);
+  assert.equal(isWorktreeMutation("git mv a.ts b.ts"), true);
+  assert.equal(isWorktreeMutation("git clean -fd"), true);
+  assert.equal(isWorktreeMutation("git switch feat/x"), true);
+  assert.equal(isWorktreeMutation("git status"), false);
+  assert.equal(isWorktreeMutation("git log -1"), false);
+});
+
+test("isWorktreeMutation sees verbs after git -C and --work-tree", () => {
+  assert.equal(isWorktreeMutation("git -C /wt/feat add ."), true);
+  assert.equal(
+    isWorktreeMutation("git --git-dir=/wt/feat/.git --work-tree=/wt/feat commit -m x"),
+    true,
+  );
+  assert.equal(isWorktreeMutation("git -C /wt/feat status"), false);
+});
+
+test("isWorktreeMutation sees a mutating git after a harmless one in the same shell", () => {
+  assert.equal(isWorktreeMutation("git status && git push"), true);
+  assert.equal(isWorktreeMutation("git status; git push origin HEAD"), true);
+  assert.equal(isWorktreeMutation("git log -1 || git commit -m x"), true);
+  assert.equal(isWorktreeMutation("git status && git log -1"), false);
+  assert.equal(
+    classifyForRole("git status && git push", { writer: false, writerReserved: true }).block,
+    true,
+    "a reserved worktree must still block a later push in the compound command",
+  );
+});
+
+test("mutationTargetDirs realpaths a symlink into the reserved worktree", () => {
+	const root = mkdtempSync(join(tmpdir(), "guard-link-"));
+	try {
+		const reserved = join(root, "feat");
+		mkdirSync(reserved);
+		const link = join(root, "link");
+		symlinkSync(reserved, link);
+		const dirs = mutationTargetDirs(`git -C ${link} commit -m x`, "/elsewhere");
+		assert.ok(
+			dirs.includes(realpathSync(reserved)),
+			`symlink target must canonicalize; got ${dirs.join(" | ")}`,
+		);
+		assert.equal(dirs.includes(link), false, "lexical symlink path must not be the reservation key");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("mutationTargetDirs includes --work-tree and --git-dir", () => {
+  assert.ok(
+    mutationTargetDirs(
+      "git --work-tree=/wt/feat commit -m x",
+      "/elsewhere",
+    ).includes("/wt/feat"),
+  );
+  assert.ok(
+    mutationTargetDirs(
+      "git --git-dir=/wt/feat/.git add .",
+      "/elsewhere",
+    ).some((d) => d === "/wt/feat" || d.startsWith("/wt/feat/")),
   );
 });

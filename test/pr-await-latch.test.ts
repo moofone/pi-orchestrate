@@ -9,7 +9,7 @@
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -60,6 +60,8 @@ const {
 	parseField,
 	trailingCd,
 } = await import("../src/pr-await-latch.ts");
+const { parsePrKey } = await import("../src/lib/pr-review-identity.ts");
+const { createReviewStore, emptyObligation } = await import("../src/lib/pr-review-store.ts");
 const {
 	actionableFingerprint,
 	armObservedLatch,
@@ -115,6 +117,9 @@ function harness(
 		watchStateDir?: boolean;
 		featureOwnedPr?: any;
 		onFeatureActionable?: any;
+		onSessionFixer?: any;
+		queryRun?: any;
+		publish?: any;
 		/** Present-and-undefined selects the production pid probe. */
 		driverRunning?: any;
 	} = {},
@@ -126,6 +131,7 @@ function harness(
 	const wakeModes: Array<string | undefined> = [];
 	const spawns: string[][] = [];
 	const dispatches: FeatureDispatch[] = [];
+	const sessionFixes: any[] = [];
 	const running = new Set<string>();
 	const sessionId = `TEST-${process.pid}-${++sessionSeq}`;
 	const dir = mkdtempSync(join(tmpdir(), "ghl-await-h-"));
@@ -175,6 +181,14 @@ function harness(
 			((_ctx: unknown, owner: any, verdict: FeatureDispatch["verdict"]) => {
 				dispatches.push({ owner, verdict });
 			}),
+		onSessionFixer:
+			extraHooks.onSessionFixer ??
+			((intent: unknown) => {
+				sessionFixes.push(intent);
+				return { runId: `session-${sessionFixes.length}`, recovered: false };
+			}),
+		queryRun: extraHooks.queryRun,
+		publish: extraHooks.publish,
 	});
 
 	let idle = true;
@@ -220,9 +234,11 @@ function harness(
 		wake: (i = 0) => nth(wakes, i, "wake"),
 		spawn: (i = 0) => nth(spawns, i, "spawn"),
 		dispatch: (i = 0) => nth(dispatches, i, "dispatch"),
+		sessionFix: (i = 0) => nth(sessionFixes, i, "session fixer"),
 		wakeModes,
 		spawns,
 		dispatches,
+		sessionFixes,
 		notifies,
 		widgets,
 		titles,
@@ -1661,6 +1677,23 @@ const ACTIONABLE_VERDICT = [
 	"comment bot=grok path=a.ts line=1 body=fix",
 ].join("\n");
 
+function piRunDir(runId: string): string {
+	const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+	return join(tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs", runId);
+}
+
+function writePiRunComplete(runId: string): void {
+	const dir = piRunDir(runId);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "status.json"), JSON.stringify({ state: "complete", endedAt: Date.now() }));
+}
+
+function writePiRunRunning(runId: string): void {
+	const dir = piRunDir(runId);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "status.json"), JSON.stringify({ state: "running" }));
+}
+
 /** Write a verdict the way the waiter does: into the waiter's own state file. */
 function writeActionable(dir: string, _sessionId: string, extra: Record<string, unknown> = {}) {
 	const path = waiterState(dir);
@@ -1689,25 +1722,311 @@ test("handoff persist does not wipe a waiter ACTIONABLE verdict", async () => {
 	await sleep(40);
 	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
 	assert.equal(state.lastNext, "read_comments_and_fix", "persist must not clobber the waiter verdict");
-	assert.equal(state.verdictDelivered, true, "the delivered wake must mark the verdict spent");
 	h.cleanup();
 });
 
-test("undelivered ACTIONABLE on settle wakes the live parent once", async () => {
+test("undelivered ACTIONABLE on settle launches a fixer, not the parent", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
 	writeActionable(h.dir, h.sessionId);
 	await h.settle();
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, `expected one ACTIONABLE wake, got ${h.wakes.length}`);
-	assert.match(h.wake(0), /next=read_comments_and_fix/);
-	assert.match(h.wake(0), /Fix current-head findings/);
-	assert.match(h.wake(0), /Do not wait for another user message/);
-	assert.match(h.wake(0), /comment bot=grok/);
-	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
-	assert.equal(state.verdictDelivered, true);
+	assert.equal(h.wakes.length, 0, `parent must stay idle; got ${h.wakes.join(" | ")}`);
+	assert.equal(h.sessionFixes.length, 1, "controller must launch one session fixer");
+	assert.equal(h.sessionFix(0).next, "read_comments_and_fix");
 	h.cleanup();
+});
+
+test("already-consumed waiter verdict is marked delivered on recovery", async () => {
+	const h1 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h1.start();
+		await h1.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h1.dir, h1.sessionId);
+		await h1.settle();
+		await sleep(80);
+		assert.equal(h1.sessionFixes.length, 1);
+		const h2 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+		try {
+			await h2.start();
+			await h2.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+			cpSync(join(h1.dir, "review"), join(h2.dir, "review"), { recursive: true });
+			writeActionable(h2.dir, h2.sessionId);
+			await h2.settle();
+			await sleep(80);
+			assert.equal(h2.sessionFixes.length, 0, "receipt means the fixer already launched");
+			const state = JSON.parse(readFileSync(waiterState(h2.dir), "utf8"));
+			assert.equal(state.verdictDelivered, true, "duplicate consumption must spend the waiter verdict");
+		} finally {
+			h2.cleanup();
+		}
+	} finally {
+		h1.cleanup();
+	}
+});
+
+test("session fixer exit is observed and published without a parent turn", async () => {
+	const published: string[] = [];
+	let exited = false;
+	const newHead = "2033c56dcccccccccccccccccccccccccccccccc";
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		queryRun: async () =>
+			exited
+				? { runId: "session-1", status: "exited", ok: true, head: newHead }
+				: undefined,
+		publish: async (req: { localHead: string }) => {
+			published.push(req.localHead);
+			return { ok: true, remoteHead: req.localHead };
+		},
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 1);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(published.length, 0, "must not publish while the child is running");
+		exited = true;
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "parent stays idle after the fixer exits");
+		assert.equal(published.length, 1, "controller must publish after the fixer exits");
+		assert.equal(published[0], newHead);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("queryRun rev-parses the fixer worktree, not a later latch cwd", async () => {
+	const originalHead = "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016";
+	const fixerHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const otherHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	const runId = `session-query-wt-${process.pid}`;
+	const published: string[] = [];
+	const revParseCwds: string[] = [];
+	let childComplete = false;
+	const otherOut = [
+		"status=reviewer_active",
+		"next=poll_again",
+		"pr=2150",
+		`head=${otherHead}`,
+		"",
+	].join("\n");
+	const h = harness(
+		(cmd, args, opts) => {
+			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "rev-parse") {
+				revParseCwds.push(String(opts?.cwd ?? ""));
+				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
+				if (opts?.cwd === PI_SUB) return ok(otherHead);
+				return ok("");
+			}
+			return ok(REAL_OUTPUT);
+		},
+		REPO,
+		{
+			onSessionFixer: (intent: unknown) => {
+				assert.equal((intent as { worktree: string }).worktree, REPO);
+				return { runId, recovered: false };
+			},
+			publish: async (req: { localHead: string }) => {
+				published.push(req.localHead);
+				return { ok: true, remoteHead: req.localHead };
+			},
+		},
+	);
+	const snapDir = piRunDir(runId);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(published.length, 0, "must not publish while the child is running");
+		writePiRunComplete(runId);
+		childComplete = true;
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, otherOut);
+		await h.settle();
+		await sleep(80);
+		assert.ok(
+			revParseCwds.includes(REPO),
+			`must rev-parse the fixer worktree; got ${revParseCwds.join(" | ") || "(none)"}`,
+		);
+		assert.equal(published.length, 1, "controller must publish after the fixer exits");
+		assert.equal(
+			published[0],
+			fixerHead,
+			"must publish the fixer worktree HEAD, not the later latch cwd",
+		);
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		h.cleanup();
+	}
+});
+
+test("reawait after publish targets the obligation PR, not a later latch", async () => {
+	const originalHead = "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016";
+	const fixerHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const otherHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	const runId = `session-reawait-pr-${process.pid}`;
+	const published: string[] = [];
+	let childComplete = false;
+	const otherOut = [
+		"status=reviewer_active",
+		"next=poll_again",
+		"pr=2150",
+		`head=${otherHead}`,
+		"",
+	].join("\n");
+	const h = harness(
+		(cmd, args, opts) => {
+			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "rev-parse") {
+				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
+				if (opts?.cwd === PI_SUB) return ok(otherHead);
+				return ok("");
+			}
+			return ok(REAL_OUTPUT);
+		},
+		REPO,
+		{
+			driverRunning: () => false,
+			onSessionFixer: () => ({ runId, recovered: false }),
+			publish: async (req: { localHead: string }) => {
+				published.push(req.localHead);
+				return { ok: true, remoteHead: req.localHead };
+			},
+		},
+	);
+	const snapDir = piRunDir(runId);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		writePiRunComplete(runId);
+		childComplete = true;
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, otherOut);
+		const before = h.spawns.length;
+		await h.settle();
+		await sleep(80);
+		assert.equal(published.length, 1, "controller must publish after the fixer exits");
+		assert.ok(h.spawns.length > before, "reawait must spawn or re-seed a waiter");
+		const last = h.spawn(h.spawns.length - 1);
+		const stateFile = last[last.indexOf("--state") + 1];
+		assert.ok(stateFile, "reawait spawn must pass --state");
+		assert.equal(
+			stateFile,
+			waiterStatePath("icemining", "2142", h.dir),
+			"reawait must use the obligation PR/worktree, not the live latch",
+		);
+		assert.notEqual(
+			stateFile,
+			waiterStatePath("pi-subagents", "2150", h.dir),
+			"must not retarget the waiter onto the later latch",
+		);
+		const seeded = JSON.parse(readFileSync(stateFile, "utf8")) as { pr?: string };
+		assert.equal(seeded.pr, "2142", "reawait must target the published obligation, not the live latch");
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		h.cleanup();
+	}
+});
+
+test("queryRun recovers a live fixer after restart without spawning another", async () => {
+	const runId = `session-live-restart-${process.pid}`;
+	let launched = 0;
+	const h1 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		onSessionFixer: () => {
+			launched += 1;
+			return { runId, recovered: false };
+		},
+	});
+	const snapDir = piRunDir(runId);
+	let h2: ReturnType<typeof harness> | undefined;
+	try {
+		await h1.start();
+		await h1.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h1.dir, h1.sessionId);
+		await h1.settle();
+		await sleep(80);
+		assert.equal(launched, 1);
+		writePiRunRunning(runId);
+		h2 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO);
+		await h2.start();
+		await h2.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		cpSync(join(h1.dir, "review"), join(h2.dir, "review"), { recursive: true });
+		await h2.settle();
+		await sleep(80);
+		assert.equal(h2.sessionFixes.length, 0, "live disk snapshot must recover, not spawn a second fixer");
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		h2?.cleanup();
+		h1.cleanup();
+	}
+});
+
+test("ensureWaiter targets the obligation PR, not a later latch", async () => {
+	const originalHead = "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016";
+	const fixerHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const otherHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+	const runId = `session-ensure-pr-${process.pid}`;
+	let childComplete = false;
+	const otherOut = [
+		"status=reviewer_active",
+		"next=poll_again",
+		"pr=2150",
+		`head=${otherHead}`,
+		"",
+	].join("\n");
+	const h = harness(
+		(cmd, args, opts) => {
+			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "rev-parse") {
+				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
+				if (opts?.cwd === PI_SUB) return ok(otherHead);
+				return ok("");
+			}
+			return ok(REAL_OUTPUT);
+		},
+		REPO,
+		{
+			driverRunning: () => false,
+			onSessionFixer: () => ({ runId, recovered: false }),
+			publish: async (req: { localHead: string }) => ({ ok: true, remoteHead: req.localHead }),
+		},
+	);
+	const snapDir = piRunDir(runId);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		writePiRunComplete(runId);
+		childComplete = true;
+		await h.bash(`cd ${PI_SUB} && git pr-await 2150`, otherOut);
+		await h.settle();
+		await sleep(80);
+		const afterPublish = h.spawns.length;
+		await h.settle();
+		await sleep(80);
+		assert.ok(h.spawns.length > afterPublish, "ensureWaiter must spawn after waiting_review with no waiter");
+		const last = h.spawn(h.spawns.length - 1);
+		const stateFile = last[last.indexOf("--state") + 1];
+		assert.equal(
+			stateFile,
+			waiterStatePath("icemining", "2142", h.dir),
+			"ensureWaiter must use the obligation PR/worktree, not the live latch",
+		);
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		h.cleanup();
+	}
 });
 
 test("poll_again and yield do not wake", async () => {
@@ -1731,17 +2050,18 @@ test("already-delivered ACTIONABLE does not wake", async () => {
 	h.cleanup();
 });
 
-test("same ACTIONABLE verdict does not wake twice", async () => {
+test("same ACTIONABLE verdict does not launch twice", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchMs: 20 });
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
 	writeActionable(h.dir, h.sessionId);
 	await h.settle();
 	await sleep(80);
-	assert.equal(h.wakes.length, 1);
+	assert.equal(h.sessionFixes.length, 1);
+	assert.equal(h.wakes.length, 0);
 	writeActionable(h.dir, h.sessionId, { verdictDelivered: false });
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, "same fingerprint must not re-wake even if delivered was reset");
+	assert.equal(h.sessionFixes.length, 1, "same identity must not launch a second fixer");
 	h.cleanup();
 });
 
@@ -1771,7 +2091,7 @@ test("actionableFingerprint distinguishes later rounds of the same next=", () =>
 	assert.notEqual(first, laterBody, "new findings must not look like the first");
 });
 
-test("same-session reload wakes on undelivered ACTIONABLE", async () => {
+test("same-session reload reconciles undelivered ACTIONABLE without a parent turn", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
@@ -1781,12 +2101,12 @@ test("same-session reload wakes on undelivered ACTIONABLE", async () => {
 	writeActionable(h.dir, h.sessionId);
 	await h.start();
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, "/rreload must deliver the waiting fix verdict");
-	assert.match(h.wake(0), /next=read_comments_and_fix/);
+	assert.equal(h.wakes.length, 0, "/rreload must not make the parent the fixer");
+	assert.equal(h.sessionFixes.length, 1, "/rreload must still launch the fixer");
 	h.cleanup();
 });
 
-test("watch delivers ACTIONABLE written after handoff", async () => {
+test("watch launches a fixer for ACTIONABLE written after handoff", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchMs: 20 });
 	await h.start();
 	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
@@ -1795,8 +2115,8 @@ test("watch delivers ACTIONABLE written after handoff", async () => {
 	assert.equal(h.wakes.length, 0, "must not wake while the waiter is still polling");
 	writeActionable(h.dir, h.sessionId);
 	await sleep(80);
-	assert.equal(h.wakes.length, 1, "watch must inject the waiter verdict");
-	assert.match(h.wake(0), /next=read_comments_and_fix/);
+	assert.equal(h.wakes.length, 0, "watch must not inject a parent fix turn");
+	assert.equal(h.sessionFixes.length, 1, "watch must launch a fixer");
 	h.cleanup();
 });
 
@@ -2138,8 +2458,133 @@ test("a Feature with no worktree recorded is reported, not handed to the parent"
 	}
 });
 
-test("a Feature in another repo, or on another PR, does not swallow the solo wake", async () => {
-	// Ownership is `pr:` AND `repo:`. Anything looser would mute the wake a plain
+test("env ACTIONABLE is retried, not marked handled", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeFileSync(
+			waiterState(h.dir),
+			JSON.stringify({
+				pr: "2142",
+				lastNext: "fix_command_or_environment",
+				verdict: ["status=500", "next=fix_command_or_environment", "error=GitHub unavailable"].join("\n"),
+				verdictDelivered: false,
+			}),
+		);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "env is not a code fixer");
+		const key = parsePrKey({ pr: "2142", slug: originSlug(REPO) ?? "moofone/icemining" })!;
+		assert.equal(createReviewStore(h.dir).read(key)?.state, "retry_scheduled");
+		const first = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(first.verdictDelivered, false, "env must stay undelivered so it can retry");
+		await h.settle();
+		await sleep(80);
+		const again = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(again.verdictDelivered, false);
+		assert.equal(h.sessionFixes.length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("refused ownership handoff retains the waiter verdict", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		const key = parsePrKey({ pr: "2142", slug: originSlug(REPO) ?? "moofone/icemining" })!;
+		const store = createReviewStore(h.dir);
+		store.write(
+			emptyObligation({
+				pr: key,
+				owner: { kind: "feature", id: "/orch/icemining/feat-other", generation: "fg-other" },
+				worktree: "/wt/other",
+				head: "47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016",
+			}),
+		);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "must not launch against someone else's obligation");
+		assert.equal(h.wakes.length, 0, "parent must stay idle");
+		assert.equal(
+			store.read(key)?.pendingVerdicts.length ?? 0,
+			0,
+			"must not queue a verdict onto an obligation this session does not own",
+		);
+		assert.ok(
+			h.notifies.some((n) => /ownership refused|owned by/i.test(n)),
+			`refusal must be visible; got ${h.notifies.join(" | ")}`,
+		);
+		const first = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(first.verdictDelivered, false, "refused handoff must not spend the verdict");
+		await h.settle();
+		await sleep(80);
+		const again = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(again.verdictDelivered, false, "retry must still see the undelivered verdict");
+		assert.equal(h.sessionFixes.length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("dead-reviewer ACTIONABLE is marked delivered after re-arm", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeFileSync(
+			waiterState(h.dir),
+			JSON.stringify({
+				pr: "2142",
+				lastNext: "investigate_dead_reviewers",
+				verdict: [
+					"status=action_required",
+					"next=investigate_dead_reviewers",
+					"pr=2142",
+					"head=47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016",
+				].join("\n"),
+				verdictDelivered: false,
+			}),
+		);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "dead reviewers re-arm the waiter, they do not launch a fixer");
+		const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
+		assert.equal(state.verdictDelivered, true, "consumed dead-reviewer verdict must not replay");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("featureOwnedPr throw does not launch a session fixer", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		featureOwnedPr: () => {
+			throw new Error("jiti isolate: no handler");
+		},
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "must not solo-fallback when Feature lookup throws");
+		assert.equal(h.dispatches.length, 0);
+		assert.equal(h.wakes.length, 0, "parent must stay idle");
+		assert.ok(
+			h.notifies.some((n) => /lookup failed|recovery-required/i.test(n)),
+			`stall must be visible; got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a Feature in another repo, or on another PR, does not swallow the session fixer", async () => {
+	// Ownership is `pr:` AND `repo:`. Anything looser would mute the fixer a plain
 	// session depends on, using a Feature that has nothing to do with this PR.
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
 	writeFeatureStatus(h.dir, { repo: "icemining-devops", name: "feat-devops", pr: "2142" });
@@ -2151,9 +2596,8 @@ test("a Feature in another repo, or on another PR, does not swallow the solo wak
 		await h.settle();
 		await sleep(80);
 		assert.equal(h.dispatches.length, 0, "neither Feature owns icemining#2142");
-		assert.equal(h.wakes.length, 1, `the solo wake must survive; got ${h.wakes.join(" | ")}`);
-		assert.match(h.wake(0), /Fix current-head findings/);
-		assert.match(h.wake(0), /Do not wait for another user message/);
+		assert.equal(h.wakes.length, 0, `parent must stay idle; got ${h.wakes.join(" | ")}`);
+		assert.equal(h.sessionFixes.length, 1, "session fixer must still launch");
 	} finally {
 		h.cleanup();
 	}
@@ -2811,7 +3255,7 @@ test("P5 F18: the GitHub backstop is minutes, not the old 15s poll", () => {
 	);
 });
 
-test("P5 F18: a waiter verdict wakes the session with no poll in between", async () => {
+test("P5 F18: a waiter verdict launches a fixer with no poll in between", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
 	try {
 		await h.start();
@@ -2822,12 +3266,12 @@ test("P5 F18: a waiter verdict wakes the session with no poll in between", async
 
 		writeActionable(h.dir, h.sessionId);
 		await sleep(500);
+		assert.equal(h.wakes.length, 0, "fs.watch must not inject a parent fix turn");
 		assert.equal(
-			h.wakes.length,
+			h.sessionFixes.length,
 			1,
-			`fs.watch must deliver the verdict; the 10-minute timer cannot have fired`,
+			`fs.watch must launch a fixer; the 10-minute timer cannot have fired`,
 		);
-		assert.match(h.wake(0), /read_comments_and_fix/);
 	} finally {
 		h.cleanup();
 	}

@@ -11,15 +11,21 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	classifyForRole,
 	classifyViewRepeat,
+	isWorktreeMutation,
+	mutationTargetDirs,
 	isWriterRole,
 	viewRepeatKey,
 } from "./lib/git-workflow-guard.ts";
+import { stateDir } from "./lib/pr-await-core.ts";
+import { createReviewStore } from "./lib/pr-review-store.ts";
 
 export {
 	classifyForRole,
 	classifyGitWorkflowCommand,
 	classifyViewRepeat,
 	extractPrNumber,
+	isWorktreeMutation,
+	mutationTargetDirs,
 	isWriterRole,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
@@ -37,7 +43,21 @@ export default function (pi: ExtensionAPI) {
 		const command = (event.input as { command?: string } | undefined)?.command;
 		if (!command) return;
 
-		const first = classifyForRole(command, { writer });
+		let writerReserved = false;
+		if (!writer && isWorktreeMutation(command)) {
+			try {
+				const fallback =
+					(typeof (event as { cwd?: string }).cwd === "string" && (event as { cwd?: string }).cwd) ||
+					process.cwd();
+				const store = createReviewStore(stateDir());
+				writerReserved = mutationTargetDirs(command, fallback).some((dir) =>
+					Boolean(store.writerForWorktree(dir)),
+				);
+			} catch {
+				writerReserved = false;
+			}
+		}
+		const first = classifyForRole(command, { writer, writerReserved });
 		if (first.block) return first;
 
 		const key = viewRepeatKey(command);

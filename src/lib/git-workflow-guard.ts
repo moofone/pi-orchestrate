@@ -6,6 +6,9 @@
  * allowlist for wait/worktree/land. Ordinary git (status/diff/log/add/commit/
  * push/fetch-alone) is untouched.
  */
+import { resolve } from "node:path";
+import { canonicalizePath } from "./pr-review-store.ts";
+
 export type GuardVerdict = { block: false } | { block: true; reason: string };
 
 const RUST = {
@@ -165,12 +168,106 @@ const WRITER_BLOCKS: { re: RegExp; reason: string }[] = [
  * Writer blocks are checked first: the solo allowlist deliberately waves
  * `git pr-await` through, and for a child that is exactly the wrong answer.
  */
-export function classifyForRole(command: string, opts: { writer: boolean }): GuardVerdict {
+const PARENT_MUTATION_VERB =
+	/^(add|commit|push|checkout|restore|reset|rebase|merge|cherry-pick|rm|mv|clean|switch)$/;
+
+function gitVerb(command: string): string | undefined {
+	const m = stripComments(command).match(/\bgit\b([\s\S]*)/);
+	if (!m) return undefined;
+	const tokens = m[1]!.trim().split(/\s+/).filter(Boolean);
+	for (let i = 0; i < tokens.length; i++) {
+		const t = tokens[i]!;
+		if (t === "--") return tokens[i + 1];
+		if (t.startsWith("--")) {
+			if (!t.includes("=") && i + 1 < tokens.length && !tokens[i + 1]!.startsWith("-")) i += 1;
+			continue;
+		}
+		if (t.startsWith("-") && t.length === 2) {
+			if (i + 1 < tokens.length && !tokens[i + 1]!.startsWith("-")) i += 1;
+			continue;
+		}
+		if (t.startsWith("-")) continue;
+		return t;
+	}
+	return undefined;
+}
+
+export function isWorktreeMutation(command: string): boolean {
+	const text = stripComments(command);
+	const parts = text.split(/\s*(?:&&|\|\||;|\n)\s*/);
+	return parts.some((part) => {
+		const verb = gitVerb(part);
+		return Boolean(verb && PARENT_MUTATION_VERB.test(verb));
+	});
+}
+
+function captureDirArgs(prefix: string, text: string): string[] {
+	const out: string[] = [];
+	const re = new RegExp(`${prefix}\\s+(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
+	for (const m of text.matchAll(re)) {
+		const raw = (m[1] ?? m[2] ?? "").trim();
+		if (raw && raw !== "-" && !raw.startsWith("-")) out.push(raw);
+	}
+	return out;
+}
+
+function captureFlagPaths(flag: string, text: string): string[] {
+	const out: string[] = [];
+	const eq = new RegExp(`${flag}=(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
+	for (const m of text.matchAll(eq)) {
+		const raw = (m[1] ?? m[2] ?? "").trim();
+		if (raw) out.push(raw);
+	}
+	const spaced = new RegExp(`${flag}\\s+(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
+	for (const m of text.matchAll(spaced)) {
+		const raw = (m[1] ?? m[2] ?? "").trim();
+		if (raw && !raw.startsWith("-")) out.push(raw);
+	}
+	return out;
+}
+
+function resolveMutationDir(dir: string, fallbackCwd?: string): string {
+	const trimmed = dir.replace(/\/+$/, "").replace(/\/\.git$/, "");
+	if (!trimmed) return "";
+	const base = fallbackCwd?.replace(/\/+$/, "") || process.cwd();
+	const lexical = resolve(trimmed.startsWith("/") ? trimmed : resolve(base, trimmed)).replace(/\/+$/, "");
+	return canonicalizePath(lexical);
+}
+
+/** Worktrees a bash command would mutate: `cd DIR && git …`, `git -C DIR`, fallback cwd. */
+export function mutationTargetDirs(command: string, fallbackCwd?: string): string[] {
+	const text = stripComments(command);
+	const dirs: string[] = [];
+	const raws = [
+		...captureDirArgs("\\bcd", text),
+		...captureDirArgs("\\bgit\\s+-C", text),
+		...captureFlagPaths("--work-tree", text),
+		...captureFlagPaths("--git-dir", text),
+	];
+	for (const raw of raws) {
+		const resolved = resolveMutationDir(raw, fallbackCwd);
+		if (resolved) dirs.push(resolved);
+	}
+	if (fallbackCwd) dirs.push(canonicalizePath(resolve(fallbackCwd.replace(/\/+$/, "")).replace(/\/+$/, "")));
+	return [...new Set(dirs)];
+}
+
+export function classifyForRole(
+	command: string,
+	opts: { writer: boolean; writerReserved?: boolean },
+): GuardVerdict {
 	if (opts.writer) {
 		const text = stripComments(command);
 		for (const rule of WRITER_BLOCKS) {
 			if (rule.re.test(text)) return { block: true, reason: rule.reason };
 		}
+	}
+	if (opts.writerReserved && isWorktreeMutation(command)) {
+		return {
+			block: true,
+			reason:
+				"a fixer holds this worktree; the parent must not mutate it. The controller publishes after the child settles.",
+		};
 	}
 	return classifyGitWorkflowCommand(command);
 }
