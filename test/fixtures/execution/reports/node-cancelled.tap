@@ -1,0 +1,26 @@
+TAP version 13
+# Subtest: selected test
+ok 1 - selected test
+  ---
+  duration_ms: 0.273417
+  type: 'test'
+  ...
+# Subtest: cancelled test
+not ok 2 - cancelled test
+  ---
+  duration_ms: 21.477875
+  type: 'test'
+  location: '/Users/greg/Dev/git/pi-orchestrate-wt/feat-plan-driven-u3-runtime/test/fixtures/execution/reports/node-cancelled.test.mjs:4:1'
+  failureType: 'testTimeoutFailure'
+  error: 'test timed out after 20ms'
+  code: 'ERR_TEST_FAILURE'
+  ...
+1..2
+# tests 2
+# suites 0
+# pass 1
+# fail 0
+# cancelled 1
+# skipped 0
+# todo 0
+# duration_ms 131.273833

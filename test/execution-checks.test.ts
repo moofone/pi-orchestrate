@@ -84,3 +84,38 @@ test("execution-checks persisted invocation markers prevent replay in a new exec
  assert.equal((await createCheckExecutor(options).execute(spec(), context)).status, "passed");
  assert.equal((await createCheckExecutor(options).execute(spec(), context)).status, "unknown"); assert.equal(calls, 1);
 });
+
+async function nodeGate(raw: string, exitCode = 0) {
+ const executor = createCheckExecutor({ exec: async () => ({ exitCode, stdout: raw, stderr: "" }), now: () => 1 });
+ const check = spec(), invocationId = "node-totals";
+ const evidence = await executor.execute(check, { workspace: await workspace(), invocationId, startedAt: 1 });
+ return { evidence, valid: executor.validateEvidence(check, evidence, { invocationId, notBefore: 1 }).valid };
+}
+test("execution-checks rejects every missing, duplicated or contradictory Node summary through the full gate", async () => {
+ const raw = await fixture("node");
+ const reports = [raw.replace("# pass 1", "# pass 0").replace("# skipped 1", "# skipped 2")];
+ for (const field of ["tests", "suites", "pass", "fail", "cancelled", "skipped", "todo"]) {
+  const line = raw.match(new RegExp(`^# ${field} (\\d+)$`, "m"))!;
+  reports.push(raw.replace(line[0], `# ${field} ${Number(line[1]) + 1}`), raw.replace(line[0] + "\n", ""), raw + line[0] + "\n");
+ }
+ for (const report of reports) {
+  assert.throws(() => decodeCheckReport("node", report), /Node TAP/);
+  const result = await nodeGate(report); assert.equal(result.evidence.status, "unknown"); assert.equal(result.valid, false);
+ }
+});
+test("execution-checks distinguishes Node TODO and SKIP while preserving required execution", async () => {
+ const raw = (await fixture("node")).replace("# SKIP", "# TODO").replace("# skipped 1", "# skipped 0").replace("# todo 0", "# todo 1");
+ for (const report of [raw, raw.replace("ok 2 - unrelated", "not ok 2 - unrelated")]) {
+  assert.deepEqual(decodeCheckReport("node", report), { executedTests: ["selected test"], skippedTests: ["unrelated test"], failed: false });
+  assert.equal((await nodeGate(report)).valid, true);
+ }
+ const contradiction = raw.replace("# skipped 0", "# skipped 1").replace("# todo 1", "# todo 0");
+ assert.throws(() => decodeCheckReport("node", contradiction), /Node TAP/);
+ assert.equal((await nodeGate(contradiction)).valid, false);
+});
+test("execution-checks actual Node cancellation is failed evidence, never selected execution or success", async () => {
+ const raw = await readFile(new URL("./fixtures/execution/reports/node-cancelled.tap", import.meta.url), "utf8");
+ assert.deepEqual(decodeCheckReport("node", raw), { executedTests: ["selected test"], skippedTests: ["cancelled test"], failed: true });
+ const failed = await nodeGate(raw, 1); assert.equal(failed.evidence.status, "failed"); assert.equal(failed.valid, false);
+ const contradiction = await nodeGate(raw); assert.equal(contradiction.evidence.status, "unknown"); assert.equal(contradiction.valid, false);
+});

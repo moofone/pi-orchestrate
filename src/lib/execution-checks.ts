@@ -32,7 +32,9 @@ export function decodeCheckReport(runner: Exclude<CheckSpec["runner"], "command"
   if (!suites || ended !== suites || declared !== executedTests.length + skippedTests.length) throw new Error("Incomplete Cargo test stream");
  } else {
   if (!/^TAP version 13\r?$/m.test(raw) || /^\s*Bail out!/m.test(raw)) throw new Error("Invalid/incomplete Node TAP");
-  let points = 0, rootPoints = 0; const headings = new Map<number, string>();
+  let points = 0, rootPoints = 0;
+  const totals = { tests: 0, suites: 0, pass: 0, fail: 0, cancelled: 0, skipped: 0, todo: 0 };
+  const headings = new Map<number, string>();
   const lines = raw.split(/\r?\n/);
   for (const [index, line] of lines.entries()) {
    const heading = /^(\s*)# Subtest: (.+)$/.exec(line);
@@ -42,14 +44,25 @@ export function decodeCheckReport(runner: Exclude<CheckSpec["runner"], "command"
     const indent = match[1]!.length; if (!indent) rootPoints++;
     const diagnostic: string[] = [];
     for (let next = index + 1; next < lines.length && /^\s/.test(lines[next]!); next++) diagnostic.push(lines[next]!);
-    if (diagnostic.some(text => /^\s*type: ['"]suite['"]$/.test(text))) continue;
+    const isSuite = diagnostic.some(text => new RegExp(`^ {${indent + 2}}type: ['"]suite['"]$`).test(text));
+    if (isSuite) { totals.suites++; if (match[2] === "not ok" && !match[4]) failed = true; continue; }
     points++; const parents = [...headings].filter(([depth]) => depth < indent).sort(([a], [b]) => a - b).map(([, name]) => name);
-    add([...parents, match[3]].join(" > "), match[4] ? "skip" : match[2] === "ok" ? "passed" : "failed");
+    const cancelled = diagnostic.some(text => new RegExp(`^ {${indent + 2}}failureType: ['"](?:cancelledByParent|testTimeoutFailure)['"]$`).test(text));
+    if (cancelled && match[2] !== "not ok") throw new Error("Node TAP cancellation contradicts result");
+    const outcome = match[4] === "SKIP" ? "skipped" : match[4] === "TODO" ? "todo" : cancelled ? "cancelled" : match[2] === "ok" ? "pass" : "fail";
+    totals[outcome]++;
+    // Cancelled tests are not proof of execution; retain the public non-executed list.
+    if (outcome === "cancelled") { skippedTests.push([...parents, match[3]].join(" > ")); failed = true; }
+    else add([...parents, match[3]].join(" > "), outcome === "pass" ? "passed" : outcome === "fail" ? "failed" : outcome);
    }
   }
-  const tests = /^# tests (\d+)\r?$/m.exec(raw), plan = /^1\.\.(\d+)\r?$/m.exec(raw);
-  if (!tests || !plan || Number(tests[1]) !== points || Number(plan[1]) !== rootPoints || !/^# fail \d+\r?$/m.test(raw)) throw new Error("Incomplete or unsupported Node TAP totals");
-  const failures = Number(/^# fail (\d+)/m.exec(raw)![1]); if (failures !== failedCount) throw new Error("Node TAP failure contradiction");
+  totals.tests = points;
+  const plans = [...raw.matchAll(/^1\.\.(\d+)\r?$/gm)];
+  if (plans.length !== 1 || Number(plans[0]![1]) !== rootPoints) throw new Error("Incomplete or contradictory Node TAP plan");
+  for (const [field, count] of Object.entries(totals)) {
+   const summaries = [...raw.matchAll(new RegExp(`^# ${field} (\\d+)\\r?$`, "gm"))];
+   if (summaries.length !== 1 || Number(summaries[0]![1]) !== count) throw new Error(`Incomplete or contradictory Node TAP ${field} total`);
+  }
  }
  if (new Set(executedTests).size !== executedTests.length || new Set(skippedTests).size !== skippedTests.length || executedTests.some(t => skippedTests.includes(t))) throw new Error("Ambiguous duplicate test identity");
  return { executedTests, skippedTests, failed };
