@@ -970,10 +970,10 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	/**
-	 * Plan-driven PR delivery asks the latch for this already-created controller.
-	 * New execution groups resolve a durable, exact mapping from the execution
-	 * store; explicitly legacy manifests retain the Feature adapter. No synthetic
-	 * Feature or guessed PR is created.
+	 * Plan-driven PR delivery asks the latch for this one existing controller.
+	 * The execution bridge durably bootstraps an exact mapping before this
+	 * resolver is retried; explicitly legacy manifests retain the Feature
+	 * adapter. No synthetic Feature or guessed PR is created here.
 	 */
 	const executionEvents = (pi as unknown as { events?: { on: (event: string, handler: (data: any) => void) => () => void; emit: (event: string, data: unknown) => void } }).events;
 	executionEvents?.on(EXECUTION_CONTROLLER_BINDING_EVENT, (request: ExecutionControllerBindingRequest) => {

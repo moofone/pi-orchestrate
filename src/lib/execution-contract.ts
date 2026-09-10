@@ -107,6 +107,15 @@ export type CoordinatorOwner = { pid: number; processStart: string; sessionFile:
 export type ExecutionControllerMapping = {
 	manifestId: Id; manifestRevision: number; groupId: Id; ownerId: Id; generation: string;
 	pr: { repo: string; number: number }; workspace: WorkspaceRef; head: string;
+	/** Present on mappings created by the U7 bootstrap producer; omitted only for pre-U7 compatibility. */
+	manifestDigest?: Digest; sourceDigest?: Digest; authorizationId?: Id; integrationDigest?: Digest; operationId?: Id;
+};
+export type ExecutionControllerBootstrapPhase = "planned" | "creating" | "unknown" | "complete";
+export type ExecutionControllerBootstrapIntent = {
+	id: Id; operationId: Id; manifestId: Id; manifestRevision: number; manifestDigest: Digest; sourceDigest: Digest;
+	authorizationId: Id; groupId: Id; ownerId: Id; generation: string; repo: RepoIdentity; receiptDigest: Digest;
+	workspace: WorkspaceRef; branch: string; head: string; phase: ExecutionControllerBootstrapPhase;
+	createdAt: number; updatedAt: number; pr?: { repo: string; number: number }; reason?: string;
 };
 export type ResourceReservation = { id: Id; attemptId?: Id; integrationId?: Id; workspaceId: Id; workspacePath: string; slots: number; parallelGroupId?: Id };
 export type ParallelLaunchSet = { id: Id; groupId: Id; attemptIds: Id[]; instruction: "reserved" | "met" | "unmet"; reason?: string };
@@ -120,7 +129,7 @@ export type CoordinatorState = {
 	authorizations: ExecutionAuthorization[]; activeRevisions: Record<Id, number>;
 	tasks: TaskRecord[]; attempts: TaskAttempt[]; results: ResultReceipt[];
 	integrations: IntegrationIntent[]; integrationReceipts: IntegrationReceipt[]; deliveries: DeliveryRecord[];
-	reservations: ResourceReservation[]; parallelLaunchSets: ParallelLaunchSet[]; intents: CoordinatorIntent[]; controllerMappings?: ExecutionControllerMapping[];
+	reservations: ResourceReservation[]; parallelLaunchSets: ParallelLaunchSet[]; intents: CoordinatorIntent[]; controllerMappings?: ExecutionControllerMapping[]; controllerBootstrapIntents?: ExecutionControllerBootstrapIntent[];
 };
 
 export type RuntimeCapabilities = {
@@ -338,7 +347,7 @@ export function workspaceExcludedByDelivery(state: { deliveries: readonly ({ gro
 	return state.deliveries.some(delivery => ["handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(delivery.phase) && !!delivery.handoff && (delivery.handoff.workspace.id === workspace.id || delivery.handoff.workspace.path === workspace.path));
 }
 export function emptyCoordinatorState(identity: RepoIdentity): CoordinatorState {
-	return { schemaVersion: EXECUTION_SCHEMA_VERSION, repo: identity, sequence: 0, epoch: 0, capacity: 0, manifests: [], authorizations: [], activeRevisions: {}, tasks: [], attempts: [], results: [], integrations: [], integrationReceipts: [], deliveries: [], reservations: [], parallelLaunchSets: [], intents: [], controllerMappings: [] };
+	return { schemaVersion: EXECUTION_SCHEMA_VERSION, repo: identity, sequence: 0, epoch: 0, capacity: 0, manifests: [], authorizations: [], activeRevisions: {}, tasks: [], attempts: [], results: [], integrations: [], integrationReceipts: [], deliveries: [], reservations: [], parallelLaunchSets: [], intents: [], controllerMappings: [], controllerBootstrapIntents: [] };
 }
 
 export function validateCoordinatorState(value: unknown): asserts value is CoordinatorState {
@@ -446,12 +455,39 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 		if (intent.invocationId !== undefined) text(intent.invocationId);
 		if (intent.consumedAt !== undefined) integer(intent.consumedAt);
 	}
+	const validPrSlug = (value: string): boolean => { const parts = value.split("/"); return parts.length === 3 && parts.every(part => /^[A-Za-z0-9_.-]+$/.test(part)) && !value.includes(".."); };
+	for (const intent of state.controllerBootstrapIntents ?? []) {
+		object(intent); text(intent.id); text(intent.operationId); text(intent.manifestId); integer(intent.manifestRevision, 1); text(intent.manifestDigest); text(intent.sourceDigest); text(intent.authorizationId); text(intent.groupId); text(intent.ownerId); text(intent.generation); repo(intent.repo); text(intent.receiptDigest); validateWorkspace(intent.workspace); text(intent.branch); text(intent.head); integer(intent.createdAt); integer(intent.updatedAt, intent.createdAt);
+		requireThat(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(intent.head) && intent.repo.id === state.repo.id && intent.workspace.repoId === state.repo.id && intent.branch === intent.workspace.branch && intent.workspace.baseCommit === state.manifests.find(m => m.id === intent.manifestId && m.revision === intent.manifestRevision)?.baseCommit, "Controller bootstrap repository/workspace mismatch");
+		requireThat(["planned", "creating", "unknown", "complete"].includes(intent.phase), "Invalid controller bootstrap phase");
+		const manifest = state.manifests.find(m => m.id === intent.manifestId && m.revision === intent.manifestRevision);
+		const group = manifest?.deliveryGroups.find(g => g.id === intent.groupId);
+		const authorization = state.authorizations.find(a => a.id === intent.authorizationId);
+		const receipt = state.integrationReceipts.find(r => r.digest === intent.receiptDigest && r.deliveryGroupId === intent.groupId);
+		const integration = receipt && state.integrations.find(i => i.id === receipt.intentId);
+		requireThat(!!manifest && manifest.preset === "plan-driven" && state.activeRevisions[manifest.id] === manifest.revision && !!group && group.policy === "pr" && group.ownerId === intent.ownerId, "Controller bootstrap manifest/group mismatch");
+		requireThat(!!authorization && authorization.manifestId === manifest!.id && authorization.revision === manifest!.revision && authorization.publication && authorization.manifestDigest === intent.manifestDigest && authorization.sourceDigest === intent.sourceDigest, "Controller bootstrap approval mismatch");
+		requireThat(intent.manifestDigest === digest(manifest) && intent.sourceDigest === manifest!.source.digest && !!receipt && receipt.afterCommit === intent.head && !!integration && digest(integration.workspace) === digest(intent.workspace), "Controller bootstrap receipt mismatch");
+		if (intent.pr) { object(intent.pr); text(intent.pr.repo); integer(intent.pr.number, 1); requireThat(validPrSlug(intent.pr.repo), "Invalid controller bootstrap PR"); }
+		if (intent.reason !== undefined) text(intent.reason);
+		if (intent.phase === "complete") requireThat(!!intent.pr, "Completed controller bootstrap missing PR");
+	}
+	unique((state.controllerBootstrapIntents ?? []).map(i => i.id), "controller bootstrap intent");
+	unique((state.controllerBootstrapIntents ?? []).map(i => i.operationId), "controller bootstrap operation");
 	for (const mapping of state.controllerMappings ?? []) {
-		object(mapping); text(mapping.manifestId); integer(mapping.manifestRevision); text(mapping.groupId); text(mapping.ownerId); text(mapping.generation); object(mapping.pr); text(mapping.pr.repo); integer(mapping.pr.number, 1); object(mapping.workspace); text(mapping.head);
+		object(mapping); text(mapping.manifestId); integer(mapping.manifestRevision, 1); text(mapping.groupId); text(mapping.ownerId); text(mapping.generation); object(mapping.pr); text(mapping.pr.repo); integer(mapping.pr.number, 1); requireThat(validPrSlug(mapping.pr.repo), "Invalid controller mapping PR"); validateWorkspace(mapping.workspace); text(mapping.head);
+		requireThat(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(mapping.head), "Invalid controller mapping head");
 		requireThat(state.repo.id === mapping.workspace.repoId, "Controller mapping repository mismatch");
 		const manifest = state.manifests.find(m => m.id === mapping.manifestId && m.revision === mapping.manifestRevision);
 		const group = manifest?.deliveryGroups.find(g => g.id === mapping.groupId);
 		requireThat(!!manifest && !!group && group.ownerId === mapping.ownerId && mapping.workspace.baseCommit === manifest.baseCommit, "Controller mapping group mismatch");
+		if (mapping.manifestDigest !== undefined || mapping.sourceDigest !== undefined || mapping.authorizationId !== undefined || mapping.integrationDigest !== undefined || mapping.operationId !== undefined) {
+			requireThat(mapping.manifestDigest === digest(manifest) && mapping.sourceDigest === manifest!.source.digest && !!mapping.authorizationId && !!mapping.integrationDigest && !!mapping.operationId, "Incomplete controller mapping provenance");
+			const authorization = state.authorizations.find(a => a.id === mapping.authorizationId);
+			const receipt = state.integrationReceipts.find(r => r.digest === mapping.integrationDigest && r.deliveryGroupId === mapping.groupId);
+			const bootstrap = (state.controllerBootstrapIntents ?? []).find(i => i.operationId === mapping.operationId);
+			requireThat(!!authorization && authorization.manifestId === manifest!.id && authorization.revision === manifest!.revision && authorization.publication && !!receipt && receipt.afterCommit === mapping.head && !!bootstrap && !!bootstrap.pr && digest(bootstrap.pr) === digest(mapping.pr) && bootstrap.phase === "complete", "Controller mapping provenance mismatch");
+		}
 	}
 	unique((state.controllerMappings ?? []).map(m => `${m.manifestId}:${m.manifestRevision}:${m.groupId}`), "controller mapping");
 	for (const d of state.deliveries) {
@@ -492,6 +528,13 @@ export function validateStateChange(previous: CoordinatorState, next: Coordinato
 	for (const old of previous.controllerMappings ?? []) {
 		const current = (next.controllerMappings ?? []).find(mapping => mapping.manifestId === old.manifestId && mapping.manifestRevision === old.manifestRevision && mapping.groupId === old.groupId);
 		requireThat(current && digest(current) === digest(old), "Controller mapping history changed");
+	}
+	for (const old of previous.controllerBootstrapIntents ?? []) {
+		const current = (next.controllerBootstrapIntents ?? []).find(intent => intent.id === old.id);
+		requireThat(current, "Controller bootstrap intent history removed");
+		for (const key of ["id", "operationId", "manifestId", "manifestRevision", "manifestDigest", "sourceDigest", "authorizationId", "groupId", "ownerId", "generation", "repo", "receiptDigest", "workspace", "branch", "head", "createdAt"] as const) requireThat(digest(old[key]) === digest(current[key]), `Controller bootstrap intent changed: ${key}`);
+		if (old.pr) requireThat(current.pr && digest(old.pr) === digest(current.pr), "Controller bootstrap PR changed");
+		if (old.phase === "complete") requireThat(current.phase === "complete", "Completed controller bootstrap reopened");
 	}
 	for (const old of previous.integrations) {
 		const current = next.integrations.find(i => i.id === old.id); requireThat(current, "Integration history removed");

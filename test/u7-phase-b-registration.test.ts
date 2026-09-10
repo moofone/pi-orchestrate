@@ -4,8 +4,11 @@ import { mkdirSync, mkdtempSync, realpathSync, readFileSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { digest, sourceDigest, validateCoordinatorState, type DeliveryGroup, type ExecutionManifest, type IntegrationReceipt, type RepoIdentity, type WorkspaceRef } from "../src/lib/execution-contract.ts";
+import { createExecutionBridge } from "../src/lib/execution-bridge.ts";
 import { requestExecutionController } from "../src/lib/pr-review-events.ts";
 import { createExecutionStore } from "../src/lib/execution-store.ts";
+import { createReviewStore } from "../src/lib/pr-review-store.ts";
+import { FakeAttemptRuntime, FakeCheckExecutor, FakeWorkspaceAdapter } from "./fixtures/execution/fakes.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "u7-registration-")));
 process.env.GHL_LATCH_STATE_DIR = join(root, "latch");
@@ -75,4 +78,95 @@ test("registered latch resolves a new durable execution group without a legacy F
   const report = await binding!.controller.reconcile();
   assert.equal(report.launched, 1);
   assert.equal(h.launchIntents[0]?.owner.kind, "execution");
+});
+
+test("production bridge bootstraps a first PR mapping from an approved plan with no seeded mapping or obligation", async () => {
+  const localRoot = realpathSync(mkdtempSync(join(tmpdir(), "u7-bootstrap-")));
+  process.env.GHL_LATCH_STATE_DIR = join(localRoot, "latch"); mkdirSync(process.env.GHL_LATCH_STATE_DIR, { recursive: true });
+  const commonDir = join(localRoot, "repo.git"); mkdirSync(commonDir, { recursive: true });
+  const repo = { commonDir, id: digest(commonDir) };
+  const stateRoot = join(localRoot, "orchestrator"), ownedRoot = join(localRoot, "owned"); mkdirSync(ownedRoot);
+  const planPath = join(localRoot, "plan.md"); writeFileSync(planPath, "# approved plan\n");
+  const baseCommit = "a".repeat(40), integratedHead = "c".repeat(40);
+  const feature = { id: "feature-bootstrap", title: "Bootstrap", scope: "src" };
+  const sharedFeature = { id: "feature-bootstrap-shared", title: "Shared", scope: "src" };
+  const group: DeliveryGroup = { id: "group-bootstrap", featureIds: [feature.id, sharedFeature.id], requiredTaskIds: [], checks: [], policy: "pr", completion: "merged", ownerId: "execution-bootstrap" };
+  const task = { id: "task-bootstrap", featureId: feature.id, deliveryGroupId: group.id, text: "bootstrap", mode: "read-only" as const, dependencies: [], scope: ["src"], profile: {}, checks: [], provenance: ["text", "mode", "dependencies", "scope", "profile", "deliveryGroupId"].map(field => ({ field, origin: "inferred" as const, reason: "fixture" })) };
+  const makeManifest = (identity: { id: string; revision: number; repo: RepoIdentity; baseCommit: string; source: { path: string; bytes: string; digest: string } }): ExecutionManifest => ({
+    schemaVersion: 1, id: identity.id, revision: identity.revision, source: identity.source, repo: identity.repo, baseCommit: identity.baseCommit,
+    scope: "src", preset: "plan-driven", features: [feature, sharedFeature], deliveryGroups: [group], tasks: [task],
+    constraints: { capacity: 1, parallelGroups: [], provenance: [{ field: "capacity", origin: "inferred" as const, reason: "fixture" }] },
+    provenance: ["scope", "features", "deliveryGroups"].map(field => ({ field, origin: "inferred" as const, reason: "fixture" })),
+  });
+  let deliveryWorkspace: WorkspaceRef | undefined;
+  const workspaces = new FakeWorkspaceAdapter();
+  workspaces.inspect = async candidate => {
+    deliveryWorkspace = deliveryWorkspace ?? candidate;
+    const head = workspaces.compositions.length ? integratedHead : baseCommit;
+    return { kind: "inspected", workspace: candidate, head, clean: true, appliedDigests: [] };
+  };
+  workspaces.compose = async request => {
+    workspaces.compositions.push(structuredClone(request));
+    deliveryWorkspace = request.intent.workspace;
+    return { kind: "prepared", workspace: request.intent.workspace, head: integratedHead };
+  };
+  const h = harness(repo, stateRoot);
+  const initialState = createExecutionStore({ stateRoot: join(stateRoot, "plan-driven-v1"), repo }).read();
+  assert.equal(initialState.controllerMappings?.length ?? 0, 0, "regression starts with no controller mapping");
+  assert.equal(createReviewStore(process.env.GHL_LATCH_STATE_DIR!).list().length, 0, "regression starts with no controller obligation");
+  const binding = await requestExecutionController(h.events, { repo, stateRoot, sessionFile: h.sessionFile });
+  assert.ok(binding, "actual registered latch must provide the controller binding");
+  let remoteCalls = 0, creates = 0;
+  const bootstrapPr = async (request: any) => {
+    assert.equal(request.group.id, group.id);
+    assert.equal(request.branch, request.workspace.branch);
+    assert.equal(request.head, integratedHead);
+    remoteCalls++;
+    if (remoteCalls === 1) return { kind: "not-found" as const };
+    if (remoteCalls === 2) { creates++; return { kind: "unknown" as const, reason: "create acknowledgement lost" }; }
+    return { kind: "found" as const, pr: { repo: "github.com/acme/bootstrap", number: 17 }, branch: request.workspace.branch, head: integratedHead };
+  };
+  const runtime = new FakeAttemptRuntime();
+  const bridge = createExecutionBridge({
+    repo, referencePath: localRoot, stateRoot, sessionFile: h.sessionFile, processStart: "u7-bootstrap", capacity: 2, ownedRoot,
+    runtime, workspaces, checks: new FakeCheckExecutor(), controller: binding, resolvePr: binding!.resolvePr,
+    bootstrapPr, git: async (_cwd: string, argv: string[]) => ({ exitCode: 0, stdout: argv[0] === "rev-parse" ? `${baseCommit}\n` : "", stderr: "" }),
+    interpretationTransport: async (request: any) => ({ manifest: makeManifest({ id: request.identity.id, revision: request.identity.revision, repo: request.identity.repo, baseCommit: request.identity.baseCommit, source: request.source }), unresolvedDecisions: [] }),
+  } as any);
+  // This fixture exercises the real delivery path with a non-required task;
+  // suppress only unrelated task admission so no worker completion is faked.
+  (bridge.scheduler as any).admission = async () => {};
+  const preview = await bridge.run(planPath);
+  assert.equal(preview.kind, "approval-required", JSON.stringify(preview));
+  if (preview.kind !== "approval-required") return;
+  const started = await bridge.run(planPath, { token: preview.preview.token, capacity: 2, publication: true, approvedBy: h.sessionFile, approvedAt: 2 });
+  assert.equal(started.kind, "started", JSON.stringify(started));
+  for (let i = 0; i < 120 && bridge.store.read().deliveries[0]?.phase !== "controller-owned"; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  const state = bridge.store.read();
+  assert.equal(state.deliveries[0]?.phase, "controller-owned", JSON.stringify(bridge.status()));
+  assert.equal(state.controllerMappings?.length, 1, "production code must create the initial mapping");
+  assert.equal(state.controllerMappings?.[0]?.groupId, group.id);
+  assert.equal(state.controllerMappings?.[0]?.pr.number, 17);
+  assert.equal(state.controllerMappings?.[0]?.head, integratedHead);
+  assert.equal(creates, 1);
+  assert.equal(remoteCalls, 3, "lost create acknowledgement must reconcile the same deterministic PR before handoff");
+  assert.equal(state.controllerBootstrapIntents?.length, 1);
+  assert.equal(state.controllerBootstrapIntents?.[0]?.phase, "complete");
+  const verdict = binding!.controller.observeVerdict({ pr: { host: "github.com", owner: "acme", repo: "bootstrap", number: "17" }, next: "read_comments_and_fix", body: `next=read_comments_and_fix\\nhead=${integratedHead}`, head: integratedHead });
+  assert.equal(verdict.accepted, true);
+  const launched = await binding!.controller.reconcile();
+  assert.equal(launched.launched, 1);
+  assert.equal(h.launchIntents[0]?.owner.kind, "execution");
+  const mapping = structuredClone(state.controllerMappings![0]);
+  await bridge.shutdown();
+  const restarted = createExecutionBridge({
+    repo, referencePath: localRoot, stateRoot, sessionFile: h.sessionFile, processStart: "u7-bootstrap-restart", capacity: 2, ownedRoot,
+    runtime: new FakeAttemptRuntime(), workspaces, checks: new FakeCheckExecutor(), controller: binding, resolvePr: binding!.resolvePr,
+    bootstrapPr, git: async (_cwd: string, argv: string[]) => ({ exitCode: 0, stdout: argv[0] === "rev-parse" ? `${baseCommit}\n` : "", stderr: "" }),
+    interpretationTransport: async () => { throw new Error("restart must not reinterpret"); },
+  } as any);
+  await restarted.start({ resumePriorOwner: true });
+  assert.deepEqual(restarted.store.read().controllerMappings?.[0], mapping);
+  assert.equal(creates, 1, "restart must reuse the durable mapping, not create a second PR");
+  await restarted.shutdown();
 });

@@ -10,6 +10,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   digest,
   taskRevisionDigest,
+  validateAuthorization,
   workspaceExcludedByDelivery,
   validateTerminalOutput,
   type CheckExecutor,
@@ -18,7 +19,11 @@ import {
   type DeliveryAdapter,
   type AttemptRuntime,
   type ExecutionAuthorization,
+  type ExecutionControllerBootstrapIntent,
+  type ExecutionControllerMapping,
   type ExecutionManifest,
+  type DeliveryGroup,
+  type IntegrationReceipt,
   type RepoIdentity,
   type ResultReceipt,
   type RuntimeCapabilities,
@@ -41,6 +46,7 @@ import { TaskWorkspaces, type WorkspaceGit, type WorkspaceJournal, collectTaskRe
 import { ExecutionScheduler, type SchedulerControl } from "./execution-scheduler.ts";
 import { createExecutionDelivery, type DeliveryPrPort, type ExecutionDelivery } from "./execution-delivery.ts";
 import { createControllerDeliveryAdapter, type ControllerDeliveryOptions } from "./execution-delivery.ts";
+import { parsePrKey } from "./pr-review-identity.ts";
 import { PR_REVIEW_RECONCILED_EVENT, type ExecutionControllerBinding } from "./pr-review-events.ts";
 import { compileLegacyPreset, type LegacyCompileOptions } from "./execution-presets.ts";
 
@@ -83,6 +89,75 @@ export function resolvePlanArgument(value: string, cwd = process.cwd()): string 
 
 type ExecutionPi = { exec(file: string, args: string[], options: { cwd: string; timeout?: number }): Promise<{ code?: number; stdout?: string; stderr?: string }> };
 type ControllerBinding = Pick<ExecutionControllerBinding, "controller" | "controllerId" | "resolvePr" | "verifyMerge"> & Partial<Pick<ControllerDeliveryOptions, "prKey" | "acknowledged">>;
+export type ExecutionPrBootstrapRequest = {
+  manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef;
+  operationId: string; generation: string; branch: string; head: string; repository?: string;
+};
+export type ExecutionPrBootstrapResult =
+  | { kind: "found" | "created"; pr: { repo: string; number: number }; branch: string; head: string }
+  | { kind: "not-found" }
+  | { kind: "unknown" | "refused"; reason: string };
+/** Remote discovery/creation is the only effectful boundary. The bridge owns
+ * authorization, intent durability, exact mapping persistence, and fencing. */
+export type ExecutionPrBootstrapPort = (request: ExecutionPrBootstrapRequest) => Promise<ExecutionPrBootstrapResult>;
+
+function createGitHubExecutionPrBootstrap(pi: ExecutionPi): ExecutionPrBootstrapPort {
+  const run = async (file: string, args: string[], cwd: string, timeout = 60_000) => {
+    try { return await pi.exec(file, args, { cwd, timeout }); }
+    catch (error) { return { code: -1, stdout: "", stderr: String(error) }; }
+  };
+  const parsePr = (value: unknown): { repo: string; number: number } | undefined => {
+    if (typeof value !== "string") return undefined;
+    try {
+      const url = new URL(value); const parts = url.pathname.split("/").filter(Boolean);
+      const number = Number(parts[3]);
+      if (parts.length < 4 || parts[1]!.endsWith(".git") || parts[2]!.toLowerCase() !== "pull" || !Number.isSafeInteger(number) || number < 1) return undefined;
+      return { repo: `${url.host}/${parts[0]!}/${parts[1]!}`.toLowerCase(), number };
+    } catch { return undefined; }
+  };
+  const parseRemote = (value: string): string | undefined => {
+    const normalized = value.trim().replace(/^git@([^:]+):/, "https://$1/");
+    try {
+      const url = new URL(normalized.includes("://") ? normalized : `https://${normalized}`);
+      const parts = url.pathname.split("/").filter(Boolean).map(part => part.toLowerCase().endsWith(".git") ? part.slice(0, -4) : part);
+      return parts.length === 2 ? `${url.host}/${parts[0]!}/${parts[1]!}`.toLowerCase() : undefined;
+    } catch { return undefined; }
+  };
+  const discover = async (request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapResult> => {
+    const remote = await run("git", ["remote", "get-url", "origin"], request.workspace.path, 30_000);
+    const expectedRepo = remote.code === 0 ? parseRemote(String(remote.stdout ?? "")) : undefined;
+    if (!expectedRepo) return { kind: "refused", reason: "Origin repository is unavailable or noncanonical" };
+    const result = await run("gh", ["pr", "list", "--head", request.workspace.branch, "--state", "all", "--limit", "20", "--json", "number,url,headRefName,headRefOid"], request.workspace.path);
+    if (result.code !== 0) return { kind: "unknown", reason: String(result.stderr ?? result.stdout ?? "gh pr list failed") };
+    let rows: Array<{ number?: unknown; url?: unknown; headRefName?: unknown; headRefOid?: unknown }>;
+    try { rows = JSON.parse(String(result.stdout ?? "")) as Array<{ number?: unknown; url?: unknown; headRefName?: unknown; headRefOid?: unknown }>; }
+    catch (error) { return { kind: "unknown", reason: `Invalid gh PR discovery response: ${String(error)}` }; }
+    const exact = rows.filter(row => row.headRefName === request.workspace.branch && row.headRefOid === request.receipt.afterCommit).map(row => ({ ...row, pr: parsePr(row.url) })).filter(row => row.pr && row.pr.repo === expectedRepo && Number.isSafeInteger(row.number) && Number(row.number) === row.pr.number);
+    if (exact.length > 1) return { kind: "unknown", reason: "Multiple PRs match the authorized branch/head" };
+    if (exact.length === 1) return { kind: "found", pr: exact[0]!.pr!, branch: request.workspace.branch, head: request.receipt.afterCommit };
+    if (rows.some(row => row.headRefName === request.workspace.branch || row.headRefOid === request.receipt.afterCommit)) return { kind: "unknown", reason: "Remote PR branch/head does not match the authorized integration" };
+    return { kind: "not-found" };
+  };
+  return async request => {
+    const discovered = await discover(request);
+    if (discovered.kind !== "not-found") return discovered;
+    const head = await run("git", ["rev-parse", "HEAD"], request.workspace.path, 30_000);
+    const branch = await run("git", ["branch", "--show-current"], request.workspace.path, 30_000);
+    const clean = await run("git", ["status", "--porcelain=v1", "--untracked-files=all"], request.workspace.path, 30_000);
+    if (head.code !== 0 || String(head.stdout ?? "").trim() !== request.receipt.afterCommit || branch.code !== 0 || String(branch.stdout ?? "").trim() !== request.workspace.branch || clean.code !== 0 || String(clean.stdout ?? "").trim()) return { kind: "refused", reason: "Delivery workspace branch/head/clean state is not authorized" };
+    const pushed = await run("git", ["push", "-u", "origin", `${request.workspace.branch}:${request.workspace.branch}`], request.workspace.path, 120_000);
+    if (pushed.code !== 0) {
+      const afterPush = await discover(request);
+      return afterPush.kind === "found" ? afterPush : { kind: "unknown", reason: `Push outcome unknown: ${String(pushed.stderr ?? pushed.stdout ?? "")}` };
+    }
+    const created = await run("gh", ["pr", "create", "--head", request.workspace.branch, "--title", `Plan delivery ${request.group.id}`, "--body", `operation: ${request.operationId}`], request.workspace.path, 60_000);
+    const afterCreate = await discover(request);
+    if (afterCreate.kind === "found") return { ...afterCreate, kind: "created" };
+    return afterCreate.kind === "not-found"
+      ? { kind: "unknown", reason: created.code === 0 ? "PR create acknowledgement did not expose the created PR" : `PR create outcome unknown: ${String(created.stderr ?? created.stdout ?? "")}` }
+      : afterCreate;
+  };
+}
 
 export type ExecutionBridgeOptions = {
   pi?: ExecutionPi;
@@ -107,6 +182,10 @@ export type ExecutionBridgeOptions = {
   checks?: CheckExecutor;
   delivery?: DeliveryAdapter;
   resolvePr?: DeliveryPrPort;
+  /** Authorized PR bootstrap boundary; omitted preserves local-only/refusal behavior. */
+  bootstrapPr?: ExecutionPrBootstrapPort;
+  /** Canonical host/owner/repository slug from the caller's validated origin, when available. */
+  repository?: string;
   controller?: ControllerBinding;
   /** Select the new legacy-compatible sequential preset; omitted means plan-driven. */
   preset?: "plan-driven" | "legacy";
@@ -166,6 +245,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
   const root = join(options.stateRoot, EXECUTION_ENGINE_VERSION);
   const processStart = options.processStart || bridgeProcessIdentity;
   const store = createExecutionStore({ stateRoot: root, repo: options.repo, processStart });
+  const bootstrapPr = options.bootstrapPr ?? (options.pi ? createGitHubExecutionPrBootstrap(options.pi) : undefined);
   let owner: CoordinatorOwner | undefined;
   let started = false;
   let starting: Promise<void> | undefined;
@@ -240,7 +320,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     const result = await options.pi.exec(file, args, { cwd: config.cwd });
     return { exitCode: result.code ?? -1, stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? "") };
   }});
-  const resolvePr = options.resolvePr ?? options.controller?.resolvePr;
+  const rawResolvePr = options.resolvePr ?? options.controller?.resolvePr;
   const deliveryAdapter = options.delivery ?? (options.controller ? createControllerDeliveryAdapter({
     controller: options.controller.controller,
     controllerId: options.controller.controllerId,
@@ -253,6 +333,104 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     const key = `delivery-${digest([manifest.id, manifest.revision, groupId]).slice(0, 24)}`;
     return { id: `delivery-${digest([manifest.id, groupId])}`, path: resolve(ownedRoot, key), branch: key, repoId: manifest.repo.id, baseCommit: manifest.baseCommit, prerequisiteDigests: [] };
   };
+  const canonicalPr = (pr: { repo: string; number: number }): { repo: string; number: number } | undefined => {
+    const parsed = parsePrKey({ slug: pr.repo, pr: pr.number });
+    return parsed && Number.isSafeInteger(Number(parsed.number)) && Number(parsed.number) > 0 ? { repo: `${parsed.host}/${parsed.owner}/${parsed.repo}`, number: Number(parsed.number) } : undefined;
+  };
+  const bootstrapControllerMapping = async (request: Parameters<NonNullable<typeof rawResolvePr>>[0]): Promise<Awaited<ReturnType<NonNullable<typeof rawResolvePr>>>> => {
+    if (!bootstrapPr) return { kind: "refused", reason: "Authorized PR bootstrap port required" };
+    if (request.manifest.preset !== "plan-driven" || request.group.policy !== "pr") return { kind: "refused", reason: "PR bootstrap is unavailable for this execution preset" };
+    const currentOwner = owner;
+    if (!currentOwner) return { kind: "unknown", reason: "Execution coordinator owner unavailable" };
+    let state = store.read();
+    const manifest = state.manifests.find(item => item.id === request.manifest.id && item.revision === request.manifest.revision);
+    const groupMatches = state.manifests.filter(item => state.activeRevisions[item.id] === item.revision).flatMap(item => item.deliveryGroups.map(group => ({ manifest: item, group }))).filter(item => item.group.id === request.group.id);
+    const authorization = manifest && state.authorizations.find(item => item.manifestId === manifest.id && item.revision === manifest.revision);
+    if (!manifest || digest(manifest) !== digest(request.manifest) || state.activeRevisions[manifest.id] !== manifest.revision || groupMatches.length !== 1 || digest(groupMatches[0]!.group) !== digest(request.group) || !authorization) return { kind: "refused", reason: "Stale, foreign, or ambiguous execution manifest/group" };
+    try { validateAuthorization(manifest, authorization); } catch (error) { return { kind: "refused", reason: `Invalid persisted approval: ${String(error)}` }; }
+    if (!authorization.publication || manifest.repo.id !== options.repo.id || request.workspace.repoId !== options.repo.id || request.workspace.baseCommit !== manifest.baseCommit) return { kind: "refused", reason: "Publication approval or repository boundary is invalid" };
+    const delivery = state.deliveries.find(item => item.groupId === request.group.id);
+    if (!delivery || delivery.phase !== "ready" || !delivery.integrationDigest || delivery.handoff) return { kind: "refused", reason: "Delivery lifecycle is stale or already fenced" };
+    const receipt = state.integrationReceipts.find(item => item.digest === delivery.integrationDigest && item.deliveryGroupId === request.group.id);
+    const integration = receipt && state.integrations.find(item => item.id === receipt.intentId);
+    if (!receipt || !integration || digest(integration.workspace) !== digest(request.workspace) || receipt.afterCommit !== request.receipt.afterCommit || digest(request.receipt) !== digest(receipt)) return { kind: "refused", reason: "Integration receipt/workspace is stale or foreign" };
+    const inspected = await workspaces.inspect(request.workspace);
+    if (inspected.kind !== "inspected" || digest(inspected.workspace) !== digest(request.workspace) || !inspected.clean || inspected.inProgress || inspected.head !== receipt.afterCommit || digest(inspected.appliedDigests) !== digest(receipt.inputDigests)) return { kind: "refused", reason: "Delivery workspace no longer matches validated receipt" };
+    state = store.read();
+    if (!state.owner || digest(state.owner) !== digest(currentOwner) || state.reconciledEpoch !== currentOwner.epoch) return { kind: "unknown", reason: "Execution owner/lifecycle fence changed" };
+    const generation = `execution-${digest([manifest.id, manifest.revision, digest(manifest), request.group.id, request.group.ownerId, options.repo.id, request.workspace.id, request.workspace.path, receipt.digest, receipt.afterCommit]).slice(0, 32)}`;
+    const operationId = `pr-bootstrap-${digest([manifest.id, manifest.revision, digest(manifest), request.group.id, request.group.ownerId, options.repo.id, request.workspace.id, request.workspace.path, request.workspace.branch, receipt.digest, receipt.afterCommit])}`;
+    const intentBody: Omit<ExecutionControllerBootstrapIntent, "phase" | "createdAt" | "updatedAt" | "pr" | "reason"> = {
+      id: operationId, operationId, manifestId: manifest.id, manifestRevision: manifest.revision, manifestDigest: digest(manifest), sourceDigest: manifest.source.digest,
+      authorizationId: authorization.id, groupId: request.group.id, ownerId: request.group.ownerId, generation, repo: options.repo, receiptDigest: receipt.digest,
+      workspace: request.workspace, branch: request.workspace.branch, head: receipt.afterCommit,
+    };
+    const existingMapping = (state.controllerMappings ?? []).find(item => item.manifestId === manifest.id && item.manifestRevision === manifest.revision && item.groupId === request.group.id);
+    if (existingMapping) return { kind: "authorized", pr: existingMapping.pr, generation: existingMapping.generation, ownerId: existingMapping.ownerId, ownerKind: "execution" };
+    const existingIntent = (state.controllerBootstrapIntents ?? []).find(item => item.operationId === operationId);
+    if (!existingIntent) {
+      try {
+        store.transact(currentOwner, draft => {
+          const current = draft.controllerBootstrapIntents ?? (draft.controllerBootstrapIntents = []);
+          if (current.some(item => item.operationId === operationId)) return;
+          current.push({ ...intentBody, phase: "planned", createdAt: now(), updatedAt: now() });
+        });
+        state = store.read();
+      } catch (error) { return { kind: "unknown", reason: `Bootstrap intent persistence failed: ${String(error)}` }; }
+    }
+    const intent = (state.controllerBootstrapIntents ?? []).find(item => item.operationId === operationId);
+    if (!intent) return { kind: "unknown", reason: "Bootstrap intent was not durably recorded" };
+    const persistRemote = (result: Extract<ExecutionPrBootstrapResult, { kind: "found" | "created" }>): Awaited<ReturnType<NonNullable<typeof rawResolvePr>>> => {
+      const pr = canonicalPr(result.pr);
+      const expectedRepository = options.repository ? canonicalPr({ repo: options.repository, number: 1 })?.repo : undefined;
+      if (result.branch !== request.workspace.branch || result.head !== receipt.afterCommit || !pr || (expectedRepository && pr.repo !== expectedRepository)) {
+        return { kind: "refused", reason: "Remote PR reconciliation does not match authorized branch/head/repository" };
+      }
+      const mapping: ExecutionControllerMapping = { manifestId: manifest.id, manifestRevision: manifest.revision, groupId: request.group.id, ownerId: request.group.ownerId, generation, pr, workspace: request.workspace, head: receipt.afterCommit, manifestDigest: digest(manifest), sourceDigest: manifest.source.digest, authorizationId: authorization.id, integrationDigest: receipt.digest, operationId };
+      try {
+        store.transact(currentOwner, draft => {
+          const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId);
+          if (!latest) throw new Error("Bootstrap intent disappeared");
+          const duplicate = (draft.controllerMappings ?? []).find(item => item.manifestId === manifest.id && item.manifestRevision === manifest.revision && item.groupId === request.group.id);
+          if (duplicate) { if (digest(duplicate) !== digest(mapping)) throw new Error("Controller mapping identity mismatch"); return; }
+          if ((draft.controllerMappings ?? []).some(item => item.groupId !== request.group.id && item.pr.repo === pr.repo && item.pr.number === pr.number)) throw new Error("PR already mapped to another delivery group; approve one shared group");
+          latest.phase = "complete"; latest.updatedAt = now(); latest.pr = pr; delete latest.reason;
+          (draft.controllerMappings ?? (draft.controllerMappings = [])).push(mapping);
+        });
+      } catch (error) { return { kind: "unknown", reason: `Bootstrap mapping persistence failed: ${String(error)}` }; }
+      return { kind: "authorized", pr, generation, ownerId: request.group.ownerId, ownerKind: "execution" };
+    };
+    let discovered: ExecutionPrBootstrapResult;
+    try { discovered = await bootstrapPr({ manifest, group: request.group, receipt, workspace: request.workspace, operationId, generation, branch: request.workspace.branch, head: receipt.afterCommit, ...(options.repository ? { repository: options.repository } : {}) }); }
+    catch (error) { discovered = { kind: "unknown", reason: String(error) }; }
+    if (discovered.kind === "found") return persistRemote(discovered);
+    if (discovered.kind === "unknown" || discovered.kind === "refused") {
+      if (discovered.kind === "unknown") {
+        try { store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (latest && latest.phase !== "complete") { latest.phase = "unknown"; latest.updatedAt = now(); latest.reason = discovered.reason; } }); } catch { /* retain the conservative unknown fence */ }
+      }
+      return discovered;
+    }
+    if (intent.phase !== "planned") return { kind: "unknown", reason: "Prior PR bootstrap outcome is unknown; reconcile the deterministic branch before retrying" };
+    try {
+      store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (!latest || latest.phase !== "planned") throw new Error("Bootstrap intent is no longer creatable"); latest.phase = "creating"; latest.updatedAt = now(); delete latest.reason; });
+    } catch (error) { return { kind: "unknown", reason: String(error) }; }
+    let created: ExecutionPrBootstrapResult;
+    try { created = await bootstrapPr({ manifest, group: request.group, receipt, workspace: request.workspace, operationId, generation, branch: request.workspace.branch, head: receipt.afterCommit, ...(options.repository ? { repository: options.repository } : {}) }); }
+    catch (error) { created = { kind: "unknown", reason: String(error) }; }
+    if (created.kind === "found" || created.kind === "created") return persistRemote(created);
+    if (created.kind === "unknown") {
+      try { store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (latest && latest.phase !== "complete") { latest.phase = "unknown"; latest.updatedAt = now(); latest.reason = created.reason; } }); } catch { /* preserve unknown */ }
+    }
+    return created.kind === "refused" || created.kind === "unknown" ? created : { kind: "unknown", reason: "PR bootstrap did not produce a reconciled mapping" };
+  };
+  const resolvePr = rawResolvePr && bootstrapPr ? async (request: Parameters<NonNullable<typeof rawResolvePr>>[0]) => {
+    const first = await rawResolvePr(request);
+    if (first.kind === "authorized" || request.manifest.preset !== "plan-driven") return first;
+    const bootstrapped = await bootstrapControllerMapping(request);
+    if (bootstrapped.kind !== "authorized") return bootstrapped;
+    const resolved = await rawResolvePr(request);
+    return resolved.kind === "authorized" ? resolved : { kind: "refused" as const, reason: "Bootstrap mapping was persisted but controller resolution refused it" };
+  } : rawResolvePr;
   const scheduler = new ExecutionScheduler({
     store,
     owner: { pid: process.pid, processStart, sessionFile: realpathSync(options.sessionFile), instanceId: randomUUID() },
