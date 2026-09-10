@@ -114,6 +114,10 @@ export class TaskWorkspaces implements WorkspaceAdapter {
 	prepare(request: Parameters<WorkspaceAdapter["prepare"]>[0]): Promise<WorkspaceOutcome> {
 		return this.mutate(request.workspace, { attemptId: request.attemptId }, `prepare:${request.attemptId}`, request.workspace.baseCommit, request.workspace.prerequisiteDigests, request.prerequisites, true);
 	}
+	/** Provision only after U6 has persisted its integration intent/reservation. */
+	prepareDelivery(request: { integrationId: string; workspace: WorkspaceRef }): Promise<WorkspaceOutcome> {
+		return this.mutate(request.workspace, { integrationId: request.integrationId }, `delivery:${request.integrationId}`, request.workspace.baseCommit, [], [], true);
+	}
 	compose(request: { intent: IntegrationIntent; receipts: ResultReceipt[] }): Promise<WorkspaceOutcome> {
 		return this.mutate(request.intent.workspace, { integrationId: request.intent.id }, `compose:${request.intent.id}`, request.intent.beforeCommit, request.intent.inputDigests, request.receipts, false);
 	}

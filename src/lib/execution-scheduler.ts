@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-	deliveryFenced, digest, occupiesCapacity, taskRevisionDigest, transitionAttempt, validateAuthorization,
+	deliveryFenced, digest, occupiesCapacity, taskRevisionDigest, transitionAttempt, validateAuthorization, workspaceExcludedByDelivery,
 	type AttemptRuntime, type CheckExecutor, type CoordinatorOwner, type CoordinatorState,
 	type DeliveryAdapter, type ExecutionAuthorization, type ExecutionManifest, type LaunchOutcome,
 	type ResultReceipt, type TaskAttempt, type TaskRecord, type TaskSpec, type WorkspaceAdapter, type WorkspaceRef,
@@ -41,6 +41,8 @@ export class ExecutionScheduler {
 	private deferred = new Set<string>();
 	private lastError?: string;
 	constructor(options: SchedulerOptions) { this.options = options; }
+	/** Lease identity for adapters created after start; callers cannot mutate it. */
+	currentOwner(): CoordinatorOwner | undefined { return this.owner ? structuredClone(this.owner) : undefined; }
 	observe(): CoordinatorState { return this.options.store.read(); }
 	progress(): { state: CoordinatorState; error?: string } { return { state: this.observe(), ...(this.lastError ? { error: this.lastError } : {}) }; }
 	subscribe(listener: (state: CoordinatorState) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
@@ -295,7 +297,7 @@ export class ExecutionScheduler {
 					const workspace = this.options.workspace({ attemptId: id, manifest: structuredClone(manifest), task: structuredClone(member.task), prerequisites: structuredClone(prerequisites) });
 					return { member, id, prerequisites, workspace };
 				});
-				if (allocations.some(({ workspace }) => state.deliveries.some(d => ["handoff-pending", "controller-owned"].includes(d.phase) && d.handoff && (d.handoff.workspace.id === workspace.id || d.handoff.workspace.path === workspace.path)))) {
+				if (allocations.some(({ workspace }) => workspaceExcludedByDelivery(state, workspace))) {
 					for (const member of members) member.record.reason = "Workspace reserved by pending/controller-owned delivery";
 					continue;
 				}
@@ -319,7 +321,11 @@ export class ExecutionScheduler {
 			this.change(s => { const a = s.attempts.find(a => a.id === id)!; this.move(s, a, "recovery-needed", { reason: prepared.reason }); this.groupOutcome(s, id, true); }); return;
 		}
 		if (digest(prepared.workspace) !== digest(attempt.workspace)) throw new Error("Prepared workspace differs from reservation");
-		this.change(s => { this.move(s, s.attempts.find(a => a.id === id)!, "launching"); });
+		this.change(s => {
+			const currentAttempt = s.attempts.find(a => a.id === id)!;
+			currentAttempt.preparedHead = prepared.head;
+			this.move(s, currentAttempt, "launching");
+		});
 		const current = this.observe().attempts.find(a => a.id === id)!;
 		if (current.intent !== "none") {
 			await this.outcome(id, { kind: "rejected-before-start", category: "policy", reason: "Paused/cancelled before launch", evidence: { kind: "not-started", launchDigest: current.launchDigest, reason: "No RPC issued" } }); return;

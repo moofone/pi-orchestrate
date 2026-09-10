@@ -90,7 +90,7 @@ export function validateImportedManifest(value: unknown): asserts value is Execu
 
 /** The agent emits a complete shared manifest; task IDs are persistent logical keys before normalization. */
 export type InterpretationOutput = { manifest: ExecutionManifest; unresolvedDecisions: string[] };
-export type InterpretationRequest = { prompt: string; schema: Record<string, unknown>; source: SourceSnapshot; previous?: ExecutionManifest };
+export type InterpretationRequest = { prompt: string; schema: Record<string, unknown>; source: SourceSnapshot; previous?: ExecutionManifest; /** Caller-bound identity the transport must preserve verbatim. */ identity: { id: string; revision: number; repo: RepoIdentity; baseCommit: string } };
 /** Local injection port: command wiring chooses the agent/runtime, not this importer. Return JSON data, never executable code. */
 export type InterpretationTransport = (request: InterpretationRequest) => Promise<unknown>;
 export type ImportOptions = {
@@ -154,7 +154,7 @@ export function normalizeInterpretation(output: unknown, options: ImportOptions)
 	return result;
 }
 export async function interpretPlan(options: ImportOptions, transport: InterpretationTransport): Promise<InterpretationOutput> {
-	return normalizeInterpretation(await transport({ prompt: interpretationPrompt(options), schema: structuredClone(INTERPRETATION_OUTPUT_SCHEMA), source: structuredClone(options.source), ...(options.previous ? { previous: structuredClone(options.previous) } : {}) }), options);
+	return normalizeInterpretation(await transport({ prompt: interpretationPrompt(options), schema: structuredClone(INTERPRETATION_OUTPUT_SCHEMA), source: structuredClone(options.source), identity: { id: options.id, revision: options.revision, repo: structuredClone(options.repo), baseCommit: options.baseCommit }, ...(options.previous ? { previous: structuredClone(options.previous) } : {}) }), options);
 }
 export type ApprovalOptions = { id?: string; capacity: number; publication: boolean; approvedBy: string; approvedAt: number };
 export function authorizeInterpretation(result: InterpretationOutput, options: ApprovalOptions): ExecutionAuthorization {

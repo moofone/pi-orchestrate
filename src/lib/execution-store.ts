@@ -32,6 +32,8 @@ export class ExecutionStoreError extends Error {
 export type ExecutionStoreOptions = {
 	stateRoot: string; repo: RepoIdentity;
 	probeOwner?: (owner: CoordinatorOwner) => OwnerLiveness;
+	/** Host process start identity used to distinguish a reused PID during startup. */
+	processStart?: string;
 	/** Failure injection; called after durable temp write, before atomic replacement. */
 	beforeReplace?: (temporaryPath: string, destinationPath: string) => void;
 };
@@ -62,7 +64,11 @@ export function createExecutionStore(options: ExecutionStoreOptions): ExecutionS
 	const dir = join(options.stateRoot, "execution", options.repo.id);
 	mkdirSync(dir, { recursive: true });
 	const statePath = join(dir, "coordinator.json"), lockPath = join(dir, "transaction.lock");
-	const probe = options.probeOwner ?? probeOwnerProcess;
+	const probe = options.probeOwner ?? ((owner: CoordinatorOwner): OwnerLiveness => {
+		const liveness = probeOwnerProcess(owner);
+		if (liveness === "alive" && options.processStart && owner.pid === process.pid && owner.processStart !== options.processStart) return "dead";
+		return liveness;
+	});
 	function read(): CoordinatorState {
 		if (!existsSync(statePath)) return emptyCoordinatorState(options.repo);
 		try {

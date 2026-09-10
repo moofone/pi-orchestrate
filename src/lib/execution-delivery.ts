@@ -1,9 +1,9 @@
 import {
-	canonicalJson, deliveryFenced, digest, receiptDigest, taskRevisionDigest, validateAuthorization, validateCheckEvidence,
+	canonicalJson, deliveryFenced, digest, receiptDigest, taskRevisionDigest, validateAuthorization, validateCheckEvidence, workspaceExcludedByDelivery,
 	type CheckEvidence, type CheckExecutor, type CoordinatorOwner, type CoordinatorState,
 	type DeliveryAdapter, type DeliveryGroup, type DeliveryObservation, type DeliveryRecord,
 	type ExecutionManifest, type HandoffAcknowledgement, type HandoffRequest,
-	type IntegrationReceipt, type ResultReceipt, type WorkspaceAdapter, type WorkspaceRef,
+	type IntegrationReceipt, type ResultReceipt, type WorkspaceAdapter, type WorkspaceInspection, type WorkspaceOutcome, type WorkspaceRef,
 } from "./execution-contract.ts";
 import type { ExecutionStore } from "./execution-store.ts";
 import type { ReviewController } from "./pr-review-controller.ts";
@@ -109,7 +109,7 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
 			let state = store.read(); const { manifest, group } = activeGroup(state, manifestId, groupId);
 			const existing = state.deliveries.find(d => d.groupId === groupId);
 			if (existing && deliveryFenced(existing)) return { kind: "fenced", delivery: existing };
-			const foreignFence = state.deliveries.find(d => deliveryFenced(d) && d.handoff && (d.handoff.workspace.id === target.id || d.handoff.workspace.path === target.path));
+			const foreignFence = state.deliveries.find(d => d.groupId !== groupId && workspaceExcludedByDelivery({ deliveries: [d] }, target));
 			if (foreignFence) return { kind: "fenced", delivery: foreignFence };
 			let inputs: ResultReceipt[];
 			try { inputs = inputsFor(state, manifest, group); } catch (error) { return block(group, [], String(error)); }
@@ -118,27 +118,39 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
 			const id = `integration-${digest([manifest.id, group, manifest.baseCommit, inputDigests, target])}`;
 			let intent = state.integrations.find(i => i.id === id);
 			if (state.integrations.some(i => i.deliveryGroupId === groupId && i.id !== id && i.phase !== "complete")) return block(group, inputs, "Prior integration writer requires explicit resolution");
-			let inspected = await workspace.inspect(target);
-			if (inspected.kind !== "inspected" || !sameWorkspace(inspected.workspace, target) || !inspected.clean || inspected.inProgress) return block(group, inputs, inspected.kind === "unknown" ? inspected.reason : "Dirty, foreign, or in-progress integration workspace", [], intent?.phase === "complete" ? undefined : intent?.id);
-			if (intent?.phase === "complete") {
-				const receipt = state.integrationReceipts.find(r => r.intentId === id)!;
-				if (inspected.head !== receipt.afterCommit || digest(inspected.appliedDigests) !== digest(inputDigests)) return block(group, inputs, "Validated integration HEAD/ancestry changed");
-				for (const spec of group.checks) {
-					const evidence = receipt.checks.find(c => c.checkId === spec.id);
-					if (!evidence || !checks.validateEvidence(spec, evidence, { invocationId: evidence.invocationId, notBefore: intent.createdAt }).valid) return block(group, inputs, `Validated integration check unavailable: ${spec.id}`);
-				}
-				mutate(draft => { const d = record(draft, groupId); d.phase = "ready"; d.integrationDigest = receipt.digest; delete d.reason; });
-				return { kind: "ready", receipt };
-			}
-			let head: string;
+			// A new delivery workspace is materialized only after this facade records
+			// its integration writer reservation. Existing intents must instead be
+			// inspected before any recovery decision; an unknown workspace is never
+			// permission to replay a mutation.
+			let inspected = intent || !workspace.prepareDelivery
+				? await workspace.inspect(target)
+				: { kind: "unknown" as const, reason: "Delivery workspace awaits durable provisioning" };
 			if (intent) {
+				if (inspected.kind !== "inspected" || !sameWorkspace(inspected.workspace, target) || !inspected.clean || inspected.inProgress) return block(group, inputs, inspected.kind === "unknown" ? inspected.reason : "Dirty, foreign, or in-progress integration workspace", [], intent.phase === "complete" ? undefined : intent.id);
+				if (intent.phase === "complete") {
+					const receipt = state.integrationReceipts.find(r => r.intentId === id)!;
+					if (inspected.head !== receipt.afterCommit || digest(inspected.appliedDigests) !== digest(inputDigests)) return block(group, inputs, "Validated integration HEAD/ancestry changed");
+					for (const spec of group.checks) {
+						const evidence = receipt.checks.find(r => r.checkId === spec.id);
+						if (!evidence || !checks.validateEvidence(spec, evidence, { invocationId: evidence.invocationId, notBefore: intent.createdAt }).valid) return block(group, inputs, `Validated integration check unavailable: ${spec.id}`);
+					}
+					mutate(draft => { const d = record(draft, groupId); d.phase = "ready"; d.integrationDigest = receipt.digest; delete d.reason; });
+					return { kind: "ready", receipt };
+				}
 				// A persisted intent means mutation may already have happened. Absence of ancestry
 				// evidence is not permission to replay even when the worktree looks clean.
 				if (digest(inspected.appliedDigests) !== digest(inputDigests) || (intent.afterCommit && intent.afterCommit !== inspected.head)) return block(group, inputs, "Unproven integration ancestry; refusing replay", [], id);
-				head = inspected.head;
+			}
+			let head: string;
+			if (intent) {
+				head = (inspected as Extract<WorkspaceInspection, { kind: "inspected" }>).head;
 			} else {
-				if (inspected.head !== manifest.baseCommit || inspected.appliedDigests.length) return block(group, inputs, "New integration must start at authorized clean base");
-				intent = { id, deliveryGroupId: groupId, workspace: target, inputDigests, createdAt: now(), beforeCommit: inspected.head, phase: "composing" };
+				if (!workspace.prepareDelivery) {
+					if (inspected.kind !== "inspected" || inspected.head !== manifest.baseCommit || inspected.appliedDigests.length) return block(group, inputs, "New integration must start at authorized clean base");
+				}
+
+				const beforeCommit = inspected.kind === "inspected" ? inspected.head : manifest.baseCommit;
+				intent = { id, deliveryGroupId: groupId, inputDigests, createdAt: now(), beforeCommit, workspace: target, phase: "composing" };
 				mutate(draft => {
 					activeGroup(draft, manifestId, groupId);
 					const d = record(draft, groupId); if (deliveryFenced(d)) throw new Error("Delivery mutation fenced");
@@ -148,6 +160,14 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
 					draft.reservations.push({ id: `writer-${id}`, integrationId: id, workspaceId: target.id, workspacePath: target.path, slots: 1 });
 					d.phase = "integrating";
 				});
+				if (workspace.prepareDelivery) {
+					let provisioned: WorkspaceOutcome;
+					try { provisioned = await workspace.prepareDelivery({ integrationId: id, workspace: target }); }
+					catch (error) { return block(group, inputs, `Delivery provisioning outcome unknown: ${String(error)}`, [], id); }
+					if (provisioned.kind !== "prepared" || !sameWorkspace(provisioned.workspace, target)) return block(group, inputs, provisioned.kind === "prepared" ? "Delivery provisioning returned foreign workspace" : `Delivery provisioning ${provisioned.kind}: ${provisioned.reason}`, [], id);
+					inspected = await workspace.inspect(target);
+					if (inspected.kind !== "inspected" || !sameWorkspace(inspected.workspace, target) || !inspected.clean || inspected.inProgress || inspected.head !== manifest.baseCommit || inspected.appliedDigests.length) return block(group, inputs, "Provisioned delivery workspace lacks clean authorized base", [], id);
+				}
 				let composed;
 				try { composed = await workspace.compose({ intent, receipts: inputs }); }
 				catch (error) { return block(group, inputs, `Composition outcome unknown: ${String(error)}`, [], id); }

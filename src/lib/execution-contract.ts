@@ -60,7 +60,7 @@ export type TaskAttempt = {
 	schemaVersion: typeof EXECUTION_SCHEMA_VERSION; id: Id; taskId: Id; manifestId: Id;
 	manifestRevision: number; taskDigest: Digest; ownerSessionFile: string; launchDigest: Digest;
 	operationId?: Id; run?: RunRef; workspace: WorkspaceRef; baseCommit: string;
-	prerequisiteDigests: Digest[]; phase: AttemptPhase; intent: ControlIntent;
+	prerequisiteDigests: Digest[]; /** Exact clean head returned by workspace preparation. */ preparedHead?: string; phase: AttemptPhase; intent: ControlIntent;
 	createdAt: number; updatedAt: number; reason?: string; terminal?: TerminalEvidence;
 	nonStart?: NonStartEvidence; resultDigest?: Digest;
 };
@@ -134,6 +134,8 @@ export type WorkspaceInspection = { kind: "inspected"; workspace: WorkspaceRef; 
 export interface WorkspaceAdapter {
 	prepare(request: { attemptId: Id; workspace: WorkspaceRef; prerequisites: ResultReceipt[] }): Promise<WorkspaceOutcome>;
 	inspect(workspace: WorkspaceRef): Promise<WorkspaceInspection>;
+	/** U7 persists the integration reservation before asking this adapter to materialize a clean delivery worktree. */
+	prepareDelivery?(request: { integrationId: Id; workspace: WorkspaceRef }): Promise<WorkspaceOutcome>;
 	/** Caller persists the intent and writer reservation before calling compose. */
 	compose(request: { intent: IntegrationIntent; receipts: ResultReceipt[] }): Promise<WorkspaceOutcome>;
 }
@@ -316,6 +318,10 @@ export function transitionAttempt(attempt: TaskAttempt, phase: AttemptPhase, evi
 	return next;
 }
 export function deliveryFenced(delivery: DeliveryRecord): boolean { return ["handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(delivery.phase); }
+/** A handoff is a durable workspace fence even when another delivery group owns it. */
+export function workspaceExcludedByDelivery(state: { deliveries: readonly ({ groupId?: Id; phase: DeliveryRecord["phase"]; handoff?: { workspace: Pick<WorkspaceRef, "id" | "path"> } })[] }, workspace: Pick<WorkspaceRef, "id" | "path">): boolean {
+	return state.deliveries.some(delivery => ["handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(delivery.phase) && !!delivery.handoff && (delivery.handoff.workspace.id === workspace.id || delivery.handoff.workspace.path === workspace.path));
+}
 export function emptyCoordinatorState(identity: RepoIdentity): CoordinatorState {
 	return { schemaVersion: EXECUTION_SCHEMA_VERSION, repo: identity, sequence: 0, epoch: 0, capacity: 0, manifests: [], authorizations: [], activeRevisions: {}, tasks: [], attempts: [], results: [], integrations: [], integrationReceipts: [], deliveries: [], reservations: [], parallelLaunchSets: [], intents: [] };
 }
@@ -348,6 +354,7 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 		const manifest = state.manifests.find(m => m.id === attempt.manifestId && m.revision === attempt.manifestRevision);
 		const task = manifest?.tasks.find(t => t.id === attempt.taskId); requireThat(task && taskRevisionDigest(task) === attempt.taskDigest, "Missing/changed attempt contract");
 		requireThat(attempt.baseCommit === manifest!.baseCommit && attempt.workspace.repoId === state.repo.id && isAbsolute(attempt.workspace.path), "Invalid attempt workspace/base");
+		if (attempt.preparedHead !== undefined) requireThat(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(attempt.preparedHead), "Invalid prepared workspace head");
 		requireThat(attempt.workspace.baseCommit === attempt.baseCommit && digest(attempt.workspace.prerequisiteDigests) === digest(attempt.prerequisiteDigests), "Workspace prerequisite mismatch");
 		for (const d of attempt.prerequisiteDigests) requireThat(state.results.some(r => r.digest === d), "Missing prerequisite receipt");
 		const ancestors = new Set<Id>();
@@ -384,6 +391,7 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 	unique(state.reservations.map(r => r.id), "reservation ID"); unique(state.reservations.map(r => r.workspaceId), "workspace writer"); unique(state.reservations.map(r => r.workspacePath), "workspace path writer");
 	for (const r of state.reservations) {
 		text(r.id); text(r.workspaceId); requireThat(isAbsolute(r.workspacePath), "Invalid reserved path"); integer(r.slots);
+		requireThat(!workspaceExcludedByDelivery(state, { id: r.workspaceId, path: r.workspacePath }), "Reserved workspace is fenced by controller handoff");
 		requireThat(!!r.attemptId !== !!r.integrationId, "Reservation must identify one writer");
 		if (r.attemptId) { const a = state.attempts.find(a => a.id === r.attemptId); requireThat(a && a.workspace.id === r.workspaceId && a.workspace.path === r.workspacePath && r.slots === 1, "Invalid attempt reservation"); }
 		if (r.integrationId) requireThat(state.integrations.some(i => i.id === r.integrationId && i.workspace.id === r.workspaceId && i.workspace.path === r.workspacePath), "Missing integration writer");
@@ -447,7 +455,7 @@ export function validateStateChange(previous: CoordinatorState, next: Coordinato
 	for (const old of previous.attempts) {
 		const candidate = next.attempts.find(a => a.id === old.id); requireThat(candidate, "Attempt history removed");
 		for (const key of ["id", "taskId", "manifestId", "manifestRevision", "taskDigest", "ownerSessionFile", "launchDigest", "workspace", "baseCommit", "prerequisiteDigests", "createdAt"] as const) requireThat(digest(old[key]) === digest(candidate[key]), `Attempt contract changed: ${key}`);
-		for (const key of ["run", "operationId", "terminal", "nonStart", "resultDigest"] as const) if (old[key] !== undefined) requireThat(candidate[key] !== undefined && digest(old[key]) === digest(candidate[key]), `Attempt evidence changed: ${key}`);
+		for (const key of ["run", "operationId", "preparedHead", "terminal", "nonStart", "resultDigest"] as const) if (old[key] !== undefined) requireThat(candidate[key] !== undefined && digest(old[key]) === digest(candidate[key]), `Attempt evidence changed: ${key}`);
 		transitionAttempt({ ...old, ...(candidate.run ? { run: candidate.run } : {}) }, candidate.phase, { at: candidate.updatedAt, ...(candidate.terminal ? { terminal: candidate.terminal } : {}), ...(candidate.nonStart ? { nonStart: candidate.nonStart } : {}), ...(candidate.resultDigest ? { resultDigest: candidate.resultDigest } : {}) });
 	}
 	for (const r of previous.reservations) {
