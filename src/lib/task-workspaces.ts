@@ -22,7 +22,7 @@ export type TaskWorkspaceOptions = {
 	isFetchedBase: (commit: string) => Promise<boolean>;
 	readJournal: (workspaceId: string) => Promise<WorkspaceJournal | undefined>;
 	/** Durable compare-and-swap; reject if current record differs from expected. */
-	writeJournal: (journal: WorkspaceJournal, expected: WorkspaceJournal | undefined) => Promise<void>;
+	writeJournal: (journal: WorkspaceJournal, expected: WorkspaceJournal | undefined, writer: { attemptId: string } | { integrationId: string }) => Promise<void>;
 	resolveReceipt: (digest: string) => Promise<ResultReceipt | undefined>;
 	/** Must consult validated producer/manifest state, not just receipt hashes. */
 	isEligibleReceipt: (receipt: ResultReceipt) => Promise<boolean>;
@@ -155,7 +155,7 @@ export class TaskWorkspaces implements WorkspaceAdapter {
 				requireThat(same(actual.commits, receipt.output.commits) && same(actual.paths, receipt.output.paths), "Receipt range mismatch");
 			}
 			let journal: WorkspaceJournal = { workspace, operationId, inputDigests: ids, phase: "pending", before, head: before, appliedDigests: prior?.appliedDigests ?? [] };
-			await own(); pending = true; await o.writeJournal(structuredClone(journal), prior);
+			await own(); pending = true; await o.writeJournal(structuredClone(journal), prior, writer);
 			if (provision) {
 				await own(); const result = await o.git(o.referencePath, ["wt", workspace.branch, "--base", workspace.baseCommit, "--yes"]);
 				requireThat(result.exitCode === 0, `Git helper provisioning uncertain: ${result.stderr}`);
@@ -178,7 +178,7 @@ export class TaskWorkspaces implements WorkspaceAdapter {
 			requireThat(!(await gitRead(o.git, workspace.path, ["status", "--porcelain=v1", "--untracked-files=all"])), "Composition dirty");
 			const expected = structuredClone(journal);
 			journal = { ...journal, phase: "complete", head, appliedDigests: receipts.map(receipt => receipt.digest) };
-			await own(); await o.writeJournal(structuredClone(journal), expected);
+			await own(); await o.writeJournal(structuredClone(journal), expected, writer);
 			return { kind: "prepared", workspace, head };
 		} catch (error) { return { kind: pending ? "unknown" : "refused", reason: String(error) }; }
 		finally { this.busy.delete(workspace.path); }

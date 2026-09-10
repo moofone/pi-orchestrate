@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createAttemptRuntime, decodeRuntimeStatus, type RuntimeEventBus } from "../src/lib/attempt-runtime.ts";
 import { fakeAttempt, fakeAuthorization, fakeManifest } from "./fixtures/execution/fakes.ts";
-import type { LaunchRequest } from "../src/lib/execution-contract.ts";
+import { digest, type LaunchRequest } from "../src/lib/execution-contract.ts";
 class Bus implements RuntimeEventBus {
  listeners = new Map<string, Set<(value: unknown) => void>>();
  on(name: string, listener: (value: unknown) => void) { const set = this.listeners.get(name) ?? new Set(); set.add(listener); this.listeners.set(name, set); return () => { set.delete(listener); }; }
@@ -35,7 +35,12 @@ test("attempt-runtime catches completion-before-ack, uses single detached child,
  const [a, b] = await Promise.all([runtime.launch(request), runtime.launch(request)]);
  assert.equal(a.kind, "known-terminal"); assert.deepEqual(a, b); assert.equal(wakes, 1);
  const launches = calls.filter(c => c.method === "spawn"); assert.equal(launches.length, 1);
- assert.deepEqual(launches[0]!.params, { agent: "worker", task: request.task.text, cwd: request.attempt.workspace.path, async: true, worktree: false, context: "fork" });
+ assert.equal(launches[0]!.params.agent, "worker");
+ assert.equal(launches[0]!.params.cwd, request.attempt.workspace.path);
+ assert.equal(launches[0]!.params.worktree, false);
+ assert.equal(launches[0]!.params.context, "fork");
+ assert.ok(launches[0]!.params.outputSchema);
+ assert.match(String(launches[0]!.params.task), /structured_output/);
  events.emit("subagent:async-complete", { runId: "foreign" }); events.emit("subagent:async-complete", { runId: run.runId });
  assert.equal((await runtime.observe({ ...request.attempt, run })).kind, "known-terminal");
  runtime.dispose(); assert.ok([...events.listeners.values()].every(set => set.size === 0 || set === events.listeners.get("subagents:rpc:v1:request")));
@@ -93,4 +98,26 @@ test("attempt-runtime recovers advertised durable reply without another launch",
  const result = await runtime.lookupOperation!("operation-123456789", run.ownerSessionFile);
  assert.equal(result.kind, "known-terminal"); if (result.kind === "known-terminal") assert.equal(result.evidence.run.operationId, "operation-123456789");
  assert.ok(!calls.some(call => call.method === "spawn")); runtime.dispose();
+});
+
+test("attempt-runtime freezes exact structured-only output under the canonical status digest", () => {
+ for (const output of [{ kind: "commits", commit: "b".repeat(40) }, { kind: "artifact", path: "/fixture/run-1/report.md", digest: "c".repeat(64) }]) {
+  const raw = { ...status(), steps: [{ status: "complete", structuredOutput: output }] };
+  const result = decodeRuntimeStatus(JSON.stringify(raw), run, "owner", 10);
+  assert.equal(result.kind, "known-terminal");
+  if (result.kind !== "known-terminal") continue;
+  assert.deepEqual(result.evidence.output, output);
+  assert.equal(result.evidence.evidenceDigest, digest(raw));
+  assert.deepEqual(decodeRuntimeStatus(JSON.stringify(raw, null, 2), run, "owner", 10), result);
+  assert.equal(decodeRuntimeStatus(JSON.stringify(raw), { ...run, runId: "other" }, "owner", 10).kind, "unknown");
+  assert.equal(decodeRuntimeStatus(JSON.stringify(raw), run, "foreign", 10).kind, "unknown");
+ }
+});
+test("attempt-runtime malformed structured output cannot become receipt evidence", () => {
+ for (const structuredOutput of [{ kind: "commits", commit: "HEAD" }, { kind: "artifact", path: "relative", digest: "a".repeat(64) }, { kind: "artifact", path: "/a/../b", digest: "a".repeat(64) }, { kind: "artifact", path: "/a", digest: "short" }, { kind: "commits", commit: "a".repeat(40), extra: true }, []]) {
+  assert.equal(decodeRuntimeStatus(JSON.stringify({ ...status(), steps: [{ status: "complete", structuredOutput }] }), run, "owner", 10).kind, "unknown");
+ }
+ const legacy = decodeRuntimeStatus(JSON.stringify(status()), run, "owner", 10);
+ assert.equal(legacy.kind, "known-terminal");
+ if (legacy.kind === "known-terminal") assert.equal(legacy.evidence.output, undefined);
 });

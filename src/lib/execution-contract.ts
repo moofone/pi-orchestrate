@@ -54,7 +54,17 @@ export type WorkspaceRef = { id: Id; path: string; branch: string; repoId: Id; b
 export type RunRef = { runId: Id; artifactDir: string; ownerSessionFile: string; operationId?: Id };
 export type AttemptPhase = "pending" | "dependency-blocked" | "ready" | "preparing" | "launching" | "running" | "stopping" | "validating" | "succeeded" | "failed" | "recovery-needed";
 export type ControlIntent = "none" | "pause" | "stop" | "cancel";
-export type TerminalEvidence = { kind: "terminal"; run: RunRef; outcome: "succeeded" | "failed" | "stopped"; evidenceDigest: Digest; observedAt: number };
+export type TerminalOutput = { kind: "commits"; commit: string } | { kind: "artifact"; path: string; digest: Digest };
+/** Shared persisted/runtime shape validation. Files and Git objects are verified by receipt collection. */
+export function validateTerminalOutput(value: unknown): asserts value is TerminalOutput {
+	object(value);
+	if (value.kind === "commits") {
+		requireThat(Object.keys(value).sort().join(",") === "commit,kind" && typeof value.commit === "string" && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(value.commit), "Invalid terminal commit output");
+	} else {
+		requireThat(value.kind === "artifact" && Object.keys(value).sort().join(",") === "digest,kind,path" && typeof value.path === "string" && !value.path.includes("\0") && isAbsolute(value.path) && resolve(value.path) === value.path && typeof value.digest === "string" && /^[a-f0-9]{64}$/.test(value.digest), "Invalid terminal artifact output");
+	}
+}
+export type TerminalEvidence = { kind: "terminal"; run: RunRef; outcome: "succeeded" | "failed" | "stopped"; evidenceDigest: Digest; observedAt: number; output?: TerminalOutput };
 export type NonStartEvidence = { kind: "not-started"; launchDigest: Digest; reason: string };
 export type TaskAttempt = {
 	schemaVersion: typeof EXECUTION_SCHEMA_VERSION; id: Id; taskId: Id; manifestId: Id;
@@ -306,6 +316,7 @@ export function transitionAttempt(attempt: TaskAttempt, phase: AttemptPhase, evi
 	if (next.run) { validateRun(next.run); requireThat(next.run.ownerSessionFile === next.ownerSessionFile, "Runtime owner mismatch"); }
 	if (next.terminal) {
 		validateRun(next.terminal.run); text(next.terminal.evidenceDigest); integer(next.terminal.observedAt);
+		if (next.terminal.output !== undefined) validateTerminalOutput(next.terminal.output);
 		requireThat(next.terminal.kind === "terminal" && ["succeeded", "failed", "stopped"].includes(next.terminal.outcome), "Invalid terminal evidence");
 		requireThat(next.run && digest(next.run) === digest(next.terminal.run) && next.ownerSessionFile === next.terminal.run.ownerSessionFile, "Terminal run mismatch");
 	}

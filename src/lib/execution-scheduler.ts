@@ -9,6 +9,8 @@ import type { ExecutionStore } from "./execution-store.ts";
 
 export type SchedulerOptions = {
 	store: ExecutionStore; owner: Omit<CoordinatorOwner, "epoch">;
+	/** Synchronous adapter binding after acquire, before any recovery callback. */
+	onOwnerAcquired?: (owner: CoordinatorOwner) => void;
 	runtime: AttemptRuntime; workspaces: WorkspaceAdapter; checks: CheckExecutor; delivery: DeliveryAdapter;
 	/** Pure allocation of a canonical caller-owned path; no provisioning before reservation. */
 	workspace: (input: { attemptId: string; manifest: ExecutionManifest; task: TaskSpec; prerequisites: ResultReceipt[] }) => WorkspaceRef;
@@ -32,6 +34,9 @@ export class ExecutionScheduler {
 	private dirty = false;
 	private jobs = new Map<string, Promise<void>>();
 	private validationJobs = new Map<string, Promise<void>>();
+	// A failed receipt is retried only by explicit resume or a new coordinator,
+	// not by ordinary runtime/delivery wakeups that could form a busy loop.
+	private validationFailures = new Set<string>();
 	private stopJobs = new Map<string, Promise<void>>();
 	private deliveryJob?: Promise<void>;
 	private listeners = new Set<(state: CoordinatorState) => void>();
@@ -57,6 +62,7 @@ export class ExecutionScheduler {
 	async start(): Promise<void> {
 		if (this.owner || this.stopped) throw new Error("Scheduler already started or shut down");
 		this.owner = this.options.store.acquire(this.options.owner);
+		this.options.onOwnerAcquired?.(structuredClone(this.owner));
 		this.unsubscribe = this.options.runtime.subscribe(() => { this.deferred.clear(); this.wake(); });
 		// No admission until every persisted attempt has been observed or conservatively fenced.
 		await this.recover();
@@ -115,6 +121,7 @@ export class ExecutionScheduler {
 					if (record.phase === "succeeded") throw new Error("Cannot retry a completed task without revision");
 					record.phase = "pending"; delete record.reason; this.deferred.delete(record.taskId);
 				}
+				if (control.action === "resume" && active?.terminal?.outcome === "succeeded") this.validationFailures.delete(active.id);
 				record.intent = control.action === "pause" ? "pause" : control.action === "cancel" ? "cancel" : "none";
 				if (active) { active.intent = control.action === "pause" && control.immediate ? "stop" : record.intent; if ((control.action === "pause" && control.immediate) || control.action === "cancel") stops.push(structuredClone(active)); }
 			}
@@ -233,16 +240,24 @@ export class ExecutionScheduler {
 	}
 	private launchJob(id: string, job: () => Promise<void>, jobs = this.jobs): void {
 		if (jobs.has(id)) return;
+		let failed = false;
 		const promise = Promise.resolve().then(job).catch(error => {
+			failed = true;
+			if (jobs === this.validationJobs) this.validationFailures.add(id);
 			this.lastError = String(error);
 			if (!this.stopped && this.owner && this.live(this.owner)) this.change(state => { const a = state.attempts.find(a => a.id === id); if (a && occupiesCapacity(a)) this.move(state, a, "recovery-needed", { reason: String(error) }); });
-		}).finally(() => { jobs.delete(id); this.wake(); });
+		}).finally(() => { jobs.delete(id); if (!failed || jobs !== this.validationJobs) this.wake(); });
 		jobs.set(id, promise);
 	}
 	private async recover(): Promise<void> {
 		const owner = this.owner!;
 		await Promise.all(this.observe().attempts.filter(a => occupiesCapacity(a) && !(a.phase === "preparing" && this.jobs.has(a.id))).map(async attempt => {
-			if (attempt.terminal?.outcome === "succeeded") { if (attempt.phase === "validating") this.launchJob(attempt.id, () => this.validate(attempt.id), this.validationJobs); return; }
+			if (attempt.terminal?.outcome === "succeeded") {
+				if (this.validationFailures.has(attempt.id)) return;
+				if (attempt.phase === "recovery-needed") this.change(s => { this.move(s, s.attempts.find(a => a.id === attempt.id)!, "validating"); });
+				if (["validating", "recovery-needed"].includes(attempt.phase)) this.launchJob(attempt.id, () => this.validate(attempt.id), this.validationJobs);
+				return;
+			}
 			if (attempt.phase === "preparing") this.change(s => { this.move(s, s.attempts.find(a => a.id === attempt.id)!, "recovery-needed", { reason: "Interrupted workspace preparation; inspect before replacement" }); });
 			let outcome: LaunchOutcome;
 			try {

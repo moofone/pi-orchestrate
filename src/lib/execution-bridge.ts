@@ -1,22 +1,17 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
-  closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
   readFileSync,
   realpathSync,
-  renameSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
-  canonicalJson,
   digest,
   taskRevisionDigest,
   workspaceExcludedByDelivery,
+  validateTerminalOutput,
   type CheckExecutor,
   type CoordinatorOwner,
   type CoordinatorState,
@@ -39,7 +34,7 @@ import {
   type InterpretationTransport,
 } from "./plan-import.ts";
 import { createExecutionStore, type ExecutionStore } from "./execution-store.ts";
-import { createAttemptRuntime, type RuntimeEventBus } from "./attempt-runtime.ts";
+import { createAttemptRuntime, decodeRuntimeStatus, type RuntimeEventBus } from "./attempt-runtime.ts";
 import { createCheckExecutor } from "./execution-checks.ts";
 import { TaskWorkspaces, type WorkspaceGit, type WorkspaceJournal, collectTaskResult } from "./task-workspaces.ts";
 import { ExecutionScheduler, type SchedulerControl } from "./execution-scheduler.ts";
@@ -94,6 +89,7 @@ export type ExecutionBridgeOptions = {
   referencePath: string;
   stateRoot: string;
   sessionFile: string;
+  /** Diagnostic label only; liveness never treats session/instance differences as death. */
   processStart?: string;
   capacity: number;
   interpretationTransport: InterpretationTransport;
@@ -136,26 +132,15 @@ export type ExecutionBridge = {
   shutdown(): Promise<void>;
 };
 
-function atomicWrite(path: string, bytes: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temporary = `${path}.${randomUUID()}.tmp`, fd = openSync(temporary, "wx", 0o600);
-  try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(temporary, path);
-}
 function same(a: unknown, b: unknown): boolean {
   if (a === undefined || b === undefined) return a === b;
   return digest(a) === digest(b);
 }
-function processStartIdentity(): string {
-  try {
-    // `ps` reports the OS process instance, unlike a PID reused after reload.
-    const value = readFileSync(`/proc/${process.pid}/stat`, "utf8");
-    return value.split(" ")[21] ?? value;
-  } catch { return `${process.pid}:${process.uptime()}`; }
-}
+// Diagnostic only. Lease liveness uses the OS PID probe, never this label.
+const bridgeProcessIdentity = `${process.pid}:${randomUUID()}`;
 function noDelivery(): DeliveryAdapter {
   const refused = (request: { id: string }) => Promise.resolve({ kind: "not-transferred" as const, reason: `No controller delivery adapter for ${request.id}` });
-  return { handoff: refused, observe: refused };
+  return { handoff: refused, observe: async request => ({ kind: "unknown", reason: `No controller delivery adapter for ${request.id}` }) };
 }
 function resultEligible(state: CoordinatorState, receipt: ResultReceipt): boolean {
   const attempt = state.attempts.find(item => item.id === receipt.attemptId);
@@ -169,12 +154,17 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
   if (!options.sessionFile || !existsSync(options.sessionFile)) throw new Error("Persisted session file required for execution ownership");
   const now = options.now ?? Date.now;
   const root = join(options.stateRoot, EXECUTION_ENGINE_VERSION);
-  const processStart = options.processStart || processStartIdentity();
+  const processStart = options.processStart || bridgeProcessIdentity;
   const store = createExecutionStore({ stateRoot: root, repo: options.repo, processStart });
   let owner: CoordinatorOwner | undefined;
   let started = false;
   let starting: Promise<void> | undefined;
   let authorizedBase = "";
+  const authorizedBases = new Set<string>();
+  const restoreAuthorizedBases = () => {
+    // read() validates every historical approval against its immutable manifest.
+    for (const approval of store.read().authorizations) authorizedBases.add(approval.baseCommit);
+  };
   const pendingPreviews = new Map<string, ExecutionPreview>();
   const git: WorkspaceGit = options.git ?? (async (cwd, argv) => {
     if (!options.pi) throw new Error("Git adapter required");
@@ -191,20 +181,16 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     if (resolved.exitCode !== 0 || !/^[a-f0-9]{40}$/i.test(commit)) throw new Error("Fetched base did not resolve to a full immutable commit");
     if (options.baseCommit && commit.toLowerCase() !== options.baseCommit.toLowerCase()) throw new Error("Fetched base changed from caller-authorized commit");
     authorizedBase = commit;
+    authorizedBases.add(commit);
     return commit;
   };
   const ownedRootCandidate = options.ownedRoot ?? join(dirname(options.referencePath), `${basename(options.referencePath)}-wt`);
   mkdirSync(ownedRootCandidate, { recursive: true });
   const ownedRoot = realpathSync(ownedRootCandidate);
-  const journalPath = (id: string) => join(store.dir, "journals", `${id}.json`);
-  const readJournal = async (id: string): Promise<WorkspaceJournal | undefined> => {
-    const path = journalPath(id); if (!existsSync(path)) return undefined;
-    return JSON.parse(readFileSync(path, "utf8")) as WorkspaceJournal;
-  };
-  const writeJournal = async (journal: WorkspaceJournal, expected: WorkspaceJournal | undefined): Promise<void> => {
-    const path = journalPath(journal.workspace.id), current = await readJournal(journal.workspace.id);
-    if (!same(current, expected)) throw new Error("Workspace journal compare-and-swap failed");
-    atomicWrite(path, canonicalJson(journal) + "\n");
+  const readJournal = async (id: string): Promise<WorkspaceJournal | undefined> => store.readWorkspaceJournal(id);
+  const writeJournal = async (journal: WorkspaceJournal, expected: WorkspaceJournal | undefined, writer: { attemptId: string } | { integrationId: string }): Promise<void> => {
+    if (!owner) throw new Error("Execution journal owner unavailable");
+    store.writeWorkspaceJournal(owner, journal, expected, writer);
   };
   const owns = async (workspace: WorkspaceRef, writer: { attemptId: string } | { integrationId: string }): Promise<boolean> => {
     if (!owner) return false;
@@ -216,7 +202,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       ("attemptId" in writer ? reservation.attemptId === writer.attemptId : reservation.integrationId === writer.integrationId));
   };
   const resolveReceipt = async (receiptDigest: string): Promise<ResultReceipt | undefined> => store.read().results.find(receipt => receipt.digest === receiptDigest);
-  const isFetchedBase = async (commit: string): Promise<boolean> => commit === authorizedBase;
+  const isFetchedBase = async (commit: string): Promise<boolean> => authorizedBases.has(commit);
   const runtime = options.runtime ?? (() => {
     if (!options.events) throw new Error("Runtime event bus required");
     return createAttemptRuntime({ events: options.events, sessionFile: options.sessionFile, capacity: options.capacity, remainingBudget: options.remainingBudget, callerTools: options.callerTools, callerAgents: options.callerAgents });
@@ -247,6 +233,11 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
   const scheduler = new ExecutionScheduler({
     store,
     owner: { pid: process.pid, processStart, sessionFile: realpathSync(options.sessionFile), instanceId: randomUUID() },
+    onOwnerAcquired: acquired => {
+      restoreAuthorizedBases();
+      owner = acquired;
+      activeDelivery = recreateDelivery(acquired);
+    },
     runtime,
     workspaces,
     checks,
@@ -257,17 +248,20 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     },
     createReceipt: async ({ attempt, task }) => {
       if (!attempt.preparedHead || !attempt.run || !owner) throw new Error("Exact prepared head/runtime evidence required");
-      const inspection = await workspaces.inspect(attempt.workspace);
-      if (inspection.kind !== "inspected") throw new Error(inspection.reason);
-      const output = task.mode === "mutation"
-        ? { kind: "commits" as const, commit: inspection.head }
-        : (() => {
-            const path = join(attempt.run!.artifactDir, "result.json");
-            if (!existsSync(path)) throw new Error("Read-only runtime result.json is missing");
-            const value = JSON.parse(readFileSync(path, "utf8")) as { path?: unknown; digest?: unknown };
-            if (typeof value.path !== "string" || typeof value.digest !== "string") throw new Error("Read-only result.json lacks canonical artifact identity");
-            return { kind: "artifact" as const, path: value.path, digest: value.digest };
-          })();
+      let output = attempt.terminal?.output;
+      if (!output) {
+        // Compatible recovery of older evidence: canonical JSON digest, not a
+        // hash of current descriptor/artifact bytes and not arbitrary HEAD.
+        const raw = readFileSync(join(attempt.run.artifactDir, "status.json"), "utf8");
+        const header = JSON.parse(readFileSync(attempt.run.ownerSessionFile, "utf8").split("\n")[0]!);
+        if (header.type !== "session" || typeof header.id !== "string") throw new Error("Terminal output owner session unavailable");
+        const decoded = decodeRuntimeStatus(raw, attempt.run, header.id, now());
+        if (decoded.kind !== "known-terminal" || decoded.evidence.outcome !== "succeeded" || decoded.evidence.evidenceDigest !== attempt.terminal?.evidenceDigest) throw new Error("Terminal status changed; exact output recovery refused");
+        output = decoded.evidence.output;
+      }
+      if (!output) throw new Error("Terminal output identity missing; inspect original run evidence before remediation");
+      validateTerminalOutput(output);
+      const frozenOutput = structuredClone(output);
       const result = await collectTaskResult({
         attempt,
         task,
@@ -281,17 +275,12 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
           const state = store.read();
           return !!state.owner && state.owner.epoch === owner!.epoch && state.owner.instanceId === owner!.instanceId && state.reservations.some(reservation => reservation.attemptId === current.id);
         },
-        verifyTerminalOutput: async (current, claimed) => {
-          if (claimed.kind === "commits") {
-            const latest = await workspaces.inspect(current.workspace);
-            return latest.kind === "inspected" && latest.head === claimed.commit;
-          }
-          try { return realpathSync(claimed.path) === claimed.path && statSync(claimed.path).isFile() && createHash("sha256").update(readFileSync(claimed.path)).digest("hex") === claimed.digest; }
-          catch { return false; }
-        },
+        verifyTerminalOutput: async (_current, claimed) => same(frozenOutput, claimed),
         verifyPreparedBase: async (current, preparedHead) => {
-          const latest = await workspaces.inspect(current.workspace);
-          return latest.kind === "inspected" && latest.head === preparedHead && current.prerequisiteDigests.every(id => latest.appliedDigests.includes(id));
+          const journal = await readJournal(current.workspace.id);
+          return !!journal && journal.phase === "complete" && journal.operationId === `prepare:${current.id}` &&
+            same(journal.workspace, current.workspace) && journal.before === current.baseCommit && journal.head === preparedHead &&
+            same(journal.inputDigests, current.prerequisiteDigests) && same(journal.appliedDigests, current.prerequisiteDigests);
         },
         now,
       });
@@ -304,21 +293,22 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       for (const manifest of state.manifests.filter(item => state.activeRevisions[item.id] === item.revision)) {
         for (const group of manifest.deliveryGroups) {
           const current = state.deliveries.find(item => item.groupId === group.id);
-          if (!current || ["pending", "blocked"].includes(current.phase)) {
+          if (!current || ["pending", "blocked", "integrating"].includes(current.phase)) {
             await activeDelivery.integrate(manifest.id, group.id, workspaceForDelivery(manifest, group.id));
           }
           const next = store.read().deliveries.find(item => item.groupId === group.id);
-          if (next?.phase === "ready" && group.policy === "pr") {
-            try { await activeDelivery.handoff(manifest.id, group.id); } catch { /* retain ready state for explicit reconciliation */ }
+          if (next && ["handoff-pending", "controller-owned"].includes(next.phase)) {
+            await activeDelivery.observe(group.id);
+          } else if (next?.phase === "ready" && group.policy === "pr") {
+            await activeDelivery.handoff(manifest.id, group.id);
           }
         }
       }
     },
     now,
   });
-  // Delivery is created before the scheduler owner exists so options can be
-  // assembled without doing I/O in a store transaction; replace its owner
-  // dependent facade at start with the acquired lease.
+  // Bind the facade synchronously after lease acquisition, before recovery
+  // invokes receipt or delivery callbacks. No Git/RPC under the store lock.
   const recreateDelivery = (nextOwner: CoordinatorOwner): ExecutionDelivery => createExecutionDelivery({
     store,
     owner: nextOwner,
@@ -340,12 +330,6 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       if (starting) return starting;
       starting = (async () => {
         await scheduler.start();
-        owner = scheduler.currentOwner();
-        // Derive the exact durable owner from the state after start so the
-        // delivery facade cannot accidentally invent an epoch.
-        owner = store.read().owner;
-        if (!owner) throw new Error("Scheduler failed to acquire coordinator lease");
-        activeDelivery = recreateDelivery(owner);
         await scheduler.reconcile();
         started = true;
       })().finally(() => { starting = undefined; });

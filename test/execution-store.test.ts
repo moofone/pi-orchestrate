@@ -157,3 +157,50 @@ test("execution-store: two processes contending for one repository cannot create
 		await Promise.all(children.map(async child => { const exited = once(child, "exit"); child.send({ kind: "exit" }); await exited; }));
 	}
 });
+
+
+test("execution-store: arbitrary same-PID processStart labels never prove death", () => {
+ const f = fixture();
+ const a = createExecutionStore({ stateRoot: f.root, repo: f.repo, processStart: "session-a" });
+ const owner = a.acquire(createCoordinatorOwner(f.session, "session-a"));
+ const b = createExecutionStore({ stateRoot: f.root, repo: f.repo, processStart: "session-b" });
+ assert.throws(() => b.acquire(createCoordinatorOwner(f.session, "session-b")), /cannot be reclaimed/);
+ a.relinquish(owner);
+ assert.ok(b.acquire(createCoordinatorOwner(f.session, "session-b")).epoch > owner.epoch);
+});
+
+test("execution-store: workspace journal CAS is exclusive and lease/reservation fenced", async () => {
+ const f = fixture(), owner = f.store.acquire(f.identity), attempt = seed(f, owner);
+ const journal = { workspace: attempt.workspace, operationId: `prepare:${attempt.id}`, inputDigests: [], phase: "pending" as const, before: attempt.baseCommit, head: attempt.baseCommit, appliedDigests: [] };
+ const write = async () => f.store.writeWorkspaceJournal(owner, journal, undefined, { attemptId: attempt.id });
+ const outcomes = await Promise.allSettled([write(), write()]);
+ assert.equal(outcomes.filter(o => o.status === "fulfilled").length, 1);
+ assert.equal(outcomes.filter(o => o.status === "rejected").length, 1);
+ assert.deepEqual(f.store.readWorkspaceJournal(attempt.workspace.id), journal);
+ assert.throws(() => f.store.writeWorkspaceJournal(owner, { ...journal, phase: "complete" }, journal, { attemptId: "other" }), /reservation/);
+ f.store.relinquish(owner);
+ const next = f.store.acquire(createCoordinatorOwner(f.session, "next"));
+ assert.throws(() => f.store.writeWorkspaceJournal(owner, { ...journal, phase: "complete" }, journal, { attemptId: attempt.id }), /no longer owner/);
+ assert.deepEqual(f.store.readWorkspaceJournal(attempt.workspace.id), journal);
+ writeFileSync(f.store.lockPath, "");
+ assert.throws(() => f.store.writeWorkspaceJournal(next, { ...journal, phase: "complete" }, journal, { attemptId: attempt.id }), /Incomplete transaction lock/);
+ assert.equal(readFileSync(f.store.lockPath, "utf8"), "");
+});
+
+
+test("execution-store: journal replacement shares the lease lock and interrupted CAS preserves prior bytes", () => {
+ const f = fixture(), owner = f.store.acquire(f.identity), attempt = seed(f, owner);
+ const journal = { workspace: attempt.workspace, operationId: `prepare:${attempt.id}`, inputDigests: [], phase: "pending" as const, before: attempt.baseCommit, head: attempt.baseCommit, appliedDigests: [] };
+ let replaced = false;
+ const hooked = createExecutionStore({ stateRoot: f.root, repo: f.repo, beforeReplace: (_temporary, destination) => {
+  assert.ok(destination.endsWith(`${attempt.workspace.id}.json`));
+  assert.throws(() => f.store.relinquish(owner), (e: unknown) => e instanceof ExecutionStoreError && e.kind === "contention");
+  assert.throws(() => f.store.writeWorkspaceJournal(owner, journal, undefined, { attemptId: attempt.id }), /Transaction lock/);
+  replaced = true;
+ } });
+ hooked.writeWorkspaceJournal(owner, journal, undefined, { attemptId: attempt.id }); assert.ok(replaced);
+ const failing = createExecutionStore({ stateRoot: f.root, repo: f.repo, beforeReplace: () => { throw new Error("crash before journal rename"); } });
+ assert.throws(() => failing.writeWorkspaceJournal(owner, { ...journal, phase: "complete" }, journal, { attemptId: attempt.id }), /crash before journal rename/);
+ assert.deepEqual(f.store.readWorkspaceJournal(attempt.workspace.id), journal);
+ assert.deepEqual(f.store.read().owner, owner);
+});

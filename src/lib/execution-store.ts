@@ -3,9 +3,11 @@ import { execFileSync } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
-	canonicalJson, digest, emptyCoordinatorState, validateCoordinatorState, validateStateChange,
+	canonicalJson, digest, emptyCoordinatorState, validateCoordinatorState, validateStateChange, workspaceExcludedByDelivery,
 	type CoordinatorIntent, type CoordinatorOwner, type CoordinatorState, type RepoIdentity,
 } from "./execution-contract.ts";
+
+import type { WorkspaceJournal } from "./task-workspaces.ts";
 
 export function canonicalRepoIdentity(cwd: string, git: (cwd: string) => string = path => execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path, encoding: "utf8" }).trim()): RepoIdentity {
 	const commonDir = realpathSync(resolve(cwd, git(cwd)));
@@ -32,7 +34,7 @@ export class ExecutionStoreError extends Error {
 export type ExecutionStoreOptions = {
 	stateRoot: string; repo: RepoIdentity;
 	probeOwner?: (owner: CoordinatorOwner) => OwnerLiveness;
-	/** Host process start identity used to distinguish a reused PID during startup. */
+	/** Diagnostic identity only; labels never prove that a live PID died. */
 	processStart?: string;
 	/** Failure injection; called after durable temp write, before atomic replacement. */
 	beforeReplace?: (temporaryPath: string, destinationPath: string) => void;
@@ -47,6 +49,9 @@ export type ExecutionStore = {
 	/** Admission must remain stopped until the new epoch has reconciled recorded work. */
 	markReconciled(owner: CoordinatorOwner): CoordinatorState;
 	appendIntent(intent: CoordinatorIntent): CoordinatorState;
+	readWorkspaceJournal(workspaceId: string): WorkspaceJournal | undefined;
+	/** Data-only CAS under the lease transaction lock; owner and writer rechecked at commit. */
+	writeWorkspaceJournal(owner: CoordinatorOwner, journal: WorkspaceJournal, expected: WorkspaceJournal | undefined, writer: { attemptId: string } | { integrationId: string }): void;
 };
 function sameOwner(a: CoordinatorOwner | undefined, b: CoordinatorOwner): boolean {
 	return !!a && canonicalJson(a) === canonicalJson(b);
@@ -64,11 +69,7 @@ export function createExecutionStore(options: ExecutionStoreOptions): ExecutionS
 	const dir = join(options.stateRoot, "execution", options.repo.id);
 	mkdirSync(dir, { recursive: true });
 	const statePath = join(dir, "coordinator.json"), lockPath = join(dir, "transaction.lock");
-	const probe = options.probeOwner ?? ((owner: CoordinatorOwner): OwnerLiveness => {
-		const liveness = probeOwnerProcess(owner);
-		if (liveness === "alive" && options.processStart && owner.pid === process.pid && owner.processStart !== options.processStart) return "dead";
-		return liveness;
-	});
+	const probe = options.probeOwner ?? probeOwnerProcess;
 	function read(): CoordinatorState {
 		if (!existsSync(statePath)) return emptyCoordinatorState(options.repo);
 		try {
@@ -147,7 +148,33 @@ export function createExecutionStore(options: ExecutionStoreOptions): ExecutionS
 			state.intents.push(intent); state.sequence++; write(state); return state;
 		});
 	}
-	return { dir, statePath, lockPath, read, acquire, relinquish, transact, appendIntent,
+	function journalPath(id: string): string {
+		if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id)) throw new Error("Unsafe journal identity");
+		return join(dir, "journals", `${id}.json`);
+	}
+	function readWorkspaceJournal(id: string): WorkspaceJournal | undefined {
+		const path = journalPath(id);
+		return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as WorkspaceJournal : undefined;
+	}
+	function writeWorkspaceJournal(owner: CoordinatorOwner, journal: WorkspaceJournal, expected: WorkspaceJournal | undefined, writer: { attemptId: string } | { integrationId: string }): void {
+		locked(owner, () => {
+			const state = read(); assertOwner(state, owner);
+			const workspace = journal.workspace;
+			const reserved = state.reservations.some(r => r.workspaceId === workspace.id && r.workspacePath === workspace.path && ("attemptId" in writer ? r.attemptId === writer.attemptId : r.integrationId === writer.integrationId));
+			const recorded = "attemptId" in writer ? state.attempts.find(a => a.id === writer.attemptId)?.workspace : state.integrations.find(i => i.id === writer.integrationId)?.workspace;
+			if (!reserved || !recorded || digest(recorded) !== digest(workspace) || workspaceExcludedByDelivery(state, workspace)) throw new Error("Missing exclusive workspace reservation");
+			const current = readWorkspaceJournal(workspace.id);
+			if (current === undefined ? expected !== undefined : expected === undefined || digest(current) !== digest(expected)) throw new Error("Workspace journal compare-and-swap failed");
+			const path = journalPath(workspace.id), directory = dirname(path);
+			mkdirSync(directory, { recursive: true }); syncDirectory(dir);
+			const temporary = `${path}.${randomUUID()}.tmp`, fd = openSync(temporary, "wx", 0o600);
+			try { writeFileSync(fd, canonicalJson(journal) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+			options.beforeReplace?.(temporary, path);
+			renameSync(temporary, path); syncDirectory(directory);
+		});
+	}
+
+	return { dir, statePath, lockPath, read, acquire, relinquish, transact, appendIntent, readWorkspaceJournal, writeWorkspaceJournal,
 		markReconciled: owner => transact(owner, draft => { draft.reconciledEpoch = owner.epoch; }),
 	};
 }

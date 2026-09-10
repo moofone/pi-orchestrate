@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { digest, taskRevisionDigest, type AttemptRuntime, type ExecutionProfile, type LaunchOutcome, type LaunchRequest, type Observation, type RunRef, type RuntimeCapabilities } from "./execution-contract.ts";
+import { digest, taskRevisionDigest, validateTerminalOutput, type AttemptRuntime, type ExecutionProfile, type LaunchOutcome, type LaunchRequest, type Observation, type RunRef, type RuntimeCapabilities } from "./execution-contract.ts";
 import { resolveExecutionProfile } from "./execution-policy.ts";
 
 /** Structurally compatible with ExtensionAPI.events. No private runtime imports. */
@@ -44,7 +44,9 @@ export function decodeRuntimeStatus(raw: string, run: RunRef, ownerSessionId: st
   else if (status.state === "stopped") outcome = "stopped";
   else if (["failed", "partial", "rejected"].includes(String(status.state))) outcome = "failed";
   else return unknown("Contradictory terminal status");
-  return { kind: "known-terminal", evidence: { kind: "terminal", run, outcome, evidenceDigest: digest(status), observedAt: now } };
+  const output = outcome === "succeeded" ? steps[0]?.structuredOutput : undefined;
+  if (output !== undefined) validateTerminalOutput(output);
+  return { kind: "known-terminal", evidence: { kind: "terminal", run, outcome, evidenceDigest: digest(status), observedAt: now, ...(output !== undefined ? { output: structuredClone(output) } : {}) } };
  } catch { return unknown("Malformed runtime status artifact"); }
 }
 
@@ -107,7 +109,12 @@ export function createAttemptRuntime(options: AttemptRuntimeOptions): AttemptRun
    if (caps.capacity <= 0) { const reason = "Runtime capacity unavailable"; return { kind: "capacity-deferred", reason, evidence: { kind: "not-started", launchDigest: attempt.launchDigest, reason } }; }
    if (!profile.agent) return reject("Single launch requires resolved agent", "capability");
    if (profile.thinking && !profile.model) return reject("Thinking override requires a resolved model", "capability");
-   const params: RecordData = { agent: profile.agent, task: request.task.text, cwd: attempt.workspace.path, async: true, worktree: false };
+   // Public RPC spawn normalizes SubagentParams.outputSchema (not structuredOutput).
+   const outputSchema = request.task.mode === "mutation"
+    ? { type: "object", additionalProperties: false, required: ["kind", "commit"], properties: { kind: { const: "commits" }, commit: { type: "string", pattern: "^[a-f0-9]{40}([a-f0-9]{24})?$" } } }
+    : { type: "object", additionalProperties: false, required: ["kind", "path", "digest"], properties: { kind: { const: "artifact" }, path: { type: "string" }, digest: { type: "string", pattern: "^[a-f0-9]{64}$" } } };
+   const taskText = `${request.task.text}\n\nFinish with structured_output: ${request.task.mode === "mutation" ? 'exact output identity {"kind":"commits","commit":"<full final commit SHA>"}; commit only in-scope changes in this workspace' : '{"kind":"artifact","path":"<canonical absolute artifact path inside this run artifact directory>","digest":"<SHA256 of exact artifact bytes>"}; do not change Git HEAD'}. No push, PR creation, or new worktree.`;
+   const params: RecordData = { outputSchema, agent: profile.agent, task: taskText, cwd: attempt.workspace.path, async: true, worktree: false };
    for (const key of ["model", "context", "timeoutMs"] as const) if (profile[key] !== undefined) params[key] = profile[key];
    if (profile.thinking) params.model = `${profile.model}:${profile.thinking}`;
    if (options.profileEncoder) {
@@ -116,7 +123,7 @@ export function createAttemptRuntime(options: AttemptRuntimeOptions): AttemptRun
     Object.assign(params, encoded);
    }
    // Never allow an injected profile mapping to alter launch identity/isolation.
-   Object.assign(params, { agent: profile.agent, task: request.task.text, cwd: attempt.workspace.path, async: true, worktree: false });
+   Object.assign(params, { outputSchema, agent: profile.agent, task: taskText, cwd: attempt.workspace.path, async: true, worktree: false });
    if (attempt.operationId && caps.durableOperationLookup) params.operationId = attempt.operationId;
    const reply = await rpc("spawn", params);
    if (reply.success !== true) {
