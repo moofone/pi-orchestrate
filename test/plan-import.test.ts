@@ -97,6 +97,26 @@ test("plan-import: normalized argv refuses shell, traversal, inline code and mis
 	assert.equal(normalizeCheck({ ...check, runner: "command", argv: ["tsc", "--noEmit"], expectedEvidence: { requiredTests: [], rationale: "Type safety" } }).runner, "command");
 });
 
+for (const argv of [
+	["python3", "-cprint(123)"], ["python", "-cprint(123)"], ["python3.12", "-cprint(123)"],
+	["node", "-econsole.log(123)"], ["node", "-p123"], ["node", "-r./hook.js"],
+	["ruby", "-eputs(123)"], ["perl", "-eprint(123)"], ["perl", "-Eprint(123)"], ["php", "-recho(123)"],
+]) test(`plan-import: refuses attached interpreter payload ${argv.join(" ")}`, () => {
+	assert.throws(() => normalizeCheck({ id: "inline", cwd: ".", argv, runner: "command", expectedEvidence: { requiredTests: [], rationale: "Validation" } }), /Inline code\/loader checks forbidden/);
+});
+
+test("plan-import: ordinary check argv stays unchanged despite similar option prefixes", () => {
+	for (const argv of [
+		["python3", "-m", "pytest", "test/"], ["node", "--test", "test/check.test.js"],
+		["ruby", "test/check.rb"], ["perl", "test/check.pl"], ["php", "-l", "check.php"],
+		["tsc", "-pconfig.json", "--noEmit"], ["cargo", "test", "-pcrate"],
+		["vitest", "run", "--coverage"], ["npm", "run", "check"],
+	]) {
+		const check = { id: "ordinary", cwd: ".", argv, runner: "command", expectedEvidence: { requiredTests: [], rationale: "Validation" } };
+		assert.deepEqual(normalizeCheck(check), check);
+	}
+});
+
 test("plan-import: source snapshots retain bytes and never auto-refresh approved revisions", async () => {
 	const dir = await mkdtemp(`${tmpdir()}/plan-import-`), path = `${dir}/plan with spaces.md`;
 	await writeFile(path, "\ufeff# Original\r\n"); const source = await importPlanSource(path);

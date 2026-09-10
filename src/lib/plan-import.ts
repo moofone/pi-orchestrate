@@ -26,7 +26,7 @@ function keys(value: unknown, allowed: string[]): void {
 function relativePath(path: string): boolean {
 	return !isAbsolute(path) && !path.includes("\\") && !path.split("/").includes("..") && !/[\x00-\x1f]/.test(path) && posix.normalize(path) === path;
 }
-/** Structural safety only, not a grant to execute a command. U3 still enforces execution policy. */
+/** Bounded argument-shape validation, not a universal code-execution filter or execution grant. U3 still enforces execution policy. */
 export function normalizeCheck(value: unknown): CheckSpec {
 	validateCheckSpec(value);
 	keys(value, ["id", "cwd", "argv", "runner", "expectedEvidence"]);
@@ -38,6 +38,14 @@ export function normalizeCheck(value: unknown): CheckSpec {
 	requireThat(/^[a-zA-Z0-9_.+-]+$/.test(executable), "Check executable must be a bare program name");
 	requireThat(!/^(?:ba|da|z|fi|k|c)?sh$|^(?:cmd|powershell|pwsh|eval|env|sudo|git|rm)$/i.test(executable), "Unsafe check executable");
 	requireThat(!value.argv.some(arg => /^(?:-e|-p|-c|--eval|--print|--require|--import|--loader)(?:=|$)/.test(arg)), "Inline code/loader checks forbidden");
+	// These interpreter short options consume the rest of the same token as a payload.
+	// Match only named CLI grammars: e.g. Cargo/tsc -p is not an inline-code option.
+	const attachedPayload = /^(?:python(?:\d+(?:\.\d+)*)?)$/.test(executable) ? /^-c/
+		: /^(?:node|nodejs)$/.test(executable) ? /^-[epr]/
+		: executable === "ruby" ? /^-e/
+		: executable === "perl" ? /^-[eE]/
+		: executable === "php" ? /^-r/ : undefined;
+	if (attachedPayload) requireThat(!value.argv.slice(1).some(arg => attachedPayload.test(arg)), "Inline code/loader checks forbidden");
 	if (value.runner === "node") requireThat(executable === "node" && value.argv.includes("--test"), "Node check must run tests");
 	if (value.runner === "vitest") requireThat(executable === "vitest" && value.argv.includes("run"), "Vitest check must use run");
 	if (value.runner === "cargo") requireThat(executable === "cargo" && value.argv[1] === "test", "Cargo check must use test");
