@@ -207,7 +207,7 @@ Use ordinary TypeScript modules and Node filesystem primitives; do not introduce
 - `TaskAttempt`: task revision digest, attempt UUID, canonical owner session file, launch digest, optional operation ID, run ID/artifact directory, workspace, base/prerequisite receipts, and lifecycle state.
 - `ResultReceipt`: producing attempt, validated output path or committed range, check results, and immutable digest. Dependents consume receipts, not another worker's changing branch.
 - `IntegrationReceipt`: target delivery group, ordered input receipts, before/after commit, validation evidence, and ownership transfer acknowledgement where applicable.
-- `CoordinatorState`: active manifest revisions, task/attempt records, resource reservations, owner/epoch, and monotonic event sequence. Existing Markdown status and overlays become projections for new runs.
+- `CoordinatorState`: active manifest revisions, task/attempt records, resource reservations, repository-wide authorized `capacity`, owner/epoch, and monotonic event sequence. Capacity starts at zero until caller authorization is recorded; feature concurrency requests never add to or raise it. Transactions reject reservations exceeding capacity and reject reductions below existing reserved occupancy without changing state or stopping workers. Existing Markdown status and overlays become projections for new runs.
 
 Core injectable interfaces are `AttemptRuntime` (`probe`, `launch`, `observe`, `control`, completion subscription), `WorkspaceAdapter` (`prepare`, `inspect`, `compose`), `CheckExecutor` (`execute`, `validateEvidence`), and `DeliveryAdapter` (`handoff`, `observe`).
 Methods return discriminated results such as known-running, known-terminal, rejected-before-start, capacity-deferred, and unknown; text is explanatory, never a completion protocol.
@@ -238,7 +238,7 @@ Already-running children retain their original contracts, and reload disposes on
 ### Scheduling, ownership, and recovery
 
 - Put a repository coordinator lease and durable state beside the existing repository feature records, keyed by canonical Git common-directory identity so worktrees of the same repository do not create separate pools.
-- Use short locked state transactions with atomic replacement and durable writes; release the transaction lock before RPC or Git work. Keep child lifetime ownership in durable reservations, not in a held JavaScript mutex.
+- Use short locked state transactions with atomic replacement and durable writes; release the transaction lock before RPC or Git work. Keep child lifetime ownership in durable reservations, not in a held JavaScript mutex. U1 uses exclusive-create transaction locks with bounded acquisition; an abandoned or incomplete transaction lock reports recovery-needed and requires explicit manual resolution rather than unsafe automatic lock stealing. Preserve owner diagnostics, state, and reservations while blocked; coordinator-lease recovery remains separate from transaction-lock recovery.
 - A coordinator owner includes PID/start identity, canonical session file, coordinator-instance UUID, and epoch. Clean shutdown/reload quiesces admission, invalidates the old epoch, and atomically relinquishes or transfers the coordinator lease without releasing child/workspace reservations. This permits same-PID reload to acquire a new epoch; late callbacks from the previous instance cannot mutate current state. Reclaim an uncooperative owner's lease only after proven owner death, never on heartbeat expiry alone.
 - A second live session can record authorized plan/control intents for the owner to consume, but cannot start a competing pool. Poll only locally persisted intents in code when no event route exists; no model-driven wait loop or cross-session capability override.
 - Task lifecycle: pending/dependency-blocked, ready, preparing, launching, running, validating, succeeded; orthogonal pause/cancel intent plus failed and recovery-needed outcomes. A delivery group becomes ready only from its required validated receipts.
@@ -398,11 +398,25 @@ Updated during implementation at the user's request. A unit is checked off only 
 | Unit | Progress | Evidence |
 |---|---|---|
 | Baseline | Complete | Fresh upstream `9a185f7`; typecheck and 504 tests pass after correcting an obsolete skill-text assertion in the isolated worktree |
-| U1 | In progress | Contracts and durable state; sole writer in `feat/plan-driven-orchestration` |
-| U2 | Pending | Waits for U1 contracts |
-| U3 | Pending | Waits for U1 contracts |
-| U4 | Pending | Waits for U1 contracts |
-| U5 | Pending | Waits for U1 contracts |
-| U6 | Pending | Waits for U1 contracts |
+| U1 | Complete | Commits `8c272b8`, `04480ae`; four review regressions red→green; typecheck and 533 tests pass; independent recheck READY |
+| U2 | In progress | Isolated branch `feat/plan-driven-u2-import` |
+| U3 | In progress | Isolated branch `feat/plan-driven-u3-runtime` |
+| U4 | In progress | Isolated branch `feat/plan-driven-u4-workspaces` |
+| U5 | In progress | Isolated branch `feat/plan-driven-u5-scheduler` |
+| U6 | In progress | Isolated branch `feat/plan-driven-u6-delivery` |
 | U7 | Pending | Waits for U2–U6 integration |
 | U8 | Pending | Waits for integrated implementation |
+
+### Active lane ownership
+
+All five lanes start from reviewed U1 commit `04480ae`, with no missing upstream commits at launch. Their shared contracts and fixtures are read-only; any necessary contract revision returns to the parent. Workers validate and commit only their claimed files, without pushing, opening PRs, or cleaning up worktrees.
+
+| Lane | Isolated workspace, relative to reference repo | Exclusive claim | Next gate |
+|---|---|---|---|
+| U2 | `../pi-orchestrate-wt/feat-plan-driven-u2-import` | Plan import/preset modules, their tests and dedicated import fixtures | Targeted tests, full check, fresh review |
+| U3 | `../pi-orchestrate-wt/feat-plan-driven-u3-runtime` | Runtime/policy/check modules, their tests and dedicated report fixtures | Targeted tests, full check, fresh review |
+| U4 | `../pi-orchestrate-wt/feat-plan-driven-u4-workspaces` | Task-workspace module, its tests and dedicated workspace fixtures | Targeted tests, full check, fresh review |
+| U5 | `../pi-orchestrate-wt/feat-plan-driven-u5-scheduler` | Execution-scheduler module and its tests | Targeted tests, full check, fresh review |
+| U6 | `../pi-orchestrate-wt/feat-plan-driven-u6-delivery` | Execution-delivery module and its tests | Targeted tests, full check, fresh review |
+
+Parent integration workspace: `../pi-orchestrate-wt/feat-plan-driven-orchestration`. Parent owns Markdown progress, shared-contract changes, integration, and U7 wiring.
