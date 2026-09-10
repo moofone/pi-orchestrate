@@ -10,12 +10,16 @@ import { prKeyId } from "../src/lib/pr-review-identity.ts";
 import type { ObligationView, ReviewController } from "../src/lib/pr-review-controller.ts";
 import { fakeManifest, fakeAuthorization, fakeAttempt, fakeCheck, fakeWorkspace, FakeCheckExecutor, FakeWorkspaceAdapter, FakeDeliveryAdapter } from "./fixtures/execution/fakes.ts";
 
-function fixture({ pr = false, count = 2, combined = true, shared = false } = {}) {
+function fixture({ pr = false, count = 2, combined = true, shared = false, split = false, artifact = false } = {}) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "execution-delivery-")));
 	const manifest = fakeManifest(count); manifest.repo = { commonDir: root, id: digest(root) };
 	const group = manifest.deliveryGroups[0]!;
 	if (pr) { group.policy = "pr"; group.completion = "merged"; }
 	if (combined) group.checks = [fakeCheck()];
+	if (split) {
+		const second = { ...structuredClone(group), id: "delivery-b", requiredTaskIds: [manifest.tasks[1]!.id] };
+		group.requiredTaskIds = [manifest.tasks[0]!.id]; manifest.tasks[1]!.deliveryGroupId = second.id; manifest.deliveryGroups.push(second);
+	}
 	if (shared) { manifest.features.push({ id: "feature-b", title: "B", scope: "feature-a" }); group.featureIds.push("feature-b"); manifest.tasks[1]!.featureId = "feature-b"; group.ownerId = "approved-shared-owner"; }
 	const store = createExecutionStore({ stateRoot: root, repo: manifest.repo });
 	const owner = store.acquire({ pid: process.pid, processStart: "fixture", sessionFile: join(root, "session"), instanceId: "instance" });
@@ -29,6 +33,7 @@ function fixture({ pr = false, count = 2, combined = true, shared = false } = {}
 			attempt.terminal = { kind: "terminal", run: attempt.run, outcome: "succeeded", evidenceDigest: `terminal-${index}`, observedAt: 2 };
 			attempt.phase = "succeeded";
 			const body: Omit<ResultReceipt, "digest"> = { schemaVersion: 1, attemptId: attempt.id, taskId: task.id, taskDigest: attempt.taskDigest, repoId: manifest.repo.id, baseCommit: manifest.baseCommit, prerequisiteDigests: [], output: { kind: "commits", from: manifest.baseCommit, to: `commit-${index}`, commits: [`commit-${index}`], paths: [`src/${index}.ts`] }, checks: [], validatedAt: 3 };
+			if (artifact && index === 1) body.output = { kind: "artifact", path: join(root, "artifact.json"), digest: "artifact-digest" };
 			const receipt = { ...body, digest: receiptDigest(body) }; attempt.resultDigest = receipt.digest;
 			state.attempts.push(attempt); state.results.push(receipt);
 			state.tasks.push({ taskId: task.id, manifestId: manifest.id, phase: "succeeded", intent: "none", attemptIds: [attempt.id], resultDigest: receipt.digest });
@@ -223,4 +228,77 @@ test("execution-delivery positive test count without required report is remediat
 	f.checks.execute = async (...args) => { const evidence = await execute(...args); delete evidence.reportDigest; return evidence; };
 	assert.equal((await f.api.integrate(f.manifest.id, f.group.id, f.target)).kind, "remediation-required");
 	assert.equal(f.store.read().integrationReceipts.length, 0);
+});
+
+
+test("execution-delivery excludes canonical PR aliases across groups, including existing raw mappings", async () => {
+	for (const existingRepo of ["github.com/acme/repo", "GitHub.com/Acme/Repo.git"]) {
+		const f = fixture({ pr: true, split: true });
+		const other = { ...f.target, id: "delivery-workspace-b", path: f.target.path + "-b" };
+		f.workspace.inspections.set(other.id, { kind: "inspected", workspace: other, head: f.manifest.baseCommit, clean: true, appliedDigests: [] });
+		f.workspace.compose = async ({ intent }) => {
+			f.workspace.inspections.set(intent.workspace.id, { kind: "inspected", workspace: intent.workspace, head: "combined-head", clean: true, appliedDigests: intent.inputDigests });
+			return { kind: "prepared", workspace: intent.workspace, head: "combined-head" };
+		};
+		await f.api.integrate(f.manifest.id, f.group.id, f.target);
+		await f.api.integrate(f.manifest.id, "delivery-b", other);
+		const first = await f.api.handoff(f.manifest.id, f.group.id);
+		if (existingRepo !== "github.com/acme/repo") {
+			// Simulate a pre-canonicalization mapping after proven non-transfer; otherwise retain the pending fence.
+			f.delivery.observations.set(first.handoff!.id, { kind: "not-transferred", reason: "not transferred" });
+			await f.api.observe(f.group.id);
+			f.store.transact(f.owner, state => { state.deliveries[0]!.handoff!.pr.repo = existingRepo; });
+		}
+		const api = createExecutionDelivery({ ...f.options, resolvePr: async () => ({ kind: "authorized", pr: { repo: "GitHub.com/Acme/Repo", number: 42 }, generation: "gen-1" }) });
+		await assert.rejects(api.handoff(f.manifest.id, "delivery-b"), /PR already mapped/);
+		assert.equal(f.delivery.handoffs.length, 1);
+		assert.equal(f.store.read().deliveries[1]!.handoff, undefined);
+	}
+});
+
+test("execution-delivery canonicalizes authorized binding before request identity and rejects invalid slugs", async () => {
+	const f = fixture({ pr: true }); await f.api.integrate(f.manifest.id, f.group.id, f.target);
+	for (const repo of ["invalid", "github.com/../repo"]) {
+		const api = createExecutionDelivery({ ...f.options, resolvePr: async () => ({ kind: "authorized", pr: { repo, number: 42 }, generation: "gen-1" }) });
+		await assert.rejects(api.handoff(f.manifest.id, f.group.id), /Invalid authorized PR binding/);
+		assert.equal(f.store.read().deliveries[0]!.handoff, undefined);
+	}
+	const api = createExecutionDelivery({ ...f.options, resolvePr: async () => ({ kind: "authorized", pr: { repo: "GitHub.com/Acme/Repo.git", number: 42 }, generation: "gen-1" }) });
+	const request = (await api.handoff(f.manifest.id, f.group.id)).handoff!;
+	assert.deepEqual(request.pr, { repo: "github.com/acme/repo", number: 42 });
+	const { id, ...body } = request;
+	assert.equal(id, `handoff-${digest(body)}`);
+});
+
+test("execution-delivery requires exact ordered composition including artifact provenance at unchanged HEAD", async () => {
+	for (const change of ["clear", "reverse", "omit-artifact", "extra"] as const) {
+		const f = fixture({ pr: true, artifact: true });
+		const integrated = await f.api.integrate(f.manifest.id, f.group.id, f.target);
+		assert.equal(integrated.kind, "ready");
+		if (integrated.kind !== "ready") return;
+		const inputs = integrated.receipt.inputDigests;
+		const appliedDigests = change === "clear" ? [] : change === "reverse" ? [...inputs].reverse() : change === "omit-artifact" ? inputs.slice(0, 1) : [...inputs, "extra"];
+		f.workspace.inspections.set(f.target.id, { kind: "inspected", workspace: f.target, head: integrated.receipt.afterCommit, clean: true, appliedDigests });
+		let resolutions = 0;
+		const api = createExecutionDelivery({ ...f.options, resolvePr: async () => { resolutions++; return f.options.resolvePr(); } });
+		await assert.rejects(api.handoff(f.manifest.id, f.group.id), /no longer matches validated receipt/);
+		assert.equal(resolutions, 0); assert.equal(f.delivery.handoffs.length, 0);
+		assert.equal(f.store.read().deliveries[0]!.handoff, undefined);
+	}
+});
+
+test("controller adapter accepts canonical aliases without permitting retargeting", async () => {
+	const f = fixture({ pr: true }); await f.api.integrate(f.manifest.id, f.group.id, f.target);
+	let view: ObligationView | undefined, calls = 0;
+	const adapter = createControllerDeliveryAdapter({ controller: {
+		status: () => view ? [view] : [],
+		handoff: request => { calls++; view = { pr: prKeyId(request.pr), owner: request.owner, worktree: request.worktree, head: request.head!, state: "waiting_review", pendingCount: 0 }; return { ok: true, state: "waiting_review" }; },
+	}, controllerId: "controller", prKey: () => ({ host: "GitHub.com", owner: "Acme", repo: "Repo.git", number: "42" }), acknowledged: () => undefined, verifyMerge: async () => undefined });
+	const api = createExecutionDelivery({ ...f.options, delivery: adapter });
+	const result = await api.handoff(f.manifest.id, f.group.id);
+	assert.equal(result.phase, "controller-owned"); assert.equal(calls, 1);
+	for (const repo of ["github.com/other/repo", "github.com/acme/other", "other.com/acme/repo"]) {
+		assert.equal((await adapter.handoff({ ...result.handoff!, pr: { repo, number: 42 } })).kind, "unknown");
+	}
+	assert.equal(calls, 1);
 });

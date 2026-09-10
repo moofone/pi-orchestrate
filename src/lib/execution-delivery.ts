@@ -7,7 +7,7 @@ import {
 } from "./execution-contract.ts";
 import type { ExecutionStore } from "./execution-store.ts";
 import type { ReviewController } from "./pr-review-controller.ts";
-import { prKeyId, type PrKey } from "./pr-review-identity.ts";
+import { parsePrKey, prKeyId, samePrKey, type PrKey } from "./pr-review-identity.ts";
 
 export type RemediationProposal = {
 	kind: "remediation-required"; groupId: string; taskIds: string[]; inputDigests: string[];
@@ -59,6 +59,11 @@ function record(state: CoordinatorState, groupId: string): DeliveryRecord {
 	return delivery;
 }
 function sameWorkspace(a: WorkspaceRef, b: WorkspaceRef): boolean { return digest(a) === digest(b); }
+function bindingKey(pr: HandoffRequest["pr"]): PrKey {
+	const key = parsePrKey({ slug: pr.repo, pr: pr.number });
+	if (!key || !Number.isSafeInteger(pr.number) || pr.number < 1) throw new Error("Invalid authorized PR binding");
+	return key;
+}
 function validAck(request: HandoffRequest, ack: HandoffAcknowledgement): boolean {
 	return ack.requestId === request.id && ack.generation === request.generation && !!ack.controllerId && !!ack.obligationId && Number.isSafeInteger(ack.acceptedAt) && ack.acceptedAt >= 0;
 }
@@ -209,18 +214,19 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
 			const receipt = state.integrationReceipts.find(r => r.digest === d.integrationDigest)!;
 			const intent = state.integrations.find(i => i.id === receipt.intentId)!;
 			const inspected = await workspace.inspect(intent.workspace);
-			if (inspected.kind !== "inspected" || !sameWorkspace(inspected.workspace, intent.workspace) || !inspected.clean || inspected.inProgress || inspected.head !== receipt.afterCommit) throw new Error("Delivery workspace no longer matches validated receipt");
+			if (inspected.kind !== "inspected" || !sameWorkspace(inspected.workspace, intent.workspace) || !inspected.clean || inspected.inProgress || inspected.head !== receipt.afterCommit || digest(inspected.appliedDigests) !== digest(receipt.inputDigests)) throw new Error("Delivery workspace no longer matches validated receipt");
 			const binding = await options.resolvePr({ manifest, group, receipt, workspace: intent.workspace });
 			if (binding.kind !== "authorized") throw new Error(`PR binding ${binding.kind}: ${binding.reason}`);
-			if (!binding.pr.repo || !Number.isSafeInteger(binding.pr.number) || binding.pr.number < 1 || !binding.generation) throw new Error("Invalid authorized PR binding");
-			const body = { deliveryGroupId: groupId, ownerId: group.ownerId, generation: binding.generation, pr: binding.pr, workspace: intent.workspace, head: receipt.afterCommit, integrationDigest: receipt.digest };
+			const pr = bindingKey(binding.pr);
+			if (!binding.generation) throw new Error("Invalid authorized PR binding");
+			const body = { deliveryGroupId: groupId, ownerId: group.ownerId, generation: binding.generation, pr: { repo: `${pr.host}/${pr.owner}/${pr.repo}`, number: binding.pr.number }, workspace: intent.workspace, head: receipt.afterCommit, integrationDigest: receipt.digest };
 			const request: HandoffRequest = { id: `handoff-${digest(body)}`, ...body };
 			mutate(draft => {
 				const current = record(draft, groupId);
 				if (current.phase !== "ready" || current.integrationDigest !== receipt.digest) throw new Error("Delivery changed before handoff");
 				if (draft.reservations.some(r => r.workspaceId === request.workspace.id || r.workspacePath === request.workspace.path)) throw new Error("Delivery workspace has an active writer");
 				if (draft.deliveries.some(other => other.groupId !== groupId && deliveryFenced(other) && other.handoff && (other.handoff.workspace.id === request.workspace.id || other.handoff.workspace.path === request.workspace.path))) throw new Error("Workspace owned by another delivery controller");
-				if (draft.deliveries.some(other => other.groupId !== groupId && other.handoff && digest(other.handoff.pr) === digest(request.pr))) throw new Error("PR already mapped to another delivery group; approve one shared group");
+				if (draft.deliveries.some(other => other.groupId !== groupId && other.handoff && samePrKey(bindingKey(other.handoff.pr), pr))) throw new Error("PR already mapped to another delivery group; approve one shared group");
 				current.phase = "handoff-pending"; current.handoff = request; delete current.nonTransfer;
 			});
 			let observation: DeliveryObservation;
@@ -244,8 +250,9 @@ export type ControllerDeliveryOptions = {
 };
 export function createControllerDeliveryAdapter(options: ControllerDeliveryOptions): DeliveryAdapter {
 	function key(request: HandoffRequest): PrKey {
-		const pr = options.prKey(request);
-		if (`${pr.host}/${pr.owner}/${pr.repo}` !== request.pr.repo || pr.number !== String(request.pr.number)) throw new Error("PR identity mapping mismatch (repo must be host/owner/repo)");
+		const mapped = options.prKey(request);
+		const pr = parsePrKey({ ...mapped, pr: mapped.number });
+		if (!pr || !samePrKey(pr, bindingKey(request.pr))) throw new Error("PR identity mapping mismatch (repo must be host/owner/repo)");
 		return pr;
 	}
 	async function observe(request: HandoffRequest): Promise<DeliveryObservation> {
