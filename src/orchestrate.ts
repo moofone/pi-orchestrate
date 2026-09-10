@@ -2951,7 +2951,7 @@ async function makeExecutionBridge(
   if (!events) throw new Error("Pi event RPC bus unavailable");
   // pr-await-latch owns the durable controller. This is a process-local request
   // only; no second controller or synthetic legacy Feature is constructed here.
-  const controller = await requestExecutionController(events, { repo, repoName: paths.repo, sessionFile });
+  const controller = await requestExecutionController(events, { repo, stateRoot: ORCH_ROOT, repoName: paths.repo, sessionFile });
   const preset = config.executionPreset === "legacy" ? "legacy" : "plan-driven";
   const interpretationProfile = config.interpretationProfile && typeof config.interpretationProfile === "object" && !Array.isArray(config.interpretationProfile)
     ? config.interpretationProfile as ExecutionProfile
@@ -6359,7 +6359,10 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
     void reconcileLiveFeaturePrs(pi, ctx);
     armReconcileTimer(pi, ctx);
     try {
-      await executionHost.reload(async signal => makeExecutionBridge(pi, ctx as unknown as ExtensionCommandContext, await resolvePaths(pi, ctx), signal));
+      const bridge = await executionHost.reload(async signal => makeExecutionBridge(pi, ctx as unknown as ExtensionCommandContext, await resolvePaths(pi, ctx), signal));
+      // Startup only resumes durable work previously owned by this exact
+      // persisted session. Other sessions construct a lease-free observer.
+      await bridge.start({ resumePriorOwner: true });
     } catch (error) {
       uiNotify(ctx, `Execution startup unavailable: ${String(error)}`, "warning");
     }

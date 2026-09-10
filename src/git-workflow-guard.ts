@@ -11,9 +11,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	classifyForRole,
 	classifyViewRepeat,
-	isWorktreeMutation,
 	mutationTargetDirs,
 	durableExecutionReservation,
+	verifiedDurableExecutionReservation,
 	durableExecutionWorkspaceFence,
 	isWriterRole,
 	viewRepeatKey,
@@ -29,6 +29,7 @@ export {
 	isWorktreeMutation,
 	mutationTargetDirs,
 	durableExecutionReservation,
+	verifiedDurableExecutionReservation,
 	durableExecutionWorkspaceFence,
 	isWriterRole,
 	viewRepeatKey,
@@ -49,21 +50,22 @@ export default function (pi: ExtensionAPI) {
 
 		let writerReserved = false;
 		let executionRole: "worker" | "parent" | undefined;
-		if (isWorktreeMutation(command)) {
-			try {
-				const fallback =
-					(typeof (event as { cwd?: string }).cwd === "string" && (event as { cwd?: string }).cwd) ||
-					process.cwd();
-				const targets = mutationTargetDirs(command, fallback);
-				const attemptId = process.env.PI_EXECUTION_ATTEMPT_ID;
-				const executionWorker = !writer && targets.map(dir => durableExecutionReservation(dir, attemptId)).find(Boolean);
-				if (writer || executionWorker) executionRole = "worker";
-				else if (targets.some(dir => durableExecutionReservation(dir) || durableExecutionWorkspaceFence(dir))) executionRole = "parent";
-				const store = createReviewStore(stateDir());
-				writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
-			} catch {
-				writerReserved = false;
-			}
+		try {
+			const fallback =
+				(typeof (event as { cwd?: string }).cwd === "string" && (event as { cwd?: string }).cwd) ||
+				process.cwd();
+			// Caller identity is established independently of the mutation predicate;
+			// targeting a reserved path is never worker proof.
+			const targets = mutationTargetDirs(command, fallback);
+			const verified = !writer ? targets.map(dir => verifiedDurableExecutionReservation(dir)) : [];
+			const executionWorker = !writer && verified.length > 0 && verified.every(Boolean) && new Set(verified.map(item => item?.attemptId)).size === 1 ? verified[0] : undefined;
+			const reserved = targets.some(dir => durableExecutionReservation(dir) || durableExecutionWorkspaceFence(dir));
+			if (writer || executionWorker) executionRole = "worker";
+			else if (reserved || verified.some(Boolean)) executionRole = "parent";
+			const store = createReviewStore(stateDir());
+			writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
+		} catch {
+			writerReserved = false;
 		}
 		const first = classifyForRole(command, { writer, writerReserved: writerReserved || executionRole === "parent", ...(executionRole ? { executionRole } : {}) });
 		if (first.block) return first;

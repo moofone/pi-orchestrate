@@ -92,8 +92,9 @@ import {
 } from "./lib/pr-await-core.ts";
 import { classifyGithubStatus, parsePrKey, parseVerdictHead, verdictIdentity } from "./lib/pr-review-identity.ts";
 import { createReviewStore, readPiRunDisk } from "./lib/pr-review-store.ts";
+import { createExecutionStore } from "./lib/execution-store.ts";
 import { createReviewController, type ReviewController } from "./lib/pr-review-controller.ts";
-import type { DeliveryGroup, ExecutionManifest, IntegrationReceipt, WorkspaceRef } from "./lib/execution-contract.ts";
+import type { DeliveryGroup, ExecutionControllerMapping, ExecutionManifest, IntegrationReceipt, WorkspaceRef } from "./lib/execution-contract.ts";
 import {
 	requestReviewLaunch,
 	EXECUTION_CONTROLLER_BINDING_EVENT,
@@ -758,8 +759,13 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const store = createReviewStore(stateDir());
 		reviewCtrl = createReviewController({
 			store,
-			lookupOwner: (prKey): OwnerLookup => {
+			lookupOwner: (prKey, current): OwnerLookup => {
 				const held = latch;
+				if (current?.kind === "execution") {
+					const execution = store.list().find(ob => ob.pr.host === prKey.host && ob.pr.owner === prKey.owner && ob.pr.repo === prKey.repo && ob.pr.number === prKey.number && ob.owner.kind === "execution" && ob.owner.id === current.id && ob.owner.generation === current.generation);
+					if (!execution) return { status: "unavailable", reason: "durable execution owner lookup failed" };
+					return { status: "execution", owner: execution.owner, worktree: execution.worktree };
+				}
 				const fake: LatchState = {
 					pr: prKey.number,
 					cwd: held?.cwd ?? "",
@@ -965,16 +971,38 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 
 	/**
 	 * Plan-driven PR delivery asks the latch for this already-created controller.
-	 * The resolver is deliberately narrow: a delivery owner must identify one
-	 * live Feature in the same repository, and the Feature's origin must provide
-	 * a canonical GitHub slug. No synthetic Feature or guessed PR is created.
+	 * New execution groups resolve a durable, exact mapping from the execution
+	 * store; explicitly legacy manifests retain the Feature adapter. No synthetic
+	 * Feature or guessed PR is created.
 	 */
 	const executionEvents = (pi as unknown as { events?: { on: (event: string, handler: (data: any) => void) => () => void; emit: (event: string, data: unknown) => void } }).events;
 	executionEvents?.on(EXECUTION_CONTROLLER_BINDING_EVENT, (request: ExecutionControllerBindingRequest) => {
 		if (!request || request.claimed) return;
 		request.claimed = true;
 		const controller = getController();
-		const ownerFor = (group: DeliveryGroup): FeaturePrOwner | undefined => {
+		const executionMappingFor = (manifest: ExecutionManifest, group: DeliveryGroup, workspace: WorkspaceRef, expectedHead: string): ExecutionControllerMapping | undefined => {
+			if (!request.stateRoot) return undefined;
+			try {
+				const state = createExecutionStore({ stateRoot: join(request.stateRoot, "plan-driven-v1"), repo: request.repo }).read();
+				if (state.activeRevisions[manifest.id] !== manifest.revision || !state.manifests.some(item => item.id === manifest.id && item.revision === manifest.revision && item.repo.id === request.repo.id)) return undefined;
+				const exact = (state.controllerMappings ?? []).filter(item => item.manifestId === manifest.id && item.manifestRevision === manifest.revision && item.groupId === group.id && item.ownerId === group.ownerId && item.workspace.id === workspace.id && item.workspace.path === workspace.path && item.workspace.repoId === request.repo.id && item.workspace.baseCommit === manifest.baseCommit);
+				if (exact.length === 1) return exact[0];
+				// A controller obligation is itself a durable mapping after a prior
+				// handoff; no legacy Feature record is needed to reload it.
+				const obligations = createReviewStore(stateDir()).list().filter(ob => ob.owner.kind === "execution" && ob.owner.id === group.ownerId && ob.owner.generation && ob.worktree === workspace.path && ob.head === expectedHead);
+				if (obligations.length === 1) {
+					const ob = obligations[0]!;
+					return { manifestId: manifest.id, manifestRevision: manifest.revision, groupId: group.id, ownerId: ob.owner.id, generation: ob.owner.generation, pr: { repo: `${ob.pr.host}/${ob.pr.owner}/${ob.pr.repo}`, number: Number(ob.pr.number) }, workspace, head: ob.head };
+				}
+				return undefined;
+			} catch { return undefined; }
+		};
+		const ownerFor = (manifest: ExecutionManifest, group: DeliveryGroup, workspace: WorkspaceRef, expectedHead: string): { kind: "execution"; mapping: ExecutionControllerMapping } | { kind: "feature"; feature: FeaturePrOwner } | undefined => {
+			const mapping = executionMappingFor(manifest, group, workspace, expectedHead);
+			if (mapping) return { kind: "execution", mapping };
+			// Plan-driven groups never fall back to a legacy Feature record. The
+			// legacy adapter remains isolated for explicitly compiled legacy plans.
+			if (manifest.preset !== "legacy") return undefined;
 			// Read on every resolver call: a removed/renamed Feature must become a
 			// refusal instead of reusing a stale bridge-time PR mapping.
 			const ownerCandidates = listFeaturePrOwners({ root: join(homedir(), "orchestrator"), phases: ["pr", "implementing", "feature-qa"] })
@@ -982,19 +1010,22 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				.filter(owner => owner.pr && (!request.repoName || owner.repo === request.repoName));
 			const id = group.ownerId.trim();
 			const exact = ownerCandidates.filter(owner => [owner.dir, owner.name, basename(owner.dir)].includes(id));
-			if (exact.length !== 1) return undefined;
-			return exact[0];
+			return exact.length === 1 ? { kind: "feature", feature: exact[0]! } : undefined;
 		};
 		const binding: ExecutionControllerBinding = {
 			controller,
 			controllerId: "pr-review-controller-v1",
-			resolvePr: async ({ manifest, group, workspace }: { manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef }) => {
+			resolvePr: async ({ manifest, group, receipt, workspace }: { manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef }) => {
 				if (manifest.repo.id !== request.repo.id || manifest.repo.commonDir !== request.repo.commonDir || workspace.repoId !== request.repo.id) return { kind: "refused", reason: "Foreign execution repository" };
-				const feature = ownerFor(group);
-				if (!feature) return { kind: "refused", reason: "Ambiguous, stale, or foreign execution delivery owner" };
-				const slug = originSlug(feature.worktree ?? "");
-				if (!slug || !parsePrKey({ slug, pr: feature.pr })) return { kind: "refused", reason: "Feature origin/PR mapping is unavailable" };
-				return { kind: "authorized", pr: { repo: slug, number: Number(feature.pr) }, generation: feature.dir, ownerId: feature.dir };
+				const owner = ownerFor(manifest, group, workspace, receipt.afterCommit);
+				if (!owner) return { kind: "refused", reason: "Ambiguous, stale, or foreign execution delivery owner" };
+				if (owner.kind === "execution") {
+					if (owner.mapping.head !== receipt.afterCommit) return { kind: "refused", reason: "Execution delivery head changed" };
+					return { kind: "authorized", pr: owner.mapping.pr, generation: owner.mapping.generation, ownerId: owner.mapping.ownerId, ownerKind: "execution" };
+				}
+				const slug = originSlug(owner.feature.worktree ?? "");
+				if (!slug || !parsePrKey({ slug, pr: owner.feature.pr })) return { kind: "refused", reason: "Feature origin/PR mapping is unavailable" };
+				return { kind: "authorized", pr: { repo: slug, number: Number(owner.feature.pr) }, generation: owner.feature.dir, ownerId: owner.feature.dir, ownerKind: "feature" };
 			},
 			verifyMerge: async ({ pr, workspace, head }) => {
 				const key = parsePrKey({ slug: pr.repo, pr: pr.number });

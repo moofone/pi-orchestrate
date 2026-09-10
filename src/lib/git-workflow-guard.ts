@@ -14,6 +14,8 @@ import { canonicalizePath } from "./pr-review-store.ts";
 export type GuardVerdict = { block: false } | { block: true; reason: string };
 export type ExecutionGuardRole = "worker" | "parent" | "controller";
 export type ExecutionReservation = { role: "worker"; attemptId: string; workspacePath: string; workspaceId?: string };
+type DurableAttempt = { id: string; ownerSessionFile?: string; run?: { runId?: string; operationId?: string } };
+type DurableExecutionState = { reservations?: { attemptId?: string; workspacePath: string; workspaceId?: string; slots?: number }[]; attempts?: DurableAttempt[]; deliveries?: { phase?: string; handoff?: { workspace?: { path?: string } } }[] };
 
 /**
  * Resolve a worker reservation from durable execution data. The reservation is
@@ -37,8 +39,8 @@ export function executionWriterReservation(input: {
   return undefined;
 }
 
-function durableExecutionStates(): { reservations?: { attemptId?: string; workspacePath: string; workspaceId?: string }[]; deliveries?: { phase?: string; handoff?: { workspace?: { path?: string } } }[] }[] {
-  const root = join(homedir(), "orchestrator", "plan-driven-v1", "execution");
+function durableExecutionStates(): DurableExecutionState[] {
+  const root = process.env.PI_EXECUTION_STATE_ROOT ?? join(homedir(), "orchestrator", "plan-driven-v1", "execution");
   if (!existsSync(root)) return [];
   const states: { reservations?: { attemptId?: string; workspacePath: string; workspaceId?: string }[]; deliveries?: { phase?: string; handoff?: { workspace?: { path?: string } } }[] }[] = [];
   for (const repoId of readdirSync(root, { withFileTypes: true })) {
@@ -49,6 +51,23 @@ function durableExecutionStates(): { reservations?: { attemptId?: string; worksp
 }
 export function durableExecutionReservation(cwd: string, attemptId?: string): ExecutionReservation | undefined {
   for (const state of durableExecutionStates()) {
+    const found = executionWriterReservation({ cwd, reservations: Array.isArray(state.reservations) ? state.reservations : [], attemptId });
+    if (found) return found;
+  }
+  return undefined;
+}
+/** Runtime-bound worker proof. An attempt ID is only a selector; the child must
+ * also carry the runtime run ID and its authoritative parent session linkage,
+ * both matching the persisted attempt that owns the reservation. */
+export function verifiedDurableExecutionReservation(cwd: string, env: Record<string, string | undefined> = process.env): ExecutionReservation | undefined {
+  const runId = env.PI_SUBAGENT_RUN_ID?.trim();
+  const attemptId = env.PI_EXECUTION_ATTEMPT_ID?.trim() || runId;
+  const sessionFile = (env.PI_EXECUTION_SESSION_FILE ?? env.PI_SUBAGENT_PARENT_SESSION)?.trim();
+  if (!attemptId || !runId || !sessionFile) return undefined;
+  const caller = canonicalizePath(sessionFile);
+  for (const state of durableExecutionStates()) {
+    const attempt = state.attempts?.find(item => item.id === attemptId);
+    if (!attempt || canonicalizePath(attempt.ownerSessionFile ?? "") !== caller || (attempt.run?.runId !== runId && attempt.id !== runId && attempt.run?.operationId !== runId)) continue;
     const found = executionWriterReservation({ cwd, reservations: Array.isArray(state.reservations) ? state.reservations : [], attemptId });
     if (found) return found;
   }
@@ -245,6 +264,11 @@ function gitVerb(command: string): string | undefined {
 	return undefined;
 }
 
+function isLifecycleMutation(command: string): boolean {
+  const text = stripComments(command);
+  return /\bgit\s+(?:wt(?:-rm)?|pr-await|pr-land)\b|\bghl-(?:wt(?:-rm)?|pr-await|pr-land)\b|\bgh\s+pr\s+(?:create|merge|close|reopen|ready|edit|comment)\b/.test(text);
+}
+
 export function isWorktreeMutation(command: string): boolean {
 	const text = stripComments(command);
 	const parts = text.split(/\s*(?:&&|\|\||;|\n)\s*/);
@@ -317,7 +341,7 @@ export function classifyForRole(
 			if (rule.re.test(text)) return { block: true, reason: rule.reason };
 		}
 	}
-	if (reservedParent && isWorktreeMutation(command)) {
+	if (reservedParent && (isWorktreeMutation(command) || isLifecycleMutation(command))) {
 		return {
 			block: true,
 			reason:

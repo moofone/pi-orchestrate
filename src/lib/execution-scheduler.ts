@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { watch, type FSWatcher } from "node:fs";
 import {
 	deliveryFenced, digest, occupiesCapacity, taskRevisionDigest, transitionAttempt, validateAuthorization, workspaceExcludedByDelivery,
 	type AttemptRuntime, type CheckExecutor, type CoordinatorOwner, type CoordinatorState,
@@ -22,7 +23,7 @@ export type SchedulerOptions = {
 	/** Finite local wakeups after capacity deferral, never budget grants. Defaults to three. */
 	maxCapacityRechecks?: number; recheckDelayMs?: number;
 };
-export type SchedulerControl = { targetId: string; action: "pause" | "resume" | "retry" | "cancel"; immediate?: boolean };
+export type SchedulerControl = { targetId: string; action: "pause" | "resume" | "retry" | "cancel"; immediate?: boolean; /** Stable only when the caller is retrying one invocation. */ invocationId?: string };
 
 /** Repository-wide event-driven admission. Jobs never hold the short store transaction lock. */
 export class ExecutionScheduler {
@@ -30,6 +31,7 @@ export class ExecutionScheduler {
 	private owner?: CoordinatorOwner;
 	private stopped = false;
 	private unsubscribe?: () => void;
+	private stateWatcher?: FSWatcher;
 	private loop?: Promise<void>;
 	private dirty = false;
 	private jobs = new Map<string, Promise<void>>();
@@ -64,6 +66,12 @@ export class ExecutionScheduler {
 		this.owner = this.options.store.acquire(this.options.owner);
 		this.options.onOwnerAcquired?.(structuredClone(this.owner));
 		this.unsubscribe = this.options.runtime.subscribe(() => { this.deferred.clear(); this.wake(); });
+		// Intents are durable cross-process wakeups. The owner watches the state
+		// document and rechecks exact evidence; this is notification, not polling.
+		try {
+			this.stateWatcher = watch(this.options.store.statePath, { persistent: false }, () => this.wake());
+			this.stateWatcher.on("error", () => { this.stateWatcher?.close(); this.stateWatcher = undefined; });
+		} catch { this.stateWatcher = undefined; }
 		// No admission until every persisted attempt has been observed or conservatively fenced.
 		await this.recover();
 		if (!this.live(this.owner)) return;
@@ -163,7 +171,7 @@ export class ExecutionScheduler {
 	}
 
 	async shutdown(): Promise<void> {
-		this.stopped = true; this.unsubscribe?.(); if (this.timer) clearTimeout(this.timer);
+		this.stopped = true; this.unsubscribe?.(); this.stateWatcher?.close(); this.stateWatcher = undefined; if (this.timer) clearTimeout(this.timer);
 		// Do not wait for missing RPC acknowledgements and do not release child reservations.
 		if (this.owner) this.options.store.relinquish(this.owner);
 	}

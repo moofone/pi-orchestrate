@@ -20,7 +20,7 @@ import {
 	type PrKey,
 } from "./pr-review-identity.ts";
 
-export type ReviewOwnerKind = "feature" | "session" | "observer";
+export type ReviewOwnerKind = "feature" | "execution" | "session" | "observer";
 
 export type ReviewOwner = {
 	kind: ReviewOwnerKind;

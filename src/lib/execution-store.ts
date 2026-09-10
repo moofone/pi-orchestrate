@@ -135,7 +135,7 @@ export function createExecutionStore(options: ExecutionStoreOptions): ExecutionS
 	}
 	function relinquish(owner: CoordinatorOwner): void {
 		locked(owner, () => {
-			const state = read(); assertOwner(state, owner); state.epoch++; state.sequence++; delete state.owner; delete state.reconciledEpoch; write(state);
+			const state = read(); assertOwner(state, owner); state.epoch++; state.sequence++; state.lastOwner = structuredClone(owner); delete state.owner; delete state.reconciledEpoch; write(state);
 		});
 	}
 	function appendIntent(intent: CoordinatorIntent): CoordinatorState {

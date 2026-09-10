@@ -21,7 +21,7 @@ function manifest(request: InterpretationRequest): ExecutionManifest {
  tasks: [{ id: "work", featureId: "arbitrary-feature", deliveryGroupId: "shared-group", text: "Visible task", mode: "mutation", dependencies: [], scope: ["src"], profile: { agent: "custom-engineer" }, checks: [], provenance: provenance(["text", "mode", "dependencies", "scope", "profile", "deliveryGroupId"]) }],
  constraints: { capacity: 1, parallelGroups: [], provenance: provenance(["capacity"]) }, provenance: provenance(["scope", "features", "deliveryGroups"]) };
 }
-function harness(early = true) {
+function harness(early = true, approve = false) {
  const root = join(home, `repo-${Math.random().toString(16).slice(2)}`); mkdirSync(root); mkdirSync(join(root, ".git"));
  const sessionFile = join(root, "parent.jsonl"), plan = join(root, "plan.md");
  writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "parent" }) + "\n"); writeFileSync(plan, "# Ordinary plan\n");
@@ -62,7 +62,7 @@ function harness(early = true) {
   },
  };
  const ctx = { cwd: root, hasUI: true, sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "parent" },
- ui: { notify: (text: string) => notifications.push(text), confirm: async (_title: string, body: string) => { confirmations.push(body); return false; } } };
+ ui: { notify: (text: string) => notifications.push(text), confirm: async (_title: string, body: string) => { confirmations.push(body); return approve; } } };
  register(pi as unknown as ExtensionAPI);
  return { root, plan, sessionFile, ctx, pi, events, handlers, commands, notifications, confirmations, spawns, execs,
   command: (text: string) => commands.get("orchestrate").handler(text, ctx as unknown as ExtensionCommandContext),
@@ -82,6 +82,19 @@ for (const early of [true, false]) test(`registered command accepts structured-o
   assert.match(h.notifications.at(-1)!, /epoch=0/);
  } finally { await h.shutdown(); }
 });
+test("registered lifecycle resumes prior owning session after clean shutdown without another command", async () => {
+ const h = harness(true, true);
+ await h.command(`run "${h.plan}"`);
+ await new Promise(resolve => setTimeout(resolve, 40));
+ await h.shutdown();
+ await h.handlers.get("session_start")!({}, h.ctx);
+ await new Promise(resolve => setTimeout(resolve, 40));
+ const statePath = join(home, "orchestrator", "plan-driven-v1", "execution", digest(join(h.root, ".git")), "coordinator.json");
+ const state = JSON.parse(await (await import("node:fs/promises")).readFile(statePath, "utf8"));
+ assert.equal(state.owner?.sessionFile, realpathSync(h.sessionFile), "the prior owner session must reacquire durable active work");
+ await h.shutdown();
+});
+
 test("registered lifecycle fences initialization resolved after shutdown without acquiring a lease", async () => {
  const h = harness(); let release!: () => void, entered!: () => void;
  const gate = new Promise<void>(resolve => { release = resolve; }), waiting = new Promise<void>(resolve => { entered = resolve; });

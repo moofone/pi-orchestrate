@@ -19,7 +19,7 @@ export type IntegrationOutcome = { kind: "ready"; receipt: IntegrationReceipt } 
  * Repeated calls must discover the same approved PR/owner generation, not create additional PRs. */
 export type DeliveryPrPort = (request: {
 	manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef;
-}) => Promise<{ kind: "authorized"; pr: HandoffRequest["pr"]; generation: string; ownerId?: string } |
+}) => Promise<{ kind: "authorized"; pr: HandoffRequest["pr"]; generation: string; ownerId?: string; ownerKind?: "feature" | "execution" | "session" } |
 	{ kind: "refused" | "unknown"; reason: string }>;
 export type ExecutionDeliveryOptions = {
 	store: ExecutionStore; owner: CoordinatorOwner; workspace: WorkspaceAdapter; checks: CheckExecutor;
@@ -239,7 +239,7 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
 			if (binding.kind !== "authorized") throw new Error(`PR binding ${binding.kind}: ${binding.reason}`);
 			const pr = bindingKey(binding.pr);
 			if (!binding.generation) throw new Error("Invalid authorized PR binding");
-			const body = { deliveryGroupId: groupId, ownerId: binding.ownerId ?? group.ownerId, generation: binding.generation, pr: { repo: `${pr.host}/${pr.owner}/${pr.repo}`, number: binding.pr.number }, workspace: intent.workspace, head: receipt.afterCommit, integrationDigest: receipt.digest };
+			const body = { deliveryGroupId: groupId, ownerId: binding.ownerId ?? group.ownerId, generation: binding.generation, ...(binding.ownerKind ? { ownerKind: binding.ownerKind } : {}), pr: { repo: `${pr.host}/${pr.owner}/${pr.repo}`, number: binding.pr.number }, workspace: intent.workspace, head: receipt.afterCommit, integrationDigest: receipt.digest };
 			const request: HandoffRequest = { id: `handoff-${digest(body)}`, ...body };
 			mutate(draft => {
 				const current = record(draft, groupId);
@@ -282,7 +282,8 @@ export function createControllerDeliveryAdapter(options: ControllerDeliveryOptio
 			const pr = key(request), views = options.controller.status(pr);
 			const view = views.find(v => v.pr === prKeyId(pr));
 			const stored = options.acknowledged(request);
-			if (!view || view.owner.kind !== "feature" || view.owner.id !== request.ownerId || view.owner.generation !== request.generation || view.worktree !== request.workspace.path || (!stored && view.head !== request.head)) return { kind: "unknown", reason: "Exact controller obligation not proven" };
+			const ownerKind = request.ownerKind ?? "feature";
+			if (!view || view.owner.kind !== ownerKind || view.owner.id !== request.ownerId || view.owner.generation !== request.generation || view.worktree !== request.workspace.path || (!stored && view.head !== request.head)) return { kind: "unknown", reason: "Exact controller obligation not proven" };
 			const acknowledgement = stored ?? { requestId: request.id, controllerId: options.controllerId, obligationId: digest([pr, view.owner, view.worktree, request.head]), generation: request.generation, acceptedAt: (options.now ?? Date.now)() };
 			if (!validAck(request, acknowledgement) || acknowledgement.controllerId !== options.controllerId) return { kind: "unknown", reason: "Stored controller acknowledgement mismatch" };
 			if (view.state === "merged") {
@@ -299,7 +300,7 @@ export function createControllerDeliveryAdapter(options: ControllerDeliveryOptio
 			try {
 				const pr = key(request);
 				// Never refresh or overwrite a pre-existing obligation while reconciling.
-				if (!options.controller.status(pr).length) options.controller.handoff({ pr, owner: { kind: "feature", id: request.ownerId, generation: request.generation }, worktree: request.workspace.path, head: request.head });
+				if (!options.controller.status(pr).length) options.controller.handoff({ pr, owner: { kind: request.ownerKind ?? "feature", id: request.ownerId, generation: request.generation }, worktree: request.workspace.path, head: request.head });
 			} catch { /* Persistence may have succeeded before the reply was lost. */ }
 			return observe(request);
 		},

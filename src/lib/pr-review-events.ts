@@ -21,15 +21,17 @@ export const PR_REVIEW_RECONCILED_EVENT = "pi.pr-review.reconciled";
 export const EXECUTION_CONTROLLER_BINDING_EVENT = "pi.execution.controller.binding";
 export type ExecutionPrResolver = (request: {
 	manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef;
-}) => Promise<{ kind: "authorized"; pr: { repo: string; number: number }; generation: string; ownerId?: string } | { kind: "refused" | "unknown"; reason: string }>;
+}) => Promise<{ kind: "authorized"; pr: { repo: string; number: number }; generation: string; ownerId?: string; ownerKind?: "feature" | "execution" | "session" } | { kind: "refused" | "unknown"; reason: string }>;
 export type ExecutionControllerBinding = {
-	controller: Pick<ReviewController, "handoff" | "status">;
+	controller: Pick<ReviewController, "handoff" | "status" | "observeVerdict" | "reconcile">;
 	controllerId: string;
 	resolvePr: ExecutionPrResolver;
 	verifyMerge: (request: { pr: { repo: string; number: number }; workspace: WorkspaceRef; head: string }) => Promise<{ commit: string; url: string; observedAt: number } | undefined>;
 };
 export type ExecutionControllerBindingRequest = {
 	repo: RepoIdentity;
+	/** Durable execution namespace used to resolve plan-driven group ownership. */
+	stateRoot?: string;
 	repoName?: string;
 	sessionFile: string;
 	claimed: boolean;
@@ -98,6 +100,7 @@ export type PublishResult = {
 
 export type OwnerLookup =
 	| { status: "feature"; owner: ReviewOwner; worktree?: string }
+	| { status: "execution"; owner: ReviewOwner; worktree?: string }
 	| { status: "session"; owner: ReviewOwner; worktree?: string }
 	| { status: "observer" }
 	| { status: "unavailable"; reason: string };

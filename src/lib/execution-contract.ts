@@ -87,7 +87,7 @@ export type IntegrationIntent = {
 	afterCommit?: string; reason?: string;
 };
 export type HandoffRequest = {
-	id: Id; deliveryGroupId: Id; ownerId: Id; generation: string;
+	id: Id; deliveryGroupId: Id; ownerId: Id; generation: string; ownerKind?: "feature" | "execution" | "session";
 	pr: { repo: string; number: number }; workspace: WorkspaceRef; head: string; integrationDigest: Digest;
 };
 export type HandoffAcknowledgement = { requestId: Id; controllerId: Id; obligationId: Id; generation: string; acceptedAt: number };
@@ -104,19 +104,23 @@ export type DeliveryRecord = {
 	nonTransfer?: { requestId: Id; reason: string; observedAt: number }; reason?: string;
 };
 export type CoordinatorOwner = { pid: number; processStart: string; sessionFile: string; instanceId: Id; epoch: number };
+export type ExecutionControllerMapping = {
+	manifestId: Id; manifestRevision: number; groupId: Id; ownerId: Id; generation: string;
+	pr: { repo: string; number: number }; workspace: WorkspaceRef; head: string;
+};
 export type ResourceReservation = { id: Id; attemptId?: Id; integrationId?: Id; workspaceId: Id; workspacePath: string; slots: number; parallelGroupId?: Id };
 export type ParallelLaunchSet = { id: Id; groupId: Id; attemptIds: Id[]; instruction: "reserved" | "met" | "unmet"; reason?: string };
 export type TaskRecord = { taskId: Id; manifestId: Id; phase: AttemptPhase; intent: ControlIntent; attemptIds: Id[]; resultDigest?: Digest; reason?: string };
-export type CoordinatorIntent = { id: Id; sessionFile: string; authorizationId: Id; kind: "admit" | "revision" | "pause" | "resume" | "retry" | "cancel"; targetId: Id; manifest?: ExecutionManifest; immediate?: boolean; consumedAt?: number };
+export type CoordinatorIntent = { id: Id; sessionFile: string; authorizationId: Id; kind: "admit" | "revision" | "pause" | "resume" | "retry" | "cancel"; targetId: Id; manifest?: ExecutionManifest; immediate?: boolean; invocationId?: Id; consumedAt?: number };
 export type CoordinatorState = {
 	schemaVersion: typeof EXECUTION_SCHEMA_VERSION; repo: RepoIdentity; sequence: number; epoch: number;
 	/** Caller-authorized repository pool ceiling, never the sum of feature requests. */
 	capacity: number;
-	owner?: CoordinatorOwner; reconciledEpoch?: number; manifests: ExecutionManifest[];
+	owner?: CoordinatorOwner; /** Last coordinator lease holder, retained across clean relinquishment for scoped startup recovery. */ lastOwner?: CoordinatorOwner; reconciledEpoch?: number; manifests: ExecutionManifest[];
 	authorizations: ExecutionAuthorization[]; activeRevisions: Record<Id, number>;
 	tasks: TaskRecord[]; attempts: TaskAttempt[]; results: ResultReceipt[];
 	integrations: IntegrationIntent[]; integrationReceipts: IntegrationReceipt[]; deliveries: DeliveryRecord[];
-	reservations: ResourceReservation[]; parallelLaunchSets: ParallelLaunchSet[]; intents: CoordinatorIntent[];
+	reservations: ResourceReservation[]; parallelLaunchSets: ParallelLaunchSet[]; intents: CoordinatorIntent[]; controllerMappings?: ExecutionControllerMapping[];
 };
 
 export type RuntimeCapabilities = {
@@ -334,12 +338,13 @@ export function workspaceExcludedByDelivery(state: { deliveries: readonly ({ gro
 	return state.deliveries.some(delivery => ["handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(delivery.phase) && !!delivery.handoff && (delivery.handoff.workspace.id === workspace.id || delivery.handoff.workspace.path === workspace.path));
 }
 export function emptyCoordinatorState(identity: RepoIdentity): CoordinatorState {
-	return { schemaVersion: EXECUTION_SCHEMA_VERSION, repo: identity, sequence: 0, epoch: 0, capacity: 0, manifests: [], authorizations: [], activeRevisions: {}, tasks: [], attempts: [], results: [], integrations: [], integrationReceipts: [], deliveries: [], reservations: [], parallelLaunchSets: [], intents: [] };
+	return { schemaVersion: EXECUTION_SCHEMA_VERSION, repo: identity, sequence: 0, epoch: 0, capacity: 0, manifests: [], authorizations: [], activeRevisions: {}, tasks: [], attempts: [], results: [], integrations: [], integrationReceipts: [], deliveries: [], reservations: [], parallelLaunchSets: [], intents: [], controllerMappings: [] };
 }
 
 export function validateCoordinatorState(value: unknown): asserts value is CoordinatorState {
 	object(value); version(value); repo(value.repo); integer(value.sequence); integer(value.epoch); integer(value.capacity);
 	for (const key of ["manifests", "authorizations", "tasks", "attempts", "results", "integrations", "integrationReceipts", "deliveries", "reservations", "parallelLaunchSets", "intents"]) requireThat(Array.isArray(value[key]), `Expected ${key}`);
+	if (value.controllerMappings !== undefined) requireThat(Array.isArray(value.controllerMappings), "Expected controller mappings");
 	const state = value as unknown as CoordinatorState;
 	state.manifests.forEach(validateManifest); unique(state.manifests.map(m => `${m.id}:${m.revision}`), "manifest revision");
 	for (const m of state.manifests) requireThat(m.repo.id === state.repo.id, "Foreign manifest repository");
@@ -438,8 +443,17 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 		requireThat(isAbsolute(intent.sessionFile) && ["admit", "revision", "pause", "resume", "retry", "cancel"].includes(intent.kind), "Invalid coordinator intent");
 		if (intent.manifest) validateManifest(intent.manifest);
 		if (intent.immediate !== undefined) requireThat(typeof intent.immediate === "boolean", "Invalid immediate intent");
+		if (intent.invocationId !== undefined) text(intent.invocationId);
 		if (intent.consumedAt !== undefined) integer(intent.consumedAt);
 	}
+	for (const mapping of state.controllerMappings ?? []) {
+		object(mapping); text(mapping.manifestId); integer(mapping.manifestRevision); text(mapping.groupId); text(mapping.ownerId); text(mapping.generation); object(mapping.pr); text(mapping.pr.repo); integer(mapping.pr.number, 1); object(mapping.workspace); text(mapping.head);
+		requireThat(state.repo.id === mapping.workspace.repoId, "Controller mapping repository mismatch");
+		const manifest = state.manifests.find(m => m.id === mapping.manifestId && m.revision === mapping.manifestRevision);
+		const group = manifest?.deliveryGroups.find(g => g.id === mapping.groupId);
+		requireThat(!!manifest && !!group && group.ownerId === mapping.ownerId && mapping.workspace.baseCommit === manifest.baseCommit, "Controller mapping group mismatch");
+	}
+	unique((state.controllerMappings ?? []).map(m => `${m.manifestId}:${m.manifestRevision}:${m.groupId}`), "controller mapping");
 	for (const d of state.deliveries) {
 		requireThat(state.manifests.some(m => m.deliveryGroups.some(g => g.id === d.groupId)), "Missing delivery group");
 		requireThat(["pending", "integrating", "blocked", "ready", "handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(d.phase), "Invalid delivery phase");
@@ -474,6 +488,10 @@ export function validateStateChange(previous: CoordinatorState, next: Coordinato
 		if (retained) requireThat(digest(retained) === digest(r), "Reservation changed");
 		else if (r.attemptId) requireThat(canReleaseAttempt(next.attempts.find(a => a.id === r.attemptId)!), "Unknown writer reservation cannot be released");
 		else requireThat(next.integrations.some(i => i.id === r.integrationId && i.phase === "complete") && next.integrationReceipts.some(i => i.intentId === r.integrationId), "Unknown integration reservation cannot be released");
+	}
+	for (const old of previous.controllerMappings ?? []) {
+		const current = (next.controllerMappings ?? []).find(mapping => mapping.manifestId === old.manifestId && mapping.manifestRevision === old.manifestRevision && mapping.groupId === old.groupId);
+		requireThat(current && digest(current) === digest(old), "Controller mapping history changed");
 	}
 	for (const old of previous.integrations) {
 		const current = next.integrations.find(i => i.id === old.id); requireThat(current, "Integration history removed");

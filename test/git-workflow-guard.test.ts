@@ -3,9 +3,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import guardExtension from "../src/git-workflow-guard.ts";
 
 import {
 	classifyForRole,
@@ -269,6 +271,47 @@ test("mutationTargetDirs realpaths a symlink into the reserved worktree", () => 
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+test("registered guard keeps a parent and forged attempt identity out of a reserved workspace", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-registration-home-")));
+  const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });
+  const stateDir = join(home, "orchestrator", "plan-driven-v1", "execution", "repo"); mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, "coordinator.json"), JSON.stringify({
+    reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
+    attempts: [{ id: "attempt-1", ownerSessionFile: join(home, "owner.jsonl"), run: { runId: "run-1" } }],
+    deliveries: [],
+  }));
+  const priorHome = process.env.HOME, priorStateRoot = process.env.PI_EXECUTION_STATE_ROOT, priorAttempt = process.env.PI_EXECUTION_ATTEMPT_ID, priorRun = process.env.PI_SUBAGENT_RUN_ID, priorParent = process.env.PI_SUBAGENT_PARENT_SESSION, priorAgent = process.env.PI_SUBAGENT_CHILD_AGENT, priorRole = process.env.ORCHESTRATE_ROLE;
+  process.env.HOME = home; process.env.PI_EXECUTION_STATE_ROOT = join(home, "orchestrator", "plan-driven-v1", "execution"); delete process.env.PI_EXECUTION_ATTEMPT_ID; delete process.env.PI_SUBAGENT_RUN_ID; delete process.env.PI_SUBAGENT_PARENT_SESSION; delete process.env.PI_SUBAGENT_CHILD_AGENT; delete process.env.ORCHESTRATE_ROLE;
+  try {
+    let handler: ((event: any) => Promise<any>) | undefined;
+    guardExtension({ on(name: string, fn: any) { if (name === "tool_call") handler = fn; } } as unknown as ExtensionAPI);
+    assert.ok(handler);
+    const parent = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m parent" } });
+    assert.equal(parent?.block ?? false, true, "reserved workspace is not proof that the caller is its worker");
+    process.env.PI_EXECUTION_ATTEMPT_ID = "attempt-1";
+    const forged = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m forged" } });
+    assert.equal(forged?.block ?? false, true, "matching attempt ID without runtime/session binding is forged");
+    process.env.PI_SUBAGENT_RUN_ID = "run-1"; process.env.PI_SUBAGENT_PARENT_SESSION = join(home, "foreign-owner.jsonl");
+    const foreign = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m foreign" } });
+    assert.equal(foreign?.block ?? false, true, "matching attempt/run IDs from a foreign session are not worker proof");
+    process.env.PI_SUBAGENT_PARENT_SESSION = join(home, "owner.jsonl");
+    const mixed = await handler!({ toolName: "bash", cwd: workspace, input: { command: `cd ${workspace} && git commit -m own && cd ${home} && git push` } });
+    assert.equal(mixed?.block ?? false, true, "every mutation target must be independently authorized");
+    for (const command of ["gh pr create --title x --body y", "git wt branch", "git pr-await 1", "git pr-land 1", "git push"]) {
+      const worker = await handler!({ toolName: "bash", cwd: workspace, input: { command } });
+      assert.equal(worker?.block ?? false, true, `verified execution worker must be blocked from ${command}`);
+    }
+  } finally {
+    if (priorHome === undefined) delete process.env.HOME; else process.env.HOME = priorHome;
+    if (priorStateRoot === undefined) delete process.env.PI_EXECUTION_STATE_ROOT; else process.env.PI_EXECUTION_STATE_ROOT = priorStateRoot;
+    if (priorAttempt === undefined) delete process.env.PI_EXECUTION_ATTEMPT_ID; else process.env.PI_EXECUTION_ATTEMPT_ID = priorAttempt;
+    if (priorRun === undefined) delete process.env.PI_SUBAGENT_RUN_ID; else process.env.PI_SUBAGENT_RUN_ID = priorRun;
+    if (priorParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION; else process.env.PI_SUBAGENT_PARENT_SESSION = priorParent;
+    if (priorAgent === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT; else process.env.PI_SUBAGENT_CHILD_AGENT = priorAgent;
+    if (priorRole === undefined) delete process.env.ORCHESTRATE_ROLE; else process.env.ORCHESTRATE_ROLE = priorRole;
+  }
 });
 
 test("mutationTargetDirs includes --work-tree and --git-dir", () => {

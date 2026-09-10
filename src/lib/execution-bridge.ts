@@ -134,7 +134,7 @@ export type ExecutionBridge = {
   readonly store: ExecutionStore;
   readonly scheduler: ExecutionScheduler;
   readonly delivery: ExecutionDelivery;
-  start(): Promise<void>;
+  start(options?: { resumePriorOwner?: boolean }): Promise<void>;
   preview(planPath: string): Promise<ExecutionPreview>;
   run(planPath: string, approval?: ExecutionApproval): Promise<ExecutionRunResult>;
   control(control: SchedulerControl): Promise<void>;
@@ -176,6 +176,12 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     for (const approval of store.read().authorizations) authorizedBases.add(approval.baseCommit);
   };
   const pendingPreviews = new Map<string, ExecutionPreview>();
+  const previewFingerprints = new Map<string, string>();
+  const activeDurableWork = (state: CoordinatorState): boolean =>
+    state.attempts.some(attempt => ["preparing", "launching", "running", "stopping", "validating", "recovery-needed"].includes(attempt.phase)) ||
+    state.integrations.some(intent => intent.phase !== "complete") ||
+    state.deliveries.some(delivery => ["integrating", "ready", "handoff-pending", "controller-owned"].includes(delivery.phase)) ||
+    state.intents.some(intent => intent.consumedAt === undefined);
   const git: WorkspaceGit = options.git ?? (async (cwd, argv) => {
     if (!options.pi) throw new Error("Git adapter required");
     const result = await options.pi.exec("git", [...argv], { cwd });
@@ -347,7 +353,8 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     const authorization = state.authorizations.find(item => item.manifestId === manifest.id && item.revision === manifest.revision);
     if (!authorization) throw new Error("Missing target authorization");
     const session = realpathSync(options.sessionFile);
-    store.appendIntent({ id: `intent-${digest([session, authorization.id, control.targetId, control.action, control.immediate ?? false])}`, sessionFile: session, authorizationId: authorization.id, kind: control.action, targetId: control.targetId, ...(control.immediate === undefined ? {} : { immediate: control.immediate }) });
+    const invocationId = control.invocationId ?? randomUUID();
+    store.appendIntent({ id: `intent-${digest([session, authorization.id, control.targetId, control.action, control.immediate ?? false, invocationId])}`, sessionFile: session, authorizationId: authorization.id, kind: control.action, targetId: control.targetId, ...(control.immediate === undefined ? {} : { immediate: control.immediate }), invocationId });
   };
   const bridge: ExecutionBridge = {
     store,
@@ -356,9 +363,14 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       if (!activeDelivery) throw new Error("Execution coordinator has not started");
       return activeDelivery;
     },
-    async start() {
+    async start(startOptions = {}) {
       if (started) return;
       if (starting) return starting;
+      if (startOptions.resumePriorOwner) {
+        const state = store.read();
+        const session = realpathSync(options.sessionFile);
+        if (!state.lastOwner || state.lastOwner.sessionFile !== session || !activeDurableWork(state)) return;
+      }
       starting = (async () => {
         await scheduler.start();
         await scheduler.reconcile();
@@ -382,7 +394,8 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       const token = digest([randomUUID(), path, source.digest, digest(result.manifest), result.manifest.revision, options.repo, base, boundary]);
       const preview = { token, boundary, path, sourceDigest: source.digest, manifest: result.manifest, unresolvedDecisions: result.unresolvedDecisions, conflicts: interpretationConflicts(result.manifest, capacity, capabilities) };
       pendingPreviews.set(path, structuredClone(preview));
-      return preview;
+      previewFingerprints.set(preview.token, digest({ path, sourceDigest: preview.sourceDigest, boundary: preview.boundary, manifest: preview.manifest, unresolvedDecisions: preview.unresolvedDecisions, conflicts: preview.conflicts }));
+      return structuredClone(preview);
     },
     async run(planPath, approval) {
       let preview: ExecutionPreview;
@@ -390,17 +403,23 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
         const path = resolvePlanArgument(planPath);
         const pending = approval ? pendingPreviews.get(path) : undefined;
         if (approval && (!pending || !approval.token || approval.token !== pending.token)) return { kind: "refused", reason: "Missing, replaced, or stale approval token; preview again" };
+        if (approval && pending) {
+          const expected = previewFingerprints.get(pending.token);
+          const actual = digest({ path, sourceDigest: pending.sourceDigest, boundary: pending.boundary, manifest: pending.manifest, unresolvedDecisions: pending.unresolvedDecisions, conflicts: pending.conflicts });
+          if (!expected || expected !== actual) return { kind: "refused", reason: "Preview integrity changed; preview again" };
+        }
         if (pending) {
           if (approval!.capacity !== pending.boundary.capacity || (approval!.publication && !pending.boundary.publication)) return { kind: "refused", reason: "Approval exceeds displayed boundary", preview: structuredClone(pending) };
           const source = await importPlanSource(path);
-          if (source.digest !== pending.sourceDigest) return { kind: "refused", reason: "Plan changed after preview; import a fresh revision", preview: pending };
+          if (source.digest !== pending.sourceDigest) return { kind: "refused", reason: "Plan changed after preview; import a fresh revision", preview: structuredClone(pending) };
           preview = structuredClone(pending);
         } else preview = await bridge.preview(path);
       } catch (error) { return { kind: "refused", reason: String(error) }; }
       if (preview.unresolvedDecisions.length || preview.conflicts.length) return { kind: "refused", reason: [...preview.unresolvedDecisions, ...preview.conflicts].join("; "), preview };
       if (!approval) {
         pendingPreviews.set(preview.path, structuredClone(preview));
-        return { kind: "approval-required", preview };
+        previewFingerprints.set(preview.token, digest({ path: preview.path, sourceDigest: preview.sourceDigest, boundary: preview.boundary, manifest: preview.manifest, unresolvedDecisions: preview.unresolvedDecisions, conflicts: preview.conflicts }));
+        return { kind: "approval-required", preview: structuredClone(preview) };
       }
       const pending = pendingPreviews.get(preview.path);
       if (pending && pending.sourceDigest !== preview.sourceDigest) return { kind: "refused", reason: "Plan changed after preview; import a fresh revision", preview };
