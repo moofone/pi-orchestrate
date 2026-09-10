@@ -399,11 +399,11 @@ Updated during implementation at the user's request. A unit is checked off only 
 |---|---|---|
 | Baseline | Complete | Fresh upstream `9a185f7`; typecheck and 504 tests pass after correcting an obsolete skill-text assertion in the isolated worktree |
 | U1 | Complete | Commits `8c272b8`, `04480ae`; four review regressions red→green; typecheck and 533 tests pass; independent recheck READY |
-| U2 | In progress | Isolated branch `feat/plan-driven-u2-import` |
+| U2 | Complete | Commits `10ffa40`, `b460efd`; attached interpreter-option regressions pass; parent full check passes; independent recheck READY |
 | U3 | In progress | Isolated branch `feat/plan-driven-u3-runtime` |
-| U4 | In progress | Isolated branch `feat/plan-driven-u4-workspaces` |
+| U4 | Complete | Commits `dc5f340`, `3cb030c`; raw paths/artifact freshness/allowed branch query verified; parent 15 targeted tests/full check pass; independent recheck READY |
 | U5 | In progress | Isolated branch `feat/plan-driven-u5-scheduler` |
-| U6 | In progress | Isolated branch `feat/plan-driven-u6-delivery` |
+| U6 | Complete | Commits `040475a`, `69c7788`; canonical PR identities and exact pre-handoff composition verified; parent 20 targeted tests/full check pass; independent recheck READY |
 | U7 | Pending | Waits for U2–U6 integration |
 | U8 | Pending | Waits for integrated implementation |
 
