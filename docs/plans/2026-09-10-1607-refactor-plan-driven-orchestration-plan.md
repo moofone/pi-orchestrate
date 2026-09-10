@@ -400,11 +400,11 @@ Updated during implementation at the user's request. A unit is checked off only 
 | Baseline | Complete | Fresh upstream `9a185f7`; typecheck and 504 tests pass after correcting an obsolete skill-text assertion in the isolated worktree |
 | U1 | Complete | Commits `8c272b8`, `04480ae`; four review regressions red→green; typecheck and 533 tests pass; independent recheck READY |
 | U2 | Complete | Commits `10ffa40`, `b460efd`; attached interpreter-option regressions pass; parent full check passes; independent recheck READY |
-| U3 | In progress | Isolated branch `feat/plan-driven-u3-runtime` |
+| U3 | Complete | Commits `346fd320`, `6236c03`; contradictory/cancelled Node evidence rejected; parent full check passes; independent recheck READY |
 | U4 | Complete | Commits `dc5f340`, `3cb030c`; raw paths/artifact freshness/allowed branch query verified; parent 15 targeted tests/full check pass; independent recheck READY |
-| U5 | In progress | Isolated branch `feat/plan-driven-u5-scheduler` |
+| U5 | Complete | Commits `a7b7892`, `0b69c44`; four original race repros fixed; parent full check passes; independent recheck READY |
 | U6 | Complete | Commits `040475a`, `69c7788`; canonical PR identities and exact pre-handoff composition verified; parent 20 targeted tests/full check pass; independent recheck READY |
-| U7 | Pending | Waits for U2–U6 integration |
+| U7 | In progress | All five reviewed lanes integrated at `742b984`; combined package check passes; wiring command/lifecycle/production ports and central ownership guard |
 | U8 | Pending | Waits for integrated implementation |
 
 ### Active lane ownership
