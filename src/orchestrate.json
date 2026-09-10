@@ -1,5 +1,6 @@
 {
   "autoAdvanceOnLanded": true,
   "qaModel": "xai/grok-4.6:high",
-  "executionCapacity": 1
+  "executionCapacity": 1,
+  "executionPreset": "plan-driven"
 }

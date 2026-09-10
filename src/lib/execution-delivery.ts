@@ -19,7 +19,7 @@ export type IntegrationOutcome = { kind: "ready"; receipt: IntegrationReceipt } 
  * Repeated calls must discover the same approved PR/owner generation, not create additional PRs. */
 export type DeliveryPrPort = (request: {
 	manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef;
-}) => Promise<{ kind: "authorized"; pr: HandoffRequest["pr"]; generation: string } |
+}) => Promise<{ kind: "authorized"; pr: HandoffRequest["pr"]; generation: string; ownerId?: string } |
 	{ kind: "refused" | "unknown"; reason: string }>;
 export type ExecutionDeliveryOptions = {
 	store: ExecutionStore; owner: CoordinatorOwner; workspace: WorkspaceAdapter; checks: CheckExecutor;
@@ -239,7 +239,7 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
 			if (binding.kind !== "authorized") throw new Error(`PR binding ${binding.kind}: ${binding.reason}`);
 			const pr = bindingKey(binding.pr);
 			if (!binding.generation) throw new Error("Invalid authorized PR binding");
-			const body = { deliveryGroupId: groupId, ownerId: group.ownerId, generation: binding.generation, pr: { repo: `${pr.host}/${pr.owner}/${pr.repo}`, number: binding.pr.number }, workspace: intent.workspace, head: receipt.afterCommit, integrationDigest: receipt.digest };
+			const body = { deliveryGroupId: groupId, ownerId: binding.ownerId ?? group.ownerId, generation: binding.generation, pr: { repo: `${pr.host}/${pr.owner}/${pr.repo}`, number: binding.pr.number }, workspace: intent.workspace, head: receipt.afterCommit, integrationDigest: receipt.digest };
 			const request: HandoffRequest = { id: `handoff-${digest(body)}`, ...body };
 			mutate(draft => {
 				const current = record(draft, groupId);
@@ -263,14 +263,16 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
  * verified API result for the exact PR, not the controller's handoff acknowledgement. */
 export type ControllerDeliveryOptions = {
 	controller: Pick<ReviewController, "handoff" | "status">; controllerId: string;
-	prKey: (request: HandoffRequest) => PrKey;
+	/** Optional only for the production binding, where the already-authorized
+	 * request PR identity is canonicalized here after resolvePr has authorized it. */
+	prKey?: (request: HandoffRequest) => PrKey;
 	acknowledged: (request: HandoffRequest) => HandoffAcknowledgement | undefined;
 	verifyMerge: (request: HandoffRequest) => Promise<{ commit: string; url: string; observedAt: number } | undefined>;
 	now?: () => number;
 };
 export function createControllerDeliveryAdapter(options: ControllerDeliveryOptions): DeliveryAdapter {
 	function key(request: HandoffRequest): PrKey {
-		const mapped = options.prKey(request);
+		const mapped = options.prKey?.(request) ?? bindingKey(request.pr);
 		const pr = parsePrKey({ ...mapped, pr: mapped.number });
 		if (!pr || !samePrKey(pr, bindingKey(request.pr))) throw new Error("PR identity mapping mismatch (repo must be host/owner/repo)");
 		return pr;

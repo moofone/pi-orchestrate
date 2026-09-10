@@ -272,3 +272,29 @@ test("ordinary same-revision terminal failure requires explicit retry", async ()
 	await until(() => h.store.read().attempts[0]!.phase === "failed"); await h.scheduler.reconcile();
 	assert.equal(h.store.read().tasks[0]!.phase, "failed"); assert.equal(h.runtime.launches.length, 1); assert.equal(h.store.read().reservations.length, 0); await h.scheduler.shutdown();
 });
+
+
+test("first pool and admission validate atomically; failed admission never changes capacity", async () => {
+ const h = harness(); await h.scheduler.start();
+ const before = h.store.read();
+ const wrong = { ...h.manifest, repo: { ...h.manifest.repo, id: digest("foreign") } };
+ assert.throws(() => h.scheduler.admit(wrong, fakeAuthorization(wrong), { initializeCapacity: true }), /Foreign|repository/);
+ assert.deepEqual(h.store.read(), before);
+ h.scheduler.admit(h.manifest, fakeAuthorization(h.manifest), { initializeCapacity: true });
+ assert.equal(h.store.read().capacity, 1);
+ await h.scheduler.shutdown();
+});
+
+test("independent one-slot admission preserves six occupied repository slots; explicit reduction is atomic", async () => {
+ const h = harness(6); await begin(h); await until(() => h.runtime.launches.length === 6);
+ const next = fakeManifest(); next.id = "independent"; next.repo = h.manifest.repo;
+ next.tasks[0]!.id = "independent-task"; next.tasks[0]!.featureId = "independent-feature"; next.tasks[0]!.deliveryGroupId = "independent-group";
+ next.features[0]!.id = "independent-feature";
+ next.deliveryGroups[0] = { ...next.deliveryGroups[0]!, id: "independent-group", featureIds: ["independent-feature"], requiredTaskIds: ["independent-task"] };
+ h.scheduler.admit(next, fakeAuthorization(next)); await h.scheduler.reconcile();
+ assert.equal(h.store.read().capacity, 6); assert.equal(h.store.read().reservations.length, 6);
+ assert.equal(h.runtime.launches.length, 6);
+ const before = h.store.read(); assert.throws(() => h.scheduler.authorizeCapacity(1), /capacity/i);
+ assert.deepEqual(h.store.read(), before);
+ await h.scheduler.shutdown();
+});

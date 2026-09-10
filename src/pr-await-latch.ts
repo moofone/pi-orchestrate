@@ -35,7 +35,7 @@ import {
 	type FSWatcher,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import {
 	ACTIONABLE,
@@ -46,6 +46,7 @@ import {
 	adoptableLatch,
 	ensureDriver,
 	findFeatureOwningPr,
+	listFeaturePrOwners,
 	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	latchOff,
@@ -92,8 +93,13 @@ import {
 import { classifyGithubStatus, parsePrKey, parseVerdictHead, verdictIdentity } from "./lib/pr-review-identity.ts";
 import { createReviewStore, readPiRunDisk } from "./lib/pr-review-store.ts";
 import { createReviewController, type ReviewController } from "./lib/pr-review-controller.ts";
+import type { DeliveryGroup, ExecutionManifest, IntegrationReceipt, WorkspaceRef } from "./lib/execution-contract.ts";
 import {
 	requestReviewLaunch,
+	EXECUTION_CONTROLLER_BINDING_EVENT,
+	PR_REVIEW_RECONCILED_EVENT,
+	type ExecutionControllerBindingRequest,
+	type ExecutionControllerBinding,
 	type LaunchIntent,
 	type LaunchResult,
 	type OwnerLookup,
@@ -958,6 +964,56 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	/**
+	 * Plan-driven PR delivery asks the latch for this already-created controller.
+	 * The resolver is deliberately narrow: a delivery owner must identify one
+	 * live Feature in the same repository, and the Feature's origin must provide
+	 * a canonical GitHub slug. No synthetic Feature or guessed PR is created.
+	 */
+	const executionEvents = (pi as unknown as { events?: { on: (event: string, handler: (data: any) => void) => () => void; emit: (event: string, data: unknown) => void } }).events;
+	executionEvents?.on(EXECUTION_CONTROLLER_BINDING_EVENT, (request: ExecutionControllerBindingRequest) => {
+		if (!request || request.claimed) return;
+		request.claimed = true;
+		const controller = getController();
+		const ownerFor = (group: DeliveryGroup): FeaturePrOwner | undefined => {
+			// Read on every resolver call: a removed/renamed Feature must become a
+			// refusal instead of reusing a stale bridge-time PR mapping.
+			const ownerCandidates = listFeaturePrOwners({ root: join(homedir(), "orchestrator"), phases: ["pr", "implementing", "feature-qa"] })
+				.filter(owner => !request.repoName || owner.repo === request.repoName)
+				.filter(owner => owner.pr && (!request.repoName || owner.repo === request.repoName));
+			const id = group.ownerId.trim();
+			const exact = ownerCandidates.filter(owner => [owner.dir, owner.name, basename(owner.dir)].includes(id));
+			if (exact.length !== 1) return undefined;
+			return exact[0];
+		};
+		const binding: ExecutionControllerBinding = {
+			controller,
+			controllerId: "pr-review-controller-v1",
+			resolvePr: async ({ manifest, group, workspace }: { manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef }) => {
+				if (manifest.repo.id !== request.repo.id || manifest.repo.commonDir !== request.repo.commonDir || workspace.repoId !== request.repo.id) return { kind: "refused", reason: "Foreign execution repository" };
+				const feature = ownerFor(group);
+				if (!feature) return { kind: "refused", reason: "Ambiguous, stale, or foreign execution delivery owner" };
+				const slug = originSlug(feature.worktree ?? "");
+				if (!slug || !parsePrKey({ slug, pr: feature.pr })) return { kind: "refused", reason: "Feature origin/PR mapping is unavailable" };
+				return { kind: "authorized", pr: { repo: slug, number: Number(feature.pr) }, generation: feature.dir, ownerId: feature.dir };
+			},
+			verifyMerge: async ({ pr, workspace, head }) => {
+				const key = parsePrKey({ slug: pr.repo, pr: pr.number });
+				if (!key || !head) return undefined;
+				try {
+					const result = await pi.exec("gh", ["pr", "view", String(key.number), "--repo", `${key.owner}/${key.repo}`, "--json", "state,mergeCommit,url"], { cwd: workspace.path, timeout: SHORT_MS });
+					if (result.code !== 0) return undefined;
+					const view = JSON.parse(String(result.stdout ?? "")) as { state?: unknown; url?: unknown; mergeCommit?: { oid?: unknown } };
+					const commit = view.mergeCommit?.oid;
+					const url = view.url;
+					if (String(view.state).toUpperCase() !== "MERGED" || typeof commit !== "string" || !/^[a-f0-9]{40}$/i.test(commit) || typeof url !== "string" || !url) return undefined;
+					return { commit: commit.toLowerCase(), url, observedAt: Date.now() };
+				} catch { return undefined; }
+			},
+		};
+		request.resolve(binding);
+	});
+
+	/**
 	 * The Grok/Claude stop-hook injects one undelivered ACTIONABLE verdict on
 	 * Stop. Pi has no Stop hook — the session has already yielded — so the
 	 * latch must deliver that verdict itself or review fixes never start.
@@ -980,6 +1036,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (!hit) {
 			try {
 				await getController().reconcile();
+				executionEvents?.emit(PR_REVIEW_RECONCILED_EVENT, { sessionFile: sessionId });
 			} catch {
 				/* never take the session down */
 			}
@@ -1093,6 +1150,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		});
 		if (!ack.accepted) return;
 		const report = await ctrl.reconcile({ ownerId: owner.id });
+		executionEvents?.emit(PR_REVIEW_RECONCILED_EVENT, { sessionFile: sessionId, pr });
 		if (ack.kind === "env") {
 			lastRefusedFingerprint = fp;
 			return;
@@ -1434,6 +1492,8 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 
 	pi.on("session_shutdown", async () => {
 		// Leave the waiter. Aborting it was the D-2 self-inflicted stall.
+		// Keep the process-local execution binding registered: a later session
+		// start must still reuse this one durable controller.
 		stopWatch();
 		pendingCommands.clear();
 		seenCwds.clear();

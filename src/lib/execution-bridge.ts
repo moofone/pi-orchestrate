@@ -31,16 +31,18 @@ import {
   interpretationConflicts,
   authorizeInterpretation,
   type ApprovalOptions,
+  type ImportOptions,
   type InterpretationTransport,
 } from "./plan-import.ts";
-import { createExecutionStore, type ExecutionStore } from "./execution-store.ts";
+import { createExecutionStore, ExecutionStoreError, type ExecutionStore } from "./execution-store.ts";
 import { createAttemptRuntime, decodeRuntimeStatus, type RuntimeEventBus } from "./attempt-runtime.ts";
 import { createCheckExecutor } from "./execution-checks.ts";
 import { TaskWorkspaces, type WorkspaceGit, type WorkspaceJournal, collectTaskResult } from "./task-workspaces.ts";
 import { ExecutionScheduler, type SchedulerControl } from "./execution-scheduler.ts";
 import { createExecutionDelivery, type DeliveryPrPort, type ExecutionDelivery } from "./execution-delivery.ts";
 import { createControllerDeliveryAdapter, type ControllerDeliveryOptions } from "./execution-delivery.ts";
-import type { ReviewController } from "./pr-review-controller.ts";
+import { PR_REVIEW_RECONCILED_EVENT, type ExecutionControllerBinding } from "./pr-review-events.ts";
+import { compileLegacyPreset, type LegacyCompileOptions } from "./execution-presets.ts";
 
 /** New execution records live below this versioned namespace; legacy Feature records drain separately. */
 export const EXECUTION_ENGINE_VERSION = "plan-driven-v1";
@@ -80,7 +82,7 @@ export function resolvePlanArgument(value: string, cwd = process.cwd()): string 
 }
 
 type ExecutionPi = { exec(file: string, args: string[], options: { cwd: string; timeout?: number }): Promise<{ code?: number; stdout?: string; stderr?: string }> };
-type ControllerBinding = { controller: Pick<ReviewController, "handoff" | "status">; controllerId: string; prKey: ControllerDeliveryOptions["prKey"]; acknowledged: ControllerDeliveryOptions["acknowledged"]; verifyMerge: ControllerDeliveryOptions["verifyMerge"] };
+type ControllerBinding = Pick<ExecutionControllerBinding, "controller" | "controllerId" | "resolvePr" | "verifyMerge"> & Partial<Pick<ControllerDeliveryOptions, "prKey" | "acknowledged">>;
 
 export type ExecutionBridgeOptions = {
   pi?: ExecutionPi;
@@ -106,9 +108,17 @@ export type ExecutionBridgeOptions = {
   delivery?: DeliveryAdapter;
   resolvePr?: DeliveryPrPort;
   controller?: ControllerBinding;
+  /** Select the new legacy-compatible sequential preset; omitted means plan-driven. */
+  preset?: "plan-driven" | "legacy";
+  legacy?: LegacyCompileOptions;
+  repositoryName?: string;
 };
 
+export type ExecutionApproval = ApprovalOptions & { token: string };
 export type ExecutionPreview = {
+  /** Opaque, one-use identity of the exact displayed interpretation and approval boundary. */
+  token: string;
+  boundary: { capacity: number; publication: boolean };
   path: string;
   sourceDigest: string;
   manifest: ExecutionManifest;
@@ -126,7 +136,7 @@ export type ExecutionBridge = {
   readonly delivery: ExecutionDelivery;
   start(): Promise<void>;
   preview(planPath: string): Promise<ExecutionPreview>;
-  run(planPath: string, approval?: ApprovalOptions): Promise<ExecutionRunResult>;
+  run(planPath: string, approval?: ExecutionApproval): Promise<ExecutionRunResult>;
   control(control: SchedulerControl): Promise<void>;
   status(): ReturnType<ExecutionScheduler["progress"]>;
   shutdown(): Promise<void>;
@@ -205,7 +215,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
   const isFetchedBase = async (commit: string): Promise<boolean> => authorizedBases.has(commit);
   const runtime = options.runtime ?? (() => {
     if (!options.events) throw new Error("Runtime event bus required");
-    return createAttemptRuntime({ events: options.events, sessionFile: options.sessionFile, capacity: options.capacity, remainingBudget: options.remainingBudget, callerTools: options.callerTools, callerAgents: options.callerAgents });
+    return createAttemptRuntime({ events: options.events, sessionFile: options.sessionFile, capacity: store.read().capacity || options.capacity, remainingBudget: options.remainingBudget, callerTools: options.callerTools, callerAgents: options.callerAgents });
   })();
   const workspaces = options.workspaces ?? new TaskWorkspaces({
     repo: options.repo,
@@ -224,7 +234,14 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     const result = await options.pi.exec(file, args, { cwd: config.cwd });
     return { exitCode: result.code ?? -1, stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? "") };
   }});
-  const deliveryAdapter = options.delivery ?? (options.controller ? createControllerDeliveryAdapter(options.controller) : noDelivery());
+  const resolvePr = options.resolvePr ?? options.controller?.resolvePr;
+  const deliveryAdapter = options.delivery ?? (options.controller ? createControllerDeliveryAdapter({
+    controller: options.controller.controller,
+    controllerId: options.controller.controllerId,
+    ...(options.controller.prKey ? { prKey: options.controller.prKey } : {}),
+    acknowledged: options.controller.acknowledged ?? (request => store.read().deliveries.find(d => d.handoff?.id === request.id)?.acknowledgement),
+    verifyMerge: options.controller.verifyMerge,
+  }) : noDelivery());
   let activeDelivery: ExecutionDelivery | undefined;
   const workspaceForDelivery = (manifest: ExecutionManifest, groupId: string): WorkspaceRef => {
     const key = `delivery-${digest([manifest.id, manifest.revision, groupId]).slice(0, 24)}`;
@@ -307,6 +324,9 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     },
     now,
   });
+  const reconcileSubscriptions = options.events ? [PR_REVIEW_RECONCILED_EVENT, "pi.execution.reconcile"].map(event => options.events!.on(event, () => {
+    if (started) void scheduler.reconcile().catch(() => {});
+  })) : [];
   // Bind the facade synchronously after lease acquisition, before recovery
   // invokes receipt or delivery callbacks. No Git/RPC under the store lock.
   const recreateDelivery = (nextOwner: CoordinatorOwner): ExecutionDelivery => createExecutionDelivery({
@@ -315,9 +335,20 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     workspace: workspaces,
     checks,
     delivery: deliveryAdapter,
-    ...(options.resolvePr ? { resolvePr: options.resolvePr } : {}),
+    ...(resolvePr ? { resolvePr } : {}),
     now,
   });
+  const appendControlIntent = (control: SchedulerControl): void => {
+    const state = store.read();
+    const matches = state.manifests.filter(manifest => state.activeRevisions[manifest.id] === manifest.revision &&
+      (manifest.id === control.targetId || manifest.features.some(feature => feature.id === control.targetId) || manifest.tasks.some(task => task.id === control.targetId)));
+    if (matches.length !== 1) throw new Error(matches.length ? "Ambiguous execution control target" : "Unknown control target");
+    const manifest = matches[0]!;
+    const authorization = state.authorizations.find(item => item.manifestId === manifest.id && item.revision === manifest.revision);
+    if (!authorization) throw new Error("Missing target authorization");
+    const session = realpathSync(options.sessionFile);
+    store.appendIntent({ id: `intent-${digest([session, authorization.id, control.targetId, control.action, control.immediate ?? false])}`, sessionFile: session, authorizationId: authorization.id, kind: control.action, targetId: control.targetId, ...(control.immediate === undefined ? {} : { immediate: control.immediate }) });
+  };
   const bridge: ExecutionBridge = {
     store,
     scheduler,
@@ -341,16 +372,26 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       const base = await baseCommit();
       const previous = store.read().manifests.filter(manifest => manifest.source.path === source.path).sort((a, b) => b.revision - a.revision)[0];
       const id = previous?.id ?? `execution-${digest([options.repo.id, source.path])}`;
-      const result = await interpretPlan({ id, revision: previous ? previous.revision + 1 : 1, repo: options.repo, baseCommit: base, source, ...(previous ? { previous } : {}) }, options.interpretationTransport);
+      const identity: ImportOptions = { id, revision: previous ? previous.revision + 1 : 1, repo: options.repo, baseCommit: base, source, ...(previous ? { previous } : {}) };
+      const result = options.preset === "legacy"
+        ? { manifest: compileLegacyPreset(identity, options.legacy), unresolvedDecisions: [] as string[] }
+        : await interpretPlan(identity, options.interpretationTransport);
       const capabilities: RuntimeCapabilities = await runtime.probe();
-      return { path, sourceDigest: source.digest, manifest: result.manifest, unresolvedDecisions: result.unresolvedDecisions, conflicts: interpretationConflicts(result.manifest, options.capacity, capabilities) };
+      const capacity = store.read().capacity || options.capacity;
+      const boundary = { capacity, publication: result.manifest.deliveryGroups.some(group => group.policy === "pr") };
+      const token = digest([randomUUID(), path, source.digest, digest(result.manifest), result.manifest.revision, options.repo, base, boundary]);
+      const preview = { token, boundary, path, sourceDigest: source.digest, manifest: result.manifest, unresolvedDecisions: result.unresolvedDecisions, conflicts: interpretationConflicts(result.manifest, capacity, capabilities) };
+      pendingPreviews.set(path, structuredClone(preview));
+      return preview;
     },
     async run(planPath, approval) {
       let preview: ExecutionPreview;
       try {
         const path = resolvePlanArgument(planPath);
         const pending = approval ? pendingPreviews.get(path) : undefined;
+        if (approval && (!pending || !approval.token || approval.token !== pending.token)) return { kind: "refused", reason: "Missing, replaced, or stale approval token; preview again" };
         if (pending) {
+          if (approval!.capacity !== pending.boundary.capacity || (approval!.publication && !pending.boundary.publication)) return { kind: "refused", reason: "Approval exceeds displayed boundary", preview: structuredClone(pending) };
           const source = await importPlanSource(path);
           if (source.digest !== pending.sourceDigest) return { kind: "refused", reason: "Plan changed after preview; import a fresh revision", preview: pending };
           preview = structuredClone(pending);
@@ -363,22 +404,35 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       }
       const pending = pendingPreviews.get(preview.path);
       if (pending && pending.sourceDigest !== preview.sourceDigest) return { kind: "refused", reason: "Plan changed after preview; import a fresh revision", preview };
-      pendingPreviews.delete(preview.path);
-      const authorization = authorizeInterpretation({ manifest: preview.manifest, unresolvedDecisions: [] }, approval);
-      await bridge.start();
-      scheduler.authorizeCapacity(approval.capacity);
-      const activeRevision = bridge.store.read().activeRevisions[preview.manifest.id];
-      if (activeRevision === undefined) scheduler.admit(preview.manifest, authorization);
-      else if (activeRevision === preview.manifest.revision - 1) scheduler.revise(preview.manifest, authorization);
-      else return { kind: "refused", reason: `Manifest revision ${preview.manifest.revision} is not the next authorized revision`, preview };
-      return { kind: "started", manifest: preview.manifest, authorization };
+      try {
+        const { token: _token, ...approved } = approval;
+        const authorization = authorizeInterpretation({ manifest: preview.manifest, unresolvedDecisions: [] }, approved);
+        await bridge.start();
+        const activeRevision = bridge.store.read().activeRevisions[preview.manifest.id];
+        if (activeRevision === undefined) scheduler.admit(preview.manifest, authorization, { initializeCapacity: true });
+        else if (activeRevision === preview.manifest.revision - 1) scheduler.revise(preview.manifest, authorization);
+        else return { kind: "refused", reason: `Manifest revision ${preview.manifest.revision} is not the next authorized revision`, preview };
+        pendingPreviews.delete(preview.path);
+        return { kind: "started", manifest: preview.manifest, authorization };
+      } catch (error) { return { kind: "refused", reason: String(error), preview }; }
     },
     async control(control) {
-      await bridge.start();
-      await scheduler.control(control);
+      try {
+        await bridge.start();
+        await scheduler.control(control);
+      } catch (error) {
+        // A non-owner may observe and submit a data-only intent. It never
+        // steals the coordinator lease or mutates execution state directly.
+        if (error instanceof ExecutionStoreError && error.kind === "lease-held") {
+          appendControlIntent(control);
+          return;
+        }
+        throw error;
+      }
     },
     status() { return scheduler.progress(); },
     async shutdown() {
+      reconcileSubscriptions.forEach(off => off());
       await scheduler.shutdown();
       const runtimeWithDispose = runtime as ReturnType<typeof createAttemptRuntime> & { dispose?: () => void };
       runtimeWithDispose.dispose?.();

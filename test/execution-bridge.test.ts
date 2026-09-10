@@ -54,7 +54,7 @@ test("execution bridge previews without auto-approval and binds approval to the 
   assert.equal(preview.kind, "approval-required", JSON.stringify(preview));
   assert.equal(bridge.store.read().authorizations.length, 0, "preview must not auto-approve");
   if (preview.kind !== "approval-required") return;
-  const started = await bridge.run(planPath, { capacity: 1, publication: false, approvedBy: sessionFile, approvedAt: 10 });
+  const started = await bridge.run(planPath, { token: preview.preview.token, capacity: 1, publication: false, approvedBy: sessionFile, approvedAt: 10 });
   assert.equal(started.kind, "started");
   assert.equal(interpretations, 1, "approval must use the exact preview snapshot, not reinterpret the plan");
   if (started.kind === "started") {

@@ -25,7 +25,11 @@ Live Pi still auto-loads `~/.pi/agent/extensions/*.ts`. Point `-e` here when ite
 
 ## Plan-driven execution
 
-Use `/orchestrate run "path/to/plan.md"` to snapshot and interpret an ordinary Markdown plan. The command shows the manifest digest, revision, capacity, and publication boundary, then requires an explicit approval; plan text never grants execution or publication. Durable records use the versioned execution engine and are independent of legacy Feature records.
+Use `/orchestrate run "path/to/plan.md"` to snapshot and interpret an ordinary Markdown plan. The command shows the complete feature/task/dependency/profile/delivery interpretation plus its immutable approval token, repository capacity boundary, and publication boundary, then requires explicit approval; plan text never grants execution or publication. Durable records use the versioned execution engine and are independent of legacy Feature records.
+
+The selectable legacy preset is configured with `executionPreset: "legacy"` in `src/orchestrate.json`. It compiles only a newly approved run into the sequential worker/reviewer/QA shape; it does not migrate or rewrite existing legacy Feature records. Restore `"plan-driven"` for ordinary Markdown interpretation. Repository capacity is shared and is never silently replaced by a plan's requested shape; capacity changes must be separately authorized.
+
+Plan-driven PR delivery reuses the existing `pr-await-latch` controller. An exact live Feature owner/PR/generation and validated delivery workspace are required; missing or ambiguous mappings remain fenced rather than creating a second controller or guessed PR.
 
 Use targeted controls without a global current-Feature pointer:
 

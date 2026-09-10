@@ -6,10 +6,63 @@
  * allowlist for wait/worktree/land. Ordinary git (status/diff/log/add/commit/
  * push/fetch-alone) is untouched.
  */
-import { resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, relative, resolve } from "node:path";
 import { canonicalizePath } from "./pr-review-store.ts";
 
 export type GuardVerdict = { block: false } | { block: true; reason: string };
+export type ExecutionGuardRole = "worker" | "parent" | "controller";
+export type ExecutionReservation = { role: "worker"; attemptId: string; workspacePath: string; workspaceId?: string };
+
+/**
+ * Resolve a worker reservation from durable execution data. The reservation is
+ * the proof; configured agent names and environment labels are only selectors
+ * and never grant a worker role by themselves.
+ */
+export function executionWriterReservation(input: {
+  cwd: string;
+  reservations: readonly { attemptId?: string; workspacePath: string; workspaceId?: string; slots?: number }[];
+  attemptId?: string;
+}): ExecutionReservation | undefined {
+  const cwd = canonicalizePath(resolve(input.cwd));
+  for (const reservation of input.reservations) {
+    if (!reservation.attemptId || (input.attemptId && reservation.attemptId !== input.attemptId)) continue;
+    const workspacePath = canonicalizePath(resolve(reservation.workspacePath));
+    const rel = relative(workspacePath, cwd);
+    if (rel === "" || (!rel.startsWith("..") && !rel.startsWith("../") && !rel.startsWith("..\\"))) {
+      return { role: "worker", attemptId: reservation.attemptId, workspacePath, ...(reservation.workspaceId ? { workspaceId: reservation.workspaceId } : {}) };
+    }
+  }
+  return undefined;
+}
+
+function durableExecutionStates(): { reservations?: { attemptId?: string; workspacePath: string; workspaceId?: string }[]; deliveries?: { phase?: string; handoff?: { workspace?: { path?: string } } }[] }[] {
+  const root = join(homedir(), "orchestrator", "plan-driven-v1", "execution");
+  if (!existsSync(root)) return [];
+  const states: { reservations?: { attemptId?: string; workspacePath: string; workspaceId?: string }[]; deliveries?: { phase?: string; handoff?: { workspace?: { path?: string } } }[] }[] = [];
+  for (const repoId of readdirSync(root, { withFileTypes: true })) {
+    if (!repoId.isDirectory()) continue;
+    try { states.push(JSON.parse(readFileSync(join(root, repoId.name, "coordinator.json"), "utf8"))); } catch { /* partial or fenced record */ }
+  }
+  return states;
+}
+export function durableExecutionReservation(cwd: string, attemptId?: string): ExecutionReservation | undefined {
+  for (const state of durableExecutionStates()) {
+    const found = executionWriterReservation({ cwd, reservations: Array.isArray(state.reservations) ? state.reservations : [], attemptId });
+    if (found) return found;
+  }
+  return undefined;
+}
+/** Controller-owned delivery workspaces have no worker reservation after handoff,
+ * but remain a mutation fence until the controller reaches a terminal state. */
+export function durableExecutionWorkspaceFence(cwd: string): boolean {
+  const target = canonicalizePath(resolve(cwd));
+  return durableExecutionStates().some(state => (Array.isArray(state.deliveries) ? state.deliveries : []).some(delivery =>
+    ["handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(String(delivery.phase)) &&
+    typeof delivery.handoff?.workspace?.path === "string" &&
+    (target === canonicalizePath(resolve(delivery.handoff.workspace.path)) || target.startsWith(`${canonicalizePath(resolve(delivery.handoff.workspace.path))}/`))));
+}
 
 const RUST = {
 	wt: "git wt <branch>",
@@ -254,15 +307,17 @@ export function mutationTargetDirs(command: string, fallbackCwd?: string): strin
 
 export function classifyForRole(
 	command: string,
-	opts: { writer: boolean; writerReserved?: boolean },
+	opts: { writer: boolean; writerReserved?: boolean; executionRole?: ExecutionGuardRole },
 ): GuardVerdict {
-	if (opts.writer) {
+	const worker = opts.writer || opts.executionRole === "worker";
+	const reservedParent = !worker && (opts.writerReserved || opts.executionRole === "parent");
+	if (worker) {
 		const text = stripComments(command);
 		for (const rule of WRITER_BLOCKS) {
 			if (rule.re.test(text)) return { block: true, reason: rule.reason };
 		}
 	}
-	if (opts.writerReserved && isWorktreeMutation(command)) {
+	if (reservedParent && isWorktreeMutation(command)) {
 		return {
 			block: true,
 			reason:

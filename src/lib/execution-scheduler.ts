@@ -71,15 +71,21 @@ export class ExecutionScheduler {
 		await this.reconcile();
 	}
 	/** Capacity is an explicit repository authorization, never added from a feature request. */
-	authorizeCapacity(capacity: number): void { this.change(state => { state.capacity = capacity; }); this.wake(); }
-	admit(manifest: ExecutionManifest, authorization: ExecutionAuthorization): void { this.install(manifest, authorization, false); }
+	authorizeCapacity(capacity: number): void {
+		if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("Repository capacity exceeded or must be a positive integer");
+		this.change(state => { state.capacity = capacity; }); this.wake();
+	}
+	admit(manifest: ExecutionManifest, authorization: ExecutionAuthorization, options?: { initializeCapacity: boolean }): void { this.install(manifest, authorization, false, options?.initializeCapacity); }
 	revise(manifest: ExecutionManifest, authorization: ExecutionAuthorization): void { this.install(manifest, authorization, true); }
-	private install(manifest: ExecutionManifest, authorization: ExecutionAuthorization, revision: boolean): void {
+	private install(manifest: ExecutionManifest, authorization: ExecutionAuthorization, revision: boolean, initializeCapacity = false): void {
 		validateAuthorization(manifest, authorization);
 		this.change(state => {
 			const previous = state.activeRevisions[manifest.id];
 			if (revision ? previous === undefined || manifest.revision !== previous + 1 : previous !== undefined) throw new Error("Invalid admission/revision order");
 			if (manifest.repo.id !== state.repo.id) throw new Error("Foreign repository");
+			// First-pool authorization and admission commit together. Independent
+			// plans request a shape, not a replacement repository-wide pool.
+			if (initializeCapacity && state.capacity === 0) state.capacity = authorization.capacity;
 			if (manifest.deliveryGroups.some(g => state.deliveries.some(d => d.groupId === g.id && deliveryFenced(d)))) throw new Error("Delivery ownership is fenced");
 			const stored = state.manifests.find(m => m.id === manifest.id && m.revision === manifest.revision);
 			if (stored && digest(stored) !== digest(manifest)) throw new Error("Persisted manifest revision mismatch");

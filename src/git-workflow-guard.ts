@@ -13,6 +13,8 @@ import {
 	classifyViewRepeat,
 	isWorktreeMutation,
 	mutationTargetDirs,
+	durableExecutionReservation,
+	durableExecutionWorkspaceFence,
 	isWriterRole,
 	viewRepeatKey,
 } from "./lib/git-workflow-guard.ts";
@@ -26,6 +28,8 @@ export {
 	extractPrNumber,
 	isWorktreeMutation,
 	mutationTargetDirs,
+	durableExecutionReservation,
+	durableExecutionWorkspaceFence,
 	isWriterRole,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
@@ -44,20 +48,24 @@ export default function (pi: ExtensionAPI) {
 		if (!command) return;
 
 		let writerReserved = false;
-		if (!writer && isWorktreeMutation(command)) {
+		let executionRole: "worker" | "parent" | undefined;
+		if (isWorktreeMutation(command)) {
 			try {
 				const fallback =
 					(typeof (event as { cwd?: string }).cwd === "string" && (event as { cwd?: string }).cwd) ||
 					process.cwd();
+				const targets = mutationTargetDirs(command, fallback);
+				const attemptId = process.env.PI_EXECUTION_ATTEMPT_ID;
+				const executionWorker = !writer && targets.map(dir => durableExecutionReservation(dir, attemptId)).find(Boolean);
+				if (writer || executionWorker) executionRole = "worker";
+				else if (targets.some(dir => durableExecutionReservation(dir) || durableExecutionWorkspaceFence(dir))) executionRole = "parent";
 				const store = createReviewStore(stateDir());
-				writerReserved = mutationTargetDirs(command, fallback).some((dir) =>
-					Boolean(store.writerForWorktree(dir)),
-				);
+				writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
 			} catch {
 				writerReserved = false;
 			}
 		}
-		const first = classifyForRole(command, { writer, writerReserved });
+		const first = classifyForRole(command, { writer, writerReserved: writerReserved || executionRole === "parent", ...(executionRole ? { executionRole } : {}) });
 		if (first.block) return first;
 
 		const key = viewRepeatKey(command);
