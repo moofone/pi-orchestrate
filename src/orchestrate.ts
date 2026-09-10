@@ -245,17 +245,16 @@ export function isAllowedQaModel(model: string, jsonText?: string): boolean {
   return (model.split(":")[0] ?? "").trim().toLowerCase() === qaModelBase(jsonText);
 }
 
-/** Writers may not inherit the parent Cursor Grok session. */
+/**
+ * Orchestration writers run one billed id: `openai-codex/gpt-5.6-luna`.
+ * Anything else (legacy GLM/cursor/Anthropic ids, composer, inherit) is off
+ * the allow-list — `applySpawnPolicy` repins it onto Luna and
+ * `writerSpawnRejection` names the refuse for callers that bypass the pin.
+ */
 export function isAllowedWriterModel(model: string): boolean {
   if (typeof model !== "string") return false;
   const base = (model.split(":")[0] ?? "").trim().toLowerCase();
-  return (
-    base === "openai-codex/gpt-5.6-luna" ||
-    base === "zai/glm-5.3-flash" ||
-    base === "cursor/grok-4.6" ||
-    base === "cursor/gpt-5.6-luna" ||
-    base === "anthropic/claude-opus-5"
-  );
+  return base === "openai-codex/gpt-5.6-luna";
 }
 
 /** Why this spawn must not go out. `undefined` means the guard does not apply or the model is allowed. */

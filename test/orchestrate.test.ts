@@ -1233,7 +1233,7 @@ test("T1: mixed dash then colon in one plan both parse", () => {
  * W1 — orchestration writers must not inherit Cursor Grok / Composer
  * ---------------------------------------------------------------- */
 
-test("W1: isAllowedWriterModel allows OpenAI Luna, GLM flash, cursor grok, Cursor Luna, and Anthropic Opus writers", () => {
+test("W1: isAllowedWriterModel allows only OpenAI Luna writers", () => {
   assert.equal(
     typeof (orch as Record<string, unknown>).isAllowedWriterModel,
     "function",
@@ -1244,14 +1244,16 @@ test("W1: isAllowedWriterModel allows OpenAI Luna, GLM flash, cursor grok, Curso
 
   assert.equal(allowed("openai-codex/gpt-5.6-luna"), true);
   assert.equal(allowed("openai-codex/gpt-5.6-luna:xhigh"), true);
-  assert.equal(allowed("zai/glm-5.3-flash"), true);
-  assert.equal(allowed("zai/glm-5.3-flash:medium"), true);
-  assert.equal(allowed("zai/glm-5.3-flash:high"), true);
-  assert.equal(allowed("cursor/grok-4.6"), true);
-  assert.equal(allowed("cursor/grok-4.6:medium"), true);
-  assert.equal(allowed("cursor/gpt-5.6-luna"), true);
-  assert.equal(allowed("cursor/gpt-5.6-luna:xhigh"), true);
-  assert.equal(allowed("anthropic/claude-opus-5:medium"), true);
+  // Legacy writer ids stay off the allow-list so applySpawnPolicy repins them
+  // onto OpenAI Luna instead of letting them through unpinned.
+  assert.equal(allowed("zai/glm-5.3-flash"), false, "legacy GLM writer must repin onto Luna");
+  assert.equal(allowed("zai/glm-5.3-flash:medium"), false);
+  assert.equal(allowed("zai/glm-5.3-flash:high"), false);
+  assert.equal(allowed("cursor/grok-4.6"), false);
+  assert.equal(allowed("cursor/grok-4.6:medium"), false);
+  assert.equal(allowed("cursor/gpt-5.6-luna"), false, "cursor-billed Luna is not the writer id");
+  assert.equal(allowed("cursor/gpt-5.6-luna:xhigh"), false);
+  assert.equal(allowed("anthropic/claude-opus-5:medium"), false);
   assert.equal(allowed("cursor/claude-opus-5"), false);
   assert.equal(allowed("cursor/claude-opus-5:high"), false);
   assert.equal(allowed("anthropic/claude-sonnet-5"), false);
@@ -1280,22 +1282,18 @@ test("W1: writerSpawnRejection names the refuse for tdd-worker on cursor/grok", 
     reject({ agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" }),
     undefined,
   );
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "zai/glm-5.3-flash:medium" }),
-    undefined,
-  );
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "cursor/grok-4.6:medium" }),
-    undefined,
-  );
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "cursor/gpt-5.6-luna:xhigh" }),
-    undefined,
-  );
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "anthropic/claude-opus-5:medium" }),
-    undefined,
-  );
+  // Legacy writer ids are off the allow-list: the refuse text names the one
+  // legal id. (Live spawns are repinned by applySpawnPolicy before this fires.)
+  for (const legacy of [
+    "zai/glm-5.3-flash:medium",
+    "cursor/grok-4.6:medium",
+    "cursor/gpt-5.6-luna:xhigh",
+    "anthropic/claude-opus-5:medium",
+  ]) {
+    const refusal = reject({ agent: "tdd-worker", model: legacy });
+    assert.equal(typeof refusal, "string", `${legacy} is no longer an allowed writer`);
+    assert.match(String(refusal), /gpt-5\.6-luna/, "refusal names the only legal writer id");
+  }
   assert.equal(
     reject({ agent: "planner", model: "xai/grok-4.6:high" }),
     undefined,
@@ -4079,7 +4077,14 @@ test("T1: applySpawnPolicy still pins writers for the extension rpcCall path", (
       applySpawnPolicy: (p: Record<string, unknown>) => { action: string };
     }
   ).applySpawnPolicy;
-  const writer = { agent: "tdd-worker", model: "cursor/gpt-5.6-luna:xhigh" };
+  const legacyWriter = { agent: "tdd-worker", model: "cursor/gpt-5.6-luna:xhigh" };
+  assert.equal(apply(legacyWriter).action, "pin");
+  assert.equal(
+    legacyWriter.model,
+    "openai-codex/gpt-5.6-luna:xhigh",
+    "cursor-billed Luna repins onto the OpenAI writer id",
+  );
+  const writer = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
   assert.equal(apply(writer).action, "allow");
   const planner = { agent: "planner", model: "xai/grok-4.6:high" };
   assert.notEqual(apply(planner).action, "reject");
@@ -4093,7 +4098,7 @@ test("T2: pinWriterCaps is a ceiling — a smaller requested budget survives", (
   ).applySpawnPolicy;
   const open = {
     agent: "tdd-worker",
-    model: "cursor/gpt-5.6-luna:xhigh",
+    model: "openai-codex/gpt-5.6-luna:xhigh",
     turnBudget: { maxTurns: 15, graceTurns: 5 },
   };
   apply(open);
@@ -4434,7 +4439,7 @@ test("T7: mutation writers never get contact_supervisor or an intercom bridge", 
 
   const writer = {
     agent: "tdd-worker",
-    model: "cursor/gpt-5.6-luna:xhigh",
+    model: "openai-codex/gpt-5.6-luna:xhigh",
     intercomBridge: { mode: "always" },
     tools: ["read", "contact_supervisor"],
   };
