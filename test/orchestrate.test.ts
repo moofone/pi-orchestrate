@@ -2615,8 +2615,8 @@ test("L4: the skill still leaves a solo session its own latch, verdict, and fix"
   );
   assert.match(
     src,
-    /`read_comments_and_fix` \| fix current-head findings[^|]*`git pr-await` once/,
-    "the solo `next=` table still tells that session to fix, push, and re-await",
+    /`read_comments_and_fix` \| dispatch a `fixer` child[^|]*one push[^|]*`git pr-await` once/,
+    "the solo `next=` table delegates fixes, then keeps push and re-await with the owner",
   );
 
   const harness = skillSection("Harness");
