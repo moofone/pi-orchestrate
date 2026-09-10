@@ -31,6 +31,8 @@ export class ExecutionScheduler {
 	private loop?: Promise<void>;
 	private dirty = false;
 	private jobs = new Map<string, Promise<void>>();
+	private validationJobs = new Map<string, Promise<void>>();
+	private stopJobs = new Map<string, Promise<void>>();
 	private deliveryJob?: Promise<void>;
 	private listeners = new Set<(state: CoordinatorState) => void>();
 	private lastFeature = "";
@@ -115,20 +117,36 @@ export class ExecutionScheduler {
 				if (active) { active.intent = control.action === "pause" && control.immediate ? "stop" : record.intent; if ((control.action === "pause" && control.immediate) || control.action === "cancel") stops.push(structuredClone(active)); }
 			}
 		});
-		await Promise.all(stops.map(a => this.stop(a)));
+		for (const attempt of stops) this.scheduleStop(attempt);
 	}
-	private async stop(attempt: TaskAttempt): Promise<void> {
-		if (!attempt.run || !this.owner) return;
-		const owner = this.owner;
-		const outcome = await this.options.runtime.control(attempt.run, "stop", owner.sessionFile);
-		if (!this.live(owner)) return;
-		this.change(state => {
-			const current = state.attempts.find(a => a.id === attempt.id)!;
-			if (!occupiesCapacity(current) || current.terminal) return;
-			if (outcome.kind === "acknowledged" && ["running", "recovery-needed"].includes(current.phase)) this.move(state, current, "stopping");
-			else if (outcome.kind !== "acknowledged") current.reason = outcome.reason;
+	private scheduleStop(attempt: TaskAttempt): void {
+		if (!attempt.run || !this.owner || !occupiesCapacity(attempt) || attempt.terminal || !["stop", "cancel"].includes(attempt.intent)) return;
+		const owner = this.owner, run = attempt.run;
+		const key = digest([owner.epoch, attempt.id, run]);
+		if (this.stopJobs.has(key)) return;
+		// The persisted intent survives restart; retain completed jobs to avoid repeated RPCs
+		// on every observation. A new coordinator can safely redispatch the stop.
+		const job = Promise.resolve().then(async () => {
+			if (!this.live(owner)) return;
+			const outcome = await this.options.runtime.control(run, "stop", owner.sessionFile);
+			if (!this.live(owner)) return;
+			if (outcome.kind !== "acknowledged") throw new Error(outcome.reason);
+			this.change(state => {
+				const current = state.attempts.find(a => a.id === attempt.id)!;
+				if (!occupiesCapacity(current) || current.terminal || digest(current.run) !== digest(run)) return;
+				if (["running", "recovery-needed"].includes(current.phase)) this.move(state, current, "stopping");
+			});
+		}).catch(error => {
+			if (!this.live(owner)) return;
+			this.lastError = `Stop ${attempt.id}: ${String(error)}`;
+			this.change(state => {
+				const current = state.attempts.find(a => a.id === attempt.id)!;
+				if (occupiesCapacity(current) && !current.terminal && digest(current.run) === digest(run)) current.reason = String(error);
+			});
 		});
+		this.stopJobs.set(key, job);
 	}
+
 	async shutdown(): Promise<void> {
 		this.stopped = true; this.unsubscribe?.(); if (this.timer) clearTimeout(this.timer);
 		// Do not wait for missing RPC acknowledgements and do not release child reservations.
@@ -211,18 +229,18 @@ export class ExecutionScheduler {
 		const record = state.tasks.find(t => t.taskId === attempt.taskId)!;
 		if (record.attemptIds.at(-1) === attempt.id) { record.phase = phase; if (extra.reason) record.reason = extra.reason; }
 	}
-	private launchJob(id: string, job: () => Promise<void>): void {
-		if (this.jobs.has(id)) return;
+	private launchJob(id: string, job: () => Promise<void>, jobs = this.jobs): void {
+		if (jobs.has(id)) return;
 		const promise = Promise.resolve().then(job).catch(error => {
 			this.lastError = String(error);
 			if (!this.stopped && this.owner && this.live(this.owner)) this.change(state => { const a = state.attempts.find(a => a.id === id); if (a && occupiesCapacity(a)) this.move(state, a, "recovery-needed", { reason: String(error) }); });
-		}).finally(() => { this.jobs.delete(id); this.wake(); });
-		this.jobs.set(id, promise);
+		}).finally(() => { jobs.delete(id); this.wake(); });
+		jobs.set(id, promise);
 	}
 	private async recover(): Promise<void> {
 		const owner = this.owner!;
-		await Promise.all(this.observe().attempts.filter(a => occupiesCapacity(a) && !this.jobs.has(a.id)).map(async attempt => {
-			if (attempt.terminal?.outcome === "succeeded") { if (attempt.phase === "validating") this.launchJob(attempt.id, () => this.validate(attempt.id)); return; }
+		await Promise.all(this.observe().attempts.filter(a => occupiesCapacity(a) && !(a.phase === "preparing" && this.jobs.has(a.id))).map(async attempt => {
+			if (attempt.terminal?.outcome === "succeeded") { if (attempt.phase === "validating") this.launchJob(attempt.id, () => this.validate(attempt.id), this.validationJobs); return; }
 			if (attempt.phase === "preparing") this.change(s => { this.move(s, s.attempts.find(a => a.id === attempt.id)!, "recovery-needed", { reason: "Interrupted workspace preparation; inspect before replacement" }); });
 			let outcome: LaunchOutcome;
 			try {
@@ -231,7 +249,7 @@ export class ExecutionScheduler {
 					? await this.options.runtime.lookupOperation(attempt.operationId, attempt.ownerSessionFile)
 					: await this.options.runtime.observe(attempt);
 			} catch (error) { outcome = { kind: "unknown", reason: String(error) }; }
-			if (this.live(owner)) await this.outcome(attempt.id, outcome);
+			if (this.live(owner) && !(this.jobs.has(attempt.id) && outcome.kind === "unknown")) await this.outcome(attempt.id, outcome);
 		}));
 	}
 	private scheduleRecheck(taskId: string): void {
@@ -310,7 +328,11 @@ export class ExecutionScheduler {
 		let outcome: LaunchOutcome;
 		try { outcome = await this.options.runtime.launch({ attempt: current, task, profile: task.profile, authorization }); }
 		catch (error) { outcome = { kind: "unknown", reason: String(error) }; }
-		if (this.live(owner)) { await this.outcome(id, outcome); const a = this.observe().attempts.find(a => a.id === id)!; if (a.intent === "cancel" || a.intent === "stop") await this.stop(a); }
+		if (this.live(owner)) {
+			const current = this.observe().attempts.find(a => a.id === id)!;
+			// Exact observation outranks a delayed launch acknowledgement.
+			if (!current.terminal && (!current.run || outcome.kind === "known-terminal")) await this.outcome(id, outcome);
+		}
 	}
 	private groupOutcome(state: CoordinatorState, id: string, unmet: boolean): void {
 		const set = state.parallelLaunchSets.find(s => s.attemptIds.includes(id)); if (!set) return;
@@ -326,7 +348,16 @@ export class ExecutionScheduler {
 				if (outcome.kind === "known-terminal") {
 					validate = outcome.evidence.outcome === "succeeded";
 					this.move(state, attempt, validate ? "validating" : "failed", { terminal: outcome.evidence });
-					if (!validate) state.reservations = state.reservations.filter(r => r.attemptId !== id);
+					if (!validate) {
+						state.reservations = state.reservations.filter(r => r.attemptId !== id);
+						const manifest = state.manifests.find(m => m.id === attempt.manifestId && m.revision === state.activeRevisions[m.id]);
+						const spec = manifest?.tasks.find(t => t.id === attempt.taskId);
+						const inputs = manifest && spec ? this.inputs(state, manifest, spec) : undefined;
+						if (manifest && spec && manifest.revision !== attempt.manifestRevision && (taskRevisionDigest(spec) !== attempt.taskDigest || manifest.baseCommit !== attempt.baseCommit || !inputs || digest(inputs.map(r => r.digest)) !== digest(attempt.prerequisiteDigests))) {
+							const record = state.tasks.find(t => t.taskId === attempt.taskId)!;
+							record.phase = "pending"; delete record.resultDigest; delete record.reason;
+						}
+					}
 				} else if (attempt.phase !== "stopping") this.move(state, attempt, "running");
 				this.groupOutcome(state, id, false);
 			} else if (outcome.kind === "unknown") { this.move(state, attempt, "recovery-needed", { reason: outcome.reason }); this.groupOutcome(state, id, true); }
@@ -338,8 +369,8 @@ export class ExecutionScheduler {
 			}
 		});
 		if (deferred) this.scheduleRecheck(this.observe().attempts.find(a => a.id === id)!.taskId);
-		if (validate && !this.jobs.has(id)) this.launchJob(id, () => this.validate(id));
-		else if (validate) await this.validate(id);
+		if (validate) this.launchJob(id, () => this.validate(id), this.validationJobs);
+		this.scheduleStop(this.observe().attempts.find(a => a.id === id)!);
 	}
 	private async validate(id: string): Promise<void> {
 		const owner = this.owner!, state = this.observe(), attempt = state.attempts.find(a => a.id === id)!;

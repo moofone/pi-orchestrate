@@ -22,7 +22,7 @@ class Runtime extends FakeAttemptRuntime {
 		const outcome = { kind: "known-running" as const, run: { runId: `run-${id}`, artifactDir: `/artifacts/${id}`, ownerSessionFile: request.attempt.ownerSessionFile } };
 		this.observations.set(id, outcome); this.gates.get(id)!.resolve(outcome);
 	}
-	finish(id: string, outcome: "succeeded" | "stopped" = "succeeded") {
+	finish(id: string, outcome: "succeeded" | "stopped" | "failed" = "succeeded") {
 		const observation = this.observations.get(id)!; assert.equal(observation.kind, "known-running"); if (observation.kind !== "known-running") return;
 		this.intervals.get(id)!.end = performance.now();
 		this.observations.set(id, { kind: "known-terminal", evidence: { kind: "terminal", run: observation.run, outcome, evidenceDigest: digest([id, outcome]), observedAt: Date.now() } }); this.emit({ attemptId: id });
@@ -208,4 +208,67 @@ test("slow injected delivery orchestration does not hold the repository admissio
 	h.scheduler = new ExecutionScheduler({ ...h.options, reconcileDelivery: async () => { deliveries++; await gate.promise; } });
 	await begin(h); await until(() => h.runtime.launches.length === 1); assert.equal(deliveries, 1);
 	await h.scheduler.shutdown(); gate.resolve();
+});
+
+
+test("terminal observation settles pending launch once and fences late acknowledgement", async () => {
+	const h = harness(); const receipt = h.options.createReceipt; const gate = barrier<void>(); let calls = 0;
+	h.options.createReceipt = async input => { calls++; await gate.promise; return receipt(input); };
+	await begin(h); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt;
+	h.runtime.observations.set(a.id, { kind: "known-terminal", evidence: { kind: "terminal", run: { runId: "early", artifactDir: "/early", ownerSessionFile: a.ownerSessionFile }, outcome: "succeeded", evidenceDigest: digest(a.id), observedAt: Date.now() } });
+	await h.scheduler.reconcile(); await until(() => calls === 1);
+	for (let n = 0; n < 5; n++) await h.scheduler.reconcile(); assert.equal(calls, 1);
+	gate.resolve(); await until(() => h.store.read().results.length === 1);
+	h.runtime.gates.get(a.id)!.resolve({ kind: "unknown", reason: "late acknowledgement" });
+	await new Promise(r => setTimeout(r, 20)); await h.scheduler.reconcile();
+	assert.equal(h.store.read().attempts[0]!.phase, "succeeded"); assert.equal(h.store.read().reservations.length, 0); assert.equal(h.runtime.launches.length, 1); assert.equal(calls, 1); await h.scheduler.shutdown();
+});
+
+test("recovery dispatches persisted immediate stop once after unknown launch", async () => {
+	const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt;
+	h.runtime.gates.get(a.id)!.resolve({ kind: "unknown", reason: "lost" }); await until(() => h.store.read().attempts[0]!.phase === "recovery-needed");
+	await h.scheduler.control({ targetId: a.taskId, action: "pause", immediate: true }); h.runtime.running(a.id);
+	await h.scheduler.reconcile(); await until(() => h.runtime.controls.length === 1);
+	for (let n = 0; n < 5; n++) await h.scheduler.reconcile();
+	assert.equal(h.runtime.controls.length, 1); assert.equal(h.store.read().reservations.length, 1);
+	h.runtime.finish(a.id, "stopped"); await until(() => h.store.read().reservations.length === 0); assert.equal(h.store.read().tasks[0]!.intent, "pause"); await h.scheduler.shutdown();
+});
+
+for (const outcome of ["stopped", "failed"] as const) for (const intent of ["none", "pause", "cancel"] as const) test(`superseded ${outcome} attempt reevaluates replacement preserving ${intent}`, async () => {
+	const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt; h.runtime.running(a.id); await until(() => h.store.read().attempts[0]!.phase === "running");
+	const revised = structuredClone(h.manifest); revised.revision++; revised.tasks[0]!.text += " changed"; h.scheduler.revise(revised, fakeAuthorization(revised));
+	if (intent !== "none") await h.scheduler.control({ targetId: a.taskId, action: intent });
+	h.runtime.finish(a.id, outcome); await until(() => h.store.read().attempts[0]!.phase === "failed"); await h.scheduler.reconcile();
+	if (intent === "none") { await until(() => h.runtime.launches.length === 2); assert.equal(h.runtime.launches[1]!.attempt.manifestRevision, 2); }
+	else { assert.equal(h.runtime.launches.length, 1); assert.equal(h.store.read().tasks[0]!.intent, intent); }
+	await h.scheduler.shutdown();
+});
+
+test("pending stop does not block authorized unrelated admission and stale stop ack is fenced", async () => {
+	const h = harness(); await begin(h, 2); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt; h.runtime.running(a.id); await until(() => h.store.read().attempts[0]!.phase === "running");
+	const gate = barrier<{ kind: "unsupported"; reason: string }>(); h.runtime.control = async (run, action, sessionFile) => { h.runtime.controls.push({ runId: run.runId, action, sessionFile }); return gate.promise; };
+	const next = fakeManifest(); next.id = "manifest-b"; next.repo = h.manifest.repo; next.tasks[0]!.id = "task-b"; next.tasks[0]!.deliveryGroupId = "delivery-b"; next.deliveryGroups[0]!.id = "delivery-b"; next.deliveryGroups[0]!.requiredTaskIds = ["task-b"];
+	const owner = h.store.read().owner!; h.store.transact(owner, s => { s.manifests.push(next); s.authorizations.push(fakeAuthorization(next)); });
+	h.store.appendIntent({ id: "pause", sessionFile: owner.sessionFile, authorizationId: fakeAuthorization(h.manifest).id, kind: "pause", targetId: a.taskId, immediate: true });
+	h.store.appendIntent({ id: "admit-b", sessionFile: owner.sessionFile, authorizationId: fakeAuthorization(next).id, kind: "admit", targetId: next.id, manifest: next });
+	void h.scheduler.reconcile(); await until(() => h.runtime.launches.length === 2);
+	assert.ok(h.store.read().intents.every(i => i.consumedAt !== undefined)); assert.equal(h.store.read().reservations.length, 2);
+	await h.scheduler.shutdown(); const replacement = new ExecutionScheduler({ ...h.options, owner: { ...h.options.owner, instanceId: "replacement" } });
+	h.runtime.control = async run => ({ kind: "acknowledged", run }); await replacement.start(); const before = h.store.read(); gate.resolve({ kind: "unsupported", reason: "stale failure" });
+	await new Promise(r => setTimeout(r, 20)); assert.deepEqual(h.store.read(), before); await replacement.shutdown();
+});
+
+for (const reject of [false, true]) test(`stop failure is surfaced without releasing capacity (reject=${reject})`, async () => {
+	const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt; h.runtime.running(a.id); await until(() => h.store.read().attempts[0]!.phase === "running");
+	h.runtime.control = async (run, action, sessionFile) => { h.runtime.controls.push({ runId: run.runId, action, sessionFile }); if (reject) throw new Error("stop lost"); return { kind: "unknown", reason: "stop lost" }; };
+	await h.scheduler.control({ targetId: a.taskId, action: "pause", immediate: true }); await until(() => !!h.scheduler.progress().error?.includes("stop lost"));
+	await h.scheduler.reconcile(); assert.equal(h.runtime.controls.length, 1); assert.match(h.store.read().attempts[0]!.reason!, /stop lost/); assert.equal(h.store.read().reservations.length, 1); await h.scheduler.shutdown();
+});
+
+
+test("ordinary same-revision terminal failure requires explicit retry", async () => {
+	const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt;
+	h.runtime.running(a.id); await until(() => h.store.read().attempts[0]!.phase === "running"); h.runtime.finish(a.id, "failed");
+	await until(() => h.store.read().attempts[0]!.phase === "failed"); await h.scheduler.reconcile();
+	assert.equal(h.store.read().tasks[0]!.phase, "failed"); assert.equal(h.runtime.launches.length, 1); assert.equal(h.store.read().reservations.length, 0); await h.scheduler.shutdown();
 });
