@@ -10,7 +10,7 @@ export type Provenance = { field: string; origin: "explicit" | "inferred"; ancho
 export type SourceSnapshot = { path: string; bytes: string; digest: Digest };
 export type ExecutionProfile = {
 	agent?: string; model?: string; thinking?: string; tools?: string[];
-	context?: "fresh" | "inherit"; supervisor?: boolean; intercom?: boolean;
+	context?: "fresh" | "fork"; supervisor?: boolean; intercom?: boolean;
 	maxTurns?: number; timeoutMs?: number;
 };
 export type CheckSpec = {
@@ -211,7 +211,7 @@ function validateProfile(value: unknown): void {
 	for (const key of Object.keys(value)) requireThat(["agent", "model", "thinking", "tools", "context", "supervisor", "intercom", "maxTurns", "timeoutMs"].includes(key), "Unknown profile field");
 	for (const key of ["agent", "model", "thinking"]) if (value[key] !== undefined) text(value[key]);
 	if (value.tools !== undefined) strings(value.tools);
-	if (value.context !== undefined) requireThat(["fresh", "inherit"].includes(value.context as string), "Invalid context");
+	if (value.context !== undefined) requireThat(["fresh", "fork"].includes(value.context as string), "Invalid context");
 	for (const key of ["supervisor", "intercom"]) if (value[key] !== undefined) requireThat(typeof value[key] === "boolean", "Invalid profile flag");
 	for (const key of ["maxTurns", "timeoutMs"]) if (value[key] !== undefined) integer(value[key], 1);
 }
@@ -354,6 +354,7 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 		const includeDependencies = (id: Id): void => { if (ancestors.has(id)) return; ancestors.add(id); manifest!.tasks.find(t => t.id === id)!.dependencies.forEach(includeDependencies); };
 		task.dependencies.forEach(includeDependencies);
 		const inputs = attempt.prerequisiteDigests.map(d => state.results.find(r => r.digest === d)!);
+		requireThat(inputs.every(r => r.repoId === manifest!.repo.id && r.baseCommit === attempt.baseCommit), "Prerequisite receipt base/repository mismatch");
 		requireThat(inputs.every(r => ancestors.has(r.taskId) && r.taskDigest === taskRevisionDigest(manifest!.tasks.find(t => t.id === r.taskId)!)), "Unrelated/stale prerequisite receipt");
 		if (!["pending", "dependency-blocked", "ready"].includes(attempt.phase)) requireThat(task.dependencies.every(id => inputs.some(r => r.taskId === id)), "Missing required prerequisite result");
 		transitionAttempt(attempt, attempt.phase, { at: attempt.updatedAt });
@@ -425,10 +426,10 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 		requireThat(["pending", "integrating", "blocked", "ready", "handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(d.phase), "Invalid delivery phase");
 		if (["ready", "handoff-pending", "controller-owned", "merged", "closed-unmerged"].includes(d.phase)) {
 			const receipt = state.integrationReceipts.find(r => r.digest === d.integrationDigest && r.deliveryGroupId === d.groupId); requireThat(receipt, "Delivery missing validated integration");
-			const groups = state.manifests.filter(m => state.activeRevisions[m.id] === m.revision).flatMap(m => m.deliveryGroups).filter(g => g.id === d.groupId);
+			const groups = state.manifests.filter(m => state.activeRevisions[m.id] === m.revision).flatMap(manifest => manifest.deliveryGroups.map(group => ({ manifest, group }))).filter(({ group }) => group.id === d.groupId);
 			requireThat(groups.length > 0, "Delivery has no active group");
-			for (const group of groups) {
-				requireThat(group.requiredTaskIds.every(id => receipt.inputDigests.some(input => state.results.some(r => r.digest === input && r.taskId === id))), "Delivery missing required result");
+			for (const { manifest, group } of groups) {
+				requireThat(group.requiredTaskIds.every(id => receipt.inputDigests.some(input => state.results.some(r => r.digest === input && r.taskId === id && r.repoId === manifest.repo.id && r.baseCommit === manifest.baseCommit && r.taskDigest === taskRevisionDigest(manifest.tasks.find(t => t.id === id)!)))), "Delivery missing required result or contains stale result");
 				validateRequiredChecks(group.checks, receipt.checks, state.integrations.find(i => i.id === receipt.intentId)!.createdAt);
 			}
 		}
@@ -447,7 +448,7 @@ export function validateStateChange(previous: CoordinatorState, next: Coordinato
 		const candidate = next.attempts.find(a => a.id === old.id); requireThat(candidate, "Attempt history removed");
 		for (const key of ["id", "taskId", "manifestId", "manifestRevision", "taskDigest", "ownerSessionFile", "launchDigest", "workspace", "baseCommit", "prerequisiteDigests", "createdAt"] as const) requireThat(digest(old[key]) === digest(candidate[key]), `Attempt contract changed: ${key}`);
 		for (const key of ["run", "operationId", "terminal", "nonStart", "resultDigest"] as const) if (old[key] !== undefined) requireThat(candidate[key] !== undefined && digest(old[key]) === digest(candidate[key]), `Attempt evidence changed: ${key}`);
-		transitionAttempt(old, candidate.phase, { at: candidate.updatedAt, ...(candidate.terminal ? { terminal: candidate.terminal } : {}), ...(candidate.nonStart ? { nonStart: candidate.nonStart } : {}), ...(candidate.resultDigest ? { resultDigest: candidate.resultDigest } : {}) });
+		transitionAttempt({ ...old, ...(candidate.run ? { run: candidate.run } : {}) }, candidate.phase, { at: candidate.updatedAt, ...(candidate.terminal ? { terminal: candidate.terminal } : {}), ...(candidate.nonStart ? { nonStart: candidate.nonStart } : {}), ...(candidate.resultDigest ? { resultDigest: candidate.resultDigest } : {}) });
 	}
 	for (const r of previous.reservations) {
 		const retained = next.reservations.find(n => n.id === r.id);

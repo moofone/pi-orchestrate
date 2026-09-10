@@ -172,6 +172,56 @@ test("execution-contract: pending transfer fences mutation; acknowledgement is n
 	merged.deliveries[0]!.mergeEvidence = { commit: "c".repeat(40), url: "https://example.test/pr/1", observedAt: 6 }; validateStateChange(accepted, merged);
 });
 
+test("execution-contract: atomic launch acknowledgement records run before validating transition", () => {
+	for (const earlyTerminal of [false, true]) {
+		const previous = activeState(); previous.attempts[0]!.phase = "launching";
+		const next = structuredClone(previous), attempt = next.attempts[0]!;
+		attempt.run = { runId: "acknowledged-run", artifactDir: "/fixture/acknowledged", ownerSessionFile: attempt.ownerSessionFile };
+		next.attempts[0] = transitionAttempt(attempt, earlyTerminal ? "validating" : "running", {
+			at: 2,
+			...(earlyTerminal ? { terminal: { kind: "terminal" as const, run: attempt.run, outcome: "succeeded" as const, evidenceDigest: "early-proof", observedAt: 2 } } : {}),
+		});
+		assert.doesNotThrow(() => validateStateChange(previous, next));
+		const retargeted = structuredClone(next); retargeted.attempts[0]!.run!.runId = "different-run";
+		assert.throws(() => validateStateChange(next, retargeted), /run|mismatch/i);
+	}
+});
+
+test("execution-contract: dependency receipts cannot cross an approved base revision", () => {
+	const manifest = fakeManifest(2); manifest.tasks[1]!.dependencies = [manifest.tasks[0]!.id];
+	const state = emptyCoordinatorState(manifest.repo); admitFakeManifest(state, manifest); state.capacity = 2;
+	const producer = fakeAttempt(manifest); producer.phase = "succeeded";
+	producer.run = { runId: "producer", artifactDir: "/fixture/producer", ownerSessionFile: producer.ownerSessionFile };
+	producer.terminal = { kind: "terminal", run: producer.run, outcome: "succeeded", evidenceDigest: "producer-proof", observedAt: 2 };
+	const body: Omit<ResultReceipt, "digest"> = { schemaVersion: 1, attemptId: producer.id, taskId: producer.taskId, taskDigest: producer.taskDigest, repoId: manifest.repo.id, baseCommit: manifest.baseCommit, prerequisiteDigests: [], output: { kind: "commits", from: manifest.baseCommit, to: "c".repeat(40), commits: ["c".repeat(40)], paths: ["src/a.ts"] }, checks: [], validatedAt: 3 };
+	const receipt = { ...body, digest: receiptDigest(body) }; producer.resultDigest = receipt.digest;
+	state.attempts.push(producer); state.results.push(receipt); validateCoordinatorState(state);
+	const matching = structuredClone(state), consumer = fakeAttempt(manifest, 1);
+	consumer.prerequisiteDigests = [receipt.digest]; consumer.workspace.prerequisiteDigests = [receipt.digest];
+	matching.attempts.push(consumer); matching.reservations.push(fakeReservation(consumer));
+	assert.doesNotThrow(() => validateStateChange(state, matching));
+	const changed = structuredClone(state), revision = structuredClone(manifest); revision.revision = 2; revision.baseCommit = "b".repeat(40);
+	changed.manifests.push(revision); changed.authorizations.push(fakeAuthorization(revision)); changed.activeRevisions[manifest.id] = 2;
+	const staleConsumer = fakeAttempt(revision, 1); staleConsumer.prerequisiteDigests = [receipt.digest]; staleConsumer.workspace.prerequisiteDigests = [receipt.digest];
+	changed.attempts.push(staleConsumer); changed.reservations.push(fakeReservation(staleConsumer));
+	assert.throws(() => validateStateChange(state, changed), /prerequisite.*base|base.*prerequisite/i);
+});
+
+test("execution-contract: an old delivery receipt cannot validate a different active base", () => {
+	const previous = deliveredState(), next = structuredClone(previous), revision = structuredClone(previous.manifests[0]!);
+	revision.revision = 2; revision.baseCommit = "d".repeat(40);
+	next.manifests.push(revision); next.authorizations.push(fakeAuthorization(revision)); next.activeRevisions[revision.id] = 2;
+	assert.throws(() => validateStateChange(previous, next), /required result|stale/i);
+});
+
+test("execution-contract: explicit fork context is preserved rather than rejected or coerced", () => {
+	const manifest = fakeManifest();
+	const input = { ...manifest, tasks: manifest.tasks.map(task => ({ ...task, profile: { context: "fork" } })) };
+	assert.doesNotThrow(() => validateManifest(input));
+	assert.equal(input.tasks[0]!.profile.context, "fork");
+	assert.throws(() => validateManifest({ ...input, tasks: input.tasks.map(task => ({ ...task, profile: { context: "invalid" } })) }), /context/);
+});
+
 test("execution-contract: generated DAGs validate and adding a back edge is rejected", () => {
 	for (let size = 2; size <= 20; size++) {
 		const m = fakeManifest(size);
