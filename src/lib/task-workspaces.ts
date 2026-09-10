@@ -36,7 +36,7 @@ function canonical(path: string): string {
 }
 function within(root: string, path: string): boolean { const rel = relative(root, path); return !!rel && !rel.startsWith("..") && !isAbsolute(rel); }
 async function gitRead(git: WorkspaceGit, cwd: string, argv: string[]): Promise<string> {
-	const result = await git(cwd, argv); requireThat(result.exitCode === 0, `Git ${argv[0]} failed: ${result.stderr}`); return result.stdout.trim();
+	const result = await git(cwd, argv); requireThat(result.exitCode === 0, `Git ${argv[0]} failed: ${result.stderr}`); return argv.includes("-z") ? result.stdout : result.stdout.trim();
 }
 function lines(text: string): string[] { return text ? text.split("\n") : []; }
 async function range(git: WorkspaceGit, cwd: string, from: string, to: string): Promise<{ commits: string[]; paths: string[] }> {
@@ -73,7 +73,7 @@ export class TaskWorkspaces implements WorkspaceAdapter {
 			requireThat(realpathSync(cwd) === cwd, "Workspace missing/aliased");
 			const common = await gitRead(o.git, cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
 			requireThat(realpathSync(common) === o.repo.commonDir, "Foreign Git repository");
-			requireThat(await gitRead(o.git, cwd, ["symbolic-ref", "--short", "HEAD"]) === workspace.branch, "Workspace branch mismatch");
+			requireThat(await gitRead(o.git, cwd, ["branch", "--show-current"]) === workspace.branch, "Workspace branch mismatch");
 			const head = await gitRead(o.git, cwd, ["rev-parse", "HEAD"]);
 			requireThat(sha(head) && (await o.git(cwd, ["merge-base", "--is-ancestor", workspace.baseCommit, head])).exitCode === 0, "Workspace base mismatch");
 			let inProgress: string | undefined;
@@ -84,7 +84,17 @@ export class TaskWorkspaces implements WorkspaceAdapter {
 			const journal = await o.readJournal(workspace.id);
 			if (journal) requireThat(same(journal.workspace, workspace), "Workspace metadata mismatch");
 			if (journal?.phase === "pending") inProgress ??= "unfinished-workspace-intent";
-			return { kind: "inspected", workspace, head, clean: !(await gitRead(o.git, cwd, ["status", "--porcelain=v1", "--untracked-files=all"])), ...(inProgress ? { inProgress } : {}), appliedDigests: journal?.appliedDigests ?? [] };
+			let appliedDigests: string[] = [];
+			if (journal) {
+				const inputs: ResultReceipt[] = [];
+				for (const id of journal.phase === "complete" ? journal.inputDigests : journal.appliedDigests) {
+					const receipt = await o.resolveReceipt(id);
+					requireThat(receipt && receipt.digest === id, "Missing journal receipt"); inputs.push(receipt);
+				}
+				appliedDigests = (await this.receipts(workspace, inputs)).map(receipt => receipt.digest);
+				requireThat(same(appliedDigests, journal.appliedDigests), "Journal receipt closure mismatch");
+			}
+			return { kind: "inspected", workspace, head, clean: !(await gitRead(o.git, cwd, ["status", "--porcelain=v1", "--untracked-files=all"])), ...(inProgress ? { inProgress } : {}), appliedDigests };
 		} catch (error) { return { kind: "unknown", reason: String(error) }; }
 	}
 	private async receipts(workspace: WorkspaceRef, inputs: ResultReceipt[]): Promise<ResultReceipt[]> {
@@ -163,7 +173,7 @@ export class TaskWorkspaces implements WorkspaceAdapter {
 			const head = await gitRead(o.git, workspace.path, ["rev-parse", "HEAD"]);
 			requireThat(!(await gitRead(o.git, workspace.path, ["status", "--porcelain=v1", "--untracked-files=all"])), "Composition dirty");
 			const expected = structuredClone(journal);
-			journal = { ...journal, phase: "complete", head, appliedDigests: [...applied] };
+			journal = { ...journal, phase: "complete", head, appliedDigests: receipts.map(receipt => receipt.digest) };
 			await own(); await o.writeJournal(structuredClone(journal), expected);
 			return { kind: "prepared", workspace, head };
 		} catch (error) { return { kind: pending ? "unknown" : "refused", reason: String(error) }; }

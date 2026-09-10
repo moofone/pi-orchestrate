@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { collectTaskResult, TaskWorkspaces, type ResultCollectionOptions, type WorkspaceGit, type WorkspaceJournal } from "../src/lib/task-workspaces.ts";
@@ -10,7 +11,9 @@ import { fakeAttempt, fakeCheck, FakeCheckExecutor, fakeManifest } from "./fixtu
 
 // Repositories are intentionally retained, including failed-operation checkpoints.
 function run(cwd: string, args: readonly string[]): string {
-	return execFileSync("git", [...args], { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.test", GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.test" }, stdio: ["ignore", "pipe", "pipe"] }).trim();
+	assert.notEqual(args[0], "symbolic-ref", "Prohibited Git command");
+	const stdout = execFileSync("git", [...args], { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.test", GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.test" }, stdio: ["ignore", "pipe", "pipe"] });
+	return args.includes("-z") ? stdout : stdout.trim();
 }
 function commit(cwd: string, path: string, text: string): string { mkdirSync(join(cwd, "src"), { recursive: true }); writeFileSync(join(cwd, path), text); run(cwd, ["add", path]); run(cwd, ["commit", "-m", text]); return run(cwd, ["rev-parse", "HEAD"]); }
 function fixture() {
@@ -80,10 +83,19 @@ test("shared ancestor DAG is applied once and unrelated sibling excluded", async
 	assert.equal(result.kind, "prepared");
 	assert.deepEqual(run(workspace.path, ["ls-tree", "-r", "--name-only", "HEAD"]).split("\n"), ["src/ancestor", "src/base", "src/left", "src/right"]);
 	assert.equal(run(workspace.path, ["rev-list", "--count", `${f.base}..HEAD`]), "3");
-	assert.deepEqual((await f.adapter.inspect(workspace)).kind, "inspected");
+	const inspected = await f.adapter.inspect(workspace);
+	assert.ok(inspected.kind === "inspected");
+	assert.deepEqual(inspected.appliedDigests, [a.digest, l.digest, r.digest]);
 	const count = f.calls.filter(a => a[0] === "cherry-pick").length;
 	assert.equal((await f.adapter.prepare({ attemptId: "dependent", workspace, prerequisites: [l, r] })).kind, "prepared");
 	assert.equal(f.calls.filter(a => a[0] === "cherry-pick").length, count);
+	assert.ok(result.kind === "prepared");
+	assert.equal((await f.adapter.compose({ intent: { id: "ordered", deliveryGroupId: "d", workspace, inputDigests: [a.digest, r.digest, l.digest], createdAt: 1, beforeCommit: result.head, phase: "planned" }, receipts: [a, r, l] })).kind, "prepared");
+	const reordered = await f.adapter.inspect(workspace); assert.ok(reordered.kind === "inspected");
+	assert.deepEqual(reordered.appliedDigests, [a.digest, r.digest, l.digest]);
+	assert.equal(f.calls.filter(a => a[0] === "cherry-pick").length, count);
+	f.receipts.delete(a.digest);
+	assert.equal((await f.adapter.inspect(workspace)).kind, "unknown");
 });
 
 test("partial provisioning and crash after mutation preserve pending intents without replay", async () => {
@@ -104,15 +116,19 @@ test("in-progress Git operation is surfaced and composition refuses mutation", a
 	assert.equal((await f.adapter.compose({ intent: { id: "integration", deliveryGroupId: "d", workspace, inputDigests: [], createdAt: 1, beforeCommit: f.base, phase: "planned" }, receipts: [] })).kind, "refused");
 });
 
-async function resultFixture(readOnly = false) {
-	const f = fixture(), workspace = f.workspaces[0]!; await f.adapter.prepare({ attemptId: "a", workspace, prerequisites: [] });
+async function resultFixture(readOnly = false, withPrerequisite = false) {
+	const f = fixture(), prerequisite = withPrerequisite ? artifactReceipt(f) : undefined;
+	const workspace = f.workspaces[0]!;
+	workspace.prerequisiteDigests = prerequisite ? [prerequisite.digest] : [];
+	await f.adapter.prepare({ attemptId: "a", workspace, prerequisites: prerequisite ? [prerequisite] : [] });
 	const manifest = fakeManifest(), task = manifest.tasks[0]!; if (readOnly) task.mode = "read-only";
 	const attempt = fakeAttempt(manifest); attempt.workspace = workspace; attempt.baseCommit = f.base; attempt.phase = "validating";
+	attempt.prerequisiteDigests = workspace.prerequisiteDigests;
 	attempt.run = { runId: "run", artifactDir: f.root, ownerSessionFile: attempt.ownerSessionFile };
 	attempt.terminal = { kind: "terminal", outcome: "succeeded", run: attempt.run, evidenceDigest: digest("terminal"), observedAt: 2 };
 	const head = readOnly ? f.base : commit(workspace.path, "src/result", "result");
 	const options: ResultCollectionOptions = { attempt, task, workspaces: f.adapter, git: f.git, checks: new FakeCheckExecutor(), preparedHead: f.base, output: { kind: "commits", commit: head }, artifactRoot: f.root, ownsAttempt: async () => true, verifyTerminalOutput: async () => true, verifyPreparedBase: async (_a, base) => base === f.base, now: () => 10 };
-	return { ...f, options, head };
+	return { ...f, options, head, prerequisite };
 }
 
 test("immutable result capture is deterministic and rejects arbitrary HEAD, wrong base and scope", async () => {
@@ -196,4 +212,49 @@ test("checks cannot mutate the frozen output before receipt collection completes
 		}, validateEvidence: () => ({ valid: true, reasons: [] }),
 	};
 	assert.equal((await collectTaskResult(f.options)).kind, "refused");
+});
+
+function artifactReceipt(f: ReturnType<typeof fixture>): ResultReceipt {
+	const path = join(f.root, "prerequisite.txt"); writeFileSync(path, "prerequisite");
+	const body: Omit<ResultReceipt, "digest"> = { schemaVersion: 1, attemptId: "artifact", taskId: "artifact", taskDigest: digest("artifact"), repoId: f.repo.id, baseCommit: f.base, prerequisiteDigests: [], output: { kind: "artifact", path, digest: createHash("sha256").update("prerequisite").digest("hex") }, checks: [], validatedAt: 1 };
+	const receipt = { ...body, digest: receiptDigest(body) }; f.receipts.set(receipt.digest, receipt); return receipt;
+}
+
+test("result scope preserves real leading-whitespace Git filenames", async () => {
+	const f = await resultFixture(), cwd = f.options.attempt.workspace.path;
+	mkdirSync(join(cwd, "\tsrc"));
+	const head = commit(cwd, "\tsrc/escape", "escape");
+	f.options.output = { kind: "commits", commit: head };
+	const result = await collectTaskResult(f.options);
+	assert.equal(result.kind, "refused");
+	if (result.kind === "refused") assert.match(result.reason, /Out of scope: \tsrc\/escape/);
+});
+
+test("inspection revalidates composed artifacts and receipt closure", async () => {
+	for (const change of ["bytes", "deleted", "ineligible", "closure"]) {
+		const f = fixture(), workspace = f.workspaces[0]!, receipt = artifactReceipt(f);
+		assert.equal((await f.adapter.prepare({ attemptId: "a", workspace, prerequisites: [] })).kind, "prepared");
+		assert.equal((await f.adapter.compose({ intent: { id: "integration", deliveryGroupId: "d", workspace, inputDigests: [receipt.digest], createdAt: 1, beforeCommit: f.base, phase: "planned" }, receipts: [receipt] })).kind, "prepared");
+		const inspected = await f.adapter.inspect(workspace); assert.ok(inspected.kind === "inspected");
+		assert.deepEqual(inspected.appliedDigests, [receipt.digest]);
+		assert.ok(receipt.output.kind === "artifact");
+		if (change === "bytes") writeFileSync(receipt.output.path, "changed");
+		if (change === "deleted") unlinkSync(receipt.output.path);
+		if (change === "ineligible") f.adapter.options.isEligibleReceipt = async () => false;
+		if (change === "closure") f.journals.get(workspace.id)!.appliedDigests = [];
+		assert.equal((await f.adapter.inspect(workspace)).kind, "unknown", change);
+	}
+});
+
+test("receipt collection rejects prerequisite artifacts changed during checks", async () => {
+	const f = await resultFixture(false, true), receipt = f.prerequisite!;
+	const check = fakeCheck(); f.options.task.checks = [check]; f.options.attempt.taskDigest = taskRevisionDigest(f.options.task);
+	f.options.checks = {
+		execute: async (_spec, ctx) => {
+			assert.ok(receipt.output.kind === "artifact"); writeFileSync(receipt.output.path, "changed during check");
+			return { checkId: check.id, invocationId: ctx.invocationId, startedAt: 10, finishedAt: 10, exitCode: 0, status: "passed", executedTests: ["test-a"], skippedTests: [], reportPath: "report", reportDigest: digest("report") };
+		}, validateEvidence: () => ({ valid: true, reasons: [] }),
+	};
+	const result = await collectTaskResult(f.options); assert.equal(result.kind, "refused");
+	if (result.kind === "refused") assert.match(result.reason, /Workspace changed during validation/);
 });
