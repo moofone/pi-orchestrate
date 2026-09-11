@@ -406,9 +406,9 @@ export class ExecutionScheduler {
 		// A directory watcher also reports this scheduler's own atomic renames.
 		// Recovery observations are idempotent: do not rewrite an unchanged
 		// running/terminal/unknown outcome and turn the notification into a loop.
-		if (outcome.kind === "known-running" && current.run && digest(current.run) === digest(outcome.run) && ["running", "stopping"].includes(current.phase)) return;
+		if (outcome.kind === "known-running" && current.run && digest(current.run) === digest(outcome.run) && ["running", "stopping"].includes(current.phase)) { this.scheduleStop(current); return; }
 		if (outcome.kind === "known-terminal" && current.terminal && digest(current.terminal) === digest(outcome.evidence) && ["validating", "recovery-needed"].includes(current.phase)) return;
-		if (outcome.kind === "unknown" && current.phase === "recovery-needed" && current.reason === outcome.reason) return;
+		if (outcome.kind === "unknown" && current.phase === "recovery-needed" && current.reason === outcome.reason) { this.scheduleStop(current); return; }
 		this.change(state => {
 			const attempt = state.attempts.find(a => a.id === id)!; if (!occupiesCapacity(attempt) || attempt.terminal) return;
 			if (outcome.kind === "known-running" || outcome.kind === "known-terminal") {

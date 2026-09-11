@@ -283,6 +283,39 @@ for (const outcome of ["stopped", "failed"] as const) for (const intent of ["non
 	await h.scheduler.shutdown();
 });
 
+test("restart redispatches a matching known-running stop once and retains occupancy", async () => {
+	const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt; h.runtime.running(a.id); await until(() => h.store.read().attempts[0]!.phase === "running");
+	const observation = h.runtime.observations.get(a.id); assert.equal(observation?.kind, "known-running"); if (observation?.kind !== "known-running") throw new Error("missing running observation"); const run = observation.run;
+	const stale = barrier<{ kind: "acknowledged"; run: typeof run }>();
+	h.runtime.control = async (controlRun, action, sessionFile) => { h.runtime.controls.push({ runId: controlRun.runId, action, sessionFile }); return stale.promise; };
+	await h.scheduler.control({ targetId: a.taskId, action: "pause", immediate: true }); await until(() => h.runtime.controls.length === 1);
+	await h.scheduler.shutdown(); const replacement = new ExecutionScheduler({ ...h.options, owner: { ...h.options.owner, instanceId: "replacement-known-running" } });
+	h.runtime.control = async (controlRun, action, sessionFile) => { h.runtime.controls.push({ runId: controlRun.runId, action, sessionFile }); return { kind: "acknowledged", run: controlRun }; };
+	await replacement.start(); await until(() => h.runtime.controls.length === 2); await until(() => h.store.read().attempts[0]!.phase === "stopping");
+	assert.equal(h.store.read().reservations.length, 1);
+	const afterReplacementStop = h.store.read(); stale.resolve({ kind: "acknowledged", run }); await new Promise(r => setTimeout(r, 20)); assert.deepEqual(h.store.read(), afterReplacementStop);
+	for (let n = 0; n < 5; n++) await replacement.reconcile(); await new Promise(r => setTimeout(r, 20));
+	assert.equal(h.runtime.controls.length, 2); assert.deepEqual(h.store.read(), afterReplacementStop);
+	h.runtime.finish(a.id, "stopped"); await until(() => h.store.read().reservations.length === 0); await replacement.shutdown();
+});
+
+test("restart redispatches an identical unknown stop when the run is known", async () => {
+	const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt; h.runtime.running(a.id); await until(() => h.store.read().attempts[0]!.phase === "running");
+	const observation = h.runtime.observations.get(a.id); assert.equal(observation?.kind, "known-running"); if (observation?.kind !== "known-running") throw new Error("missing running observation"); const run = observation.run;
+	const stale = barrier<{ kind: "acknowledged"; run: typeof run }>();
+	h.runtime.control = async (controlRun, action, sessionFile) => { h.runtime.controls.push({ runId: controlRun.runId, action, sessionFile }); return stale.promise; };
+	await h.scheduler.control({ targetId: a.taskId, action: "pause", immediate: true }); await until(() => h.runtime.controls.length === 1);
+	h.runtime.observations.set(a.id, { kind: "unknown", reason: "lost" }); await h.scheduler.reconcile(); await until(() => h.store.read().attempts[0]!.phase === "recovery-needed");
+	await h.scheduler.shutdown(); const replacement = new ExecutionScheduler({ ...h.options, owner: { ...h.options.owner, instanceId: "replacement-identical-unknown" } });
+	h.runtime.control = async (controlRun, action, sessionFile) => { h.runtime.controls.push({ runId: controlRun.runId, action, sessionFile }); return { kind: "acknowledged", run: controlRun }; };
+	await replacement.start(); await until(() => h.runtime.controls.length === 2); await new Promise(r => setTimeout(r, 50));
+	assert.equal(h.store.read().reservations.length, 1);
+	const afterReplacementStop = h.store.read(); stale.resolve({ kind: "acknowledged", run }); await new Promise(r => setTimeout(r, 20)); assert.deepEqual(h.store.read(), afterReplacementStop);
+	for (let n = 0; n < 5; n++) await replacement.reconcile(); await new Promise(r => setTimeout(r, 20));
+	assert.equal(h.runtime.controls.length, 2); assert.deepEqual(h.store.read(), afterReplacementStop);
+	h.runtime.observations.set(a.id, { kind: "known-running", run }); h.runtime.finish(a.id, "stopped"); await until(() => h.store.read().reservations.length === 0); await replacement.shutdown();
+});
+
 test("pending stop does not block authorized unrelated admission and stale stop ack is fenced", async () => {
 	const h = harness(); await begin(h, 2); await until(() => h.runtime.launches.length === 1); const a = h.runtime.launches[0]!.attempt; h.runtime.running(a.id); await until(() => h.store.read().attempts[0]!.phase === "running");
 	const gate = barrier<{ kind: "unsupported"; reason: string }>(); h.runtime.control = async (run, action, sessionFile) => { h.runtime.controls.push({ runId: run.runId, action, sessionFile }); return gate.promise; };
