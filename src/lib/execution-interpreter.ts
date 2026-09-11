@@ -18,8 +18,12 @@ export function structuredInterpretationValue(value: unknown, runId: string): un
  return structuredClone(child.structuredOutput);
 }
 /** Public RPC v1 / single completion contract verified at pi-subagents 42257fc.
- * Configured agent settings remain runtime-owned: omitted overrides are not
- * reconstructed from private agent/executor files or legacy model pins.
+ * rpc() resolves the reply envelope's `data` payload; the spawn payload carries
+ * the single-run identity as `{ text, details: { mode: "single", runId, ... } }`
+ * (rpc.ts dataFromToolResult + async-execution.ts single receipt), so the spawn
+ * callback's `reply` already IS `data`. Configured agent settings remain
+ * runtime-owned: omitted overrides are not reconstructed from private
+ * agent/executor files or legacy model pins.
  */
 export function createExecutionInterpreter(options: {
  events: RuntimeEventBus; cwd: string; sessionFile: string; profile?: ExecutionProfile;

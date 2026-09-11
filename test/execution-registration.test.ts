@@ -43,7 +43,9 @@ function harness(early = true, approve = false) {
     const output = { manifest: manifest({ identity, source: identity.source } as InterpretationRequest), unresolvedDecisions: [] };
     const completion = { runId, sessionId: "parent", mode: "single", success: true, results: [{ structuredOutput: output }], summary: "ordinary text is not JSON" };
     if (early) events.emit("subagent:async-complete", completion);
-    reply({ details: { runId, mode: "single", asyncDir: join(root, runId) } });
+    // Faithful committed spawn payload (pi-subagents 42257fc rpc.ts dataFromToolResult + async-execution.ts:1982):
+    // data = { text, details: { mode: "single", runId, results: [], asyncId, asyncDir } }.
+    reply({ text: `Async: planner [${runId}]`, details: { runId, mode: "single", results: [], asyncId: runId, asyncDir: join(root, runId) } });
     if (!early) queueMicrotask(() => events.emit("subagent:async-complete", completion));
     return;
    }

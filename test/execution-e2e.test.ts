@@ -132,7 +132,8 @@ class ChildProvider implements RuntimeEventBus {
       this.emit("subagent:process-terminal", { runId, sessionId });
       this.emit("subagent:async-complete", { runId, sessionId, mode: "single", success: code === 0 && !signal, results: [{ ...(outputValue === undefined ? {} : { structuredOutput: outputValue }) }], summary: `child ${taskId}`, ...(signal ? { interrupted: true } : {}) });
     });
-    const response = { details: { mode: "single", runId, asyncDir: artifactDir } };
+    // Faithful committed spawn payload (pi-subagents 42257fc rpc.ts dataFromToolResult + async-execution.ts:1982).
+    const response = { text: `Async: worker [${runId}]`, details: { mode: "single", runId, results: [], asyncId: runId, asyncDir: artifactDir } };
     if (this.scenario === "reload" && taskId === "recovery") {
       writeFileSync(join(this.root, "pending-old-reply.json"), JSON.stringify({ request, response }));
       return;
