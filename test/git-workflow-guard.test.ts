@@ -267,6 +267,58 @@ test("writer and reserved-parent guards catch gh/ghl binaries at absolute or quo
 	assert.equal(classifyForRole("/usr/bin/gh pr view 2210", { writer: false, executionRole: "parent" }).block, false);
 });
 
+/* ---------------------------------------------------------------- *
+ * Round-2 P1 (codex) — parseGitInvocation consumed the `-c` value and
+ * classified the NEXT token as the git verb, so an inline alias config
+ * (`git -c alias.x='!gh pr merge 1' x`) executed blocked lifecycle
+ * mutations while every classifier returned unblocked. An inline
+ * alias.* definition can install an executable shell alias, so every
+ * spelling the parser recognises fails closed. Ordinary non-alias
+ * configuration and the installed trusted workflow aliases stay
+ * allowed.
+ * ---------------------------------------------------------------- */
+
+test("blocks inline git config alias definitions in every parsed option spelling", () => {
+	// split `-c <value>`: the value was skipped, the alias name became the verb
+	assert.match(blocked("git -c alias.x='!gh pr merge 1' x"), /alias/);
+	assert.match(blocked("git -c alias.x='!git worktree add ../ice-wt/sub -b sub' x"), /alias/);
+	// attached `-c<value>`
+	assert.match(blocked("git -calias.x='!gh pr merge 1' x"), /alias/);
+	// long equal and split `--config-env` spellings set config from a value/env too
+	assert.match(blocked("git --config-env=alias.x=EV x"), /alias/);
+	assert.match(blocked("git --config-env alias.x=EV x"), /alias/);
+	assert.match(blocked("git --config=alias.x='!gh pr merge 1' x"), /alias/);
+	// git config section/variable names are case-insensitive
+	assert.match(blocked("git -c ALIAS.X='!gh pr merge 1' x"), /alias/);
+	// a bare alias key with no '=' still defines the alias
+	assert.match(blocked("git -c alias.x x"), /alias/);
+	// quotes decode in the lexer, so a quoted value is still the config value
+	assert.match(blocked('git -c "alias.x=!gh pr merge 1" x'), /alias/);
+	// hidden inside a substitution the invocation is classified the same way
+	assert.match(blocked("echo $(git -c alias.x='!git pr-land 1' x)"), /alias/);
+});
+
+test("inline alias rejection holds for writers and the reserved parent", () => {
+	for (const command of [
+		"git -c alias.x='!git push --force origin main' x",
+		"git -calias.x='!gh pr merge 1' x",
+		"git --config-env=alias.x=EV x",
+	]) {
+		assert.equal(classifyForRole(command, { writer: true }).block, true, `a writer child must not run: ${command}`);
+		for (const opts of [{ writer: false, writerReserved: true }, { writer: false, executionRole: "parent" as const }]) {
+			assert.equal(classifyForRole(command, opts).block, true, `a reserved parent must not run: ${command}`);
+		}
+	}
+});
+
+test("ordinary inline git config and installed workflow aliases stay allowed", () => {
+	allowed("git -c core.pager=cat status");
+	allowed("git -c advice.detachedHead=false commit -m x");
+	allowed("git -c color.ui=always diff");
+	allowed("git -c core.pager=cat pr-await 13");
+	allowed("git pr-await 13");
+});
+
 test("extractPrNumber", () => {
 	assert.equal(extractPrNumber("gh pr view 2166 --json state"), "2166");
 	assert.equal(extractPrNumber("git pr-await 479"), "479");

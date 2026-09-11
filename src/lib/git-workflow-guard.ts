@@ -271,33 +271,49 @@ const GIT_GLOBAL_VALUE_OPTIONS = new Set([
 	"--exec-path", "--work-tree", "--git-dir", "--namespace", "--config-env", "--super-prefix", "--attr-source", "--list-cmds",
 ]);
 
-type GitInvocation = { tokens: string[]; index: number; verb?: string; args: string[]; paths: string[] };
+type GitInvocation = { tokens: string[]; index: number; verb?: string; args: string[]; paths: string[]; inlineAlias?: boolean };
+
+/** `git -c alias.x='!shell command' x` installs an executable shell alias for
+ * one invocation (round-2 P1: the parser consumed the `-c` value and then
+ * classified the alias name as the git verb, so the alias executed blocked
+ * lifecycle mutations with no verdict). Git config section and variable names
+ * are case-insensitive, so ALIAS.X is an alias too; a key with no `=` still
+ * defines it (boolean true). Match the key conservatively, never the value. */
+function isAliasConfigValue(value: string): boolean {
+	return /^alias\./i.test(value.slice(0, value.indexOf("=")));
+}
 
 function parseGitInvocation(segment: ShellSegment, index: number): GitInvocation {
 	const paths: string[] = [], tokens = segment.slice(index + 1);
-	let i = 0;
+	let i = 0, inlineAlias = false;
 	const valueOption = (name: string, value: string | undefined) => {
 		if (value === undefined) return;
 		if (name === "-C" || name === "--work-tree" || name === "--git-dir") paths.push(value);
 	};
+	const configOption = (name: string, value: string | undefined) => {
+		if (value !== undefined && (name === "--config" || name === "--config-env") && isAliasConfigValue(value)) inlineAlias = true;
+	};
 	while (i < tokens.length) {
 		const current = tokens[i]!;
-		if (current === "--") return { tokens: segment, index, verb: tokens[i + 1], args: tokens.slice(i + 2), paths };
+		if (current === "--") return { tokens: segment, index, verb: tokens[i + 1], args: tokens.slice(i + 2), paths, inlineAlias };
 		if (current.startsWith("--")) {
 			const equal = current.indexOf("=");
 			const name = equal === -1 ? current : current.slice(0, equal);
-			if (equal !== -1) valueOption(name, current.slice(equal + 1));
-			else if (GIT_GLOBAL_VALUE_OPTIONS.has(name)) valueOption(name, tokens[++i]);
+			if (equal !== -1) { valueOption(name, current.slice(equal + 1)); configOption(name, current.slice(equal + 1)); }
+			else if (GIT_GLOBAL_VALUE_OPTIONS.has(name)) { valueOption(name, tokens[++i]); configOption(name, tokens[i]); }
 			i++;
 			continue;
 		}
-		if (current === "-C" || current === "-c") { valueOption(current, tokens[++i]); i++; continue; }
+		if (current === "-C" || current === "-c") {
+			if (current === "-c") configOption("--config", tokens[i + 1]);
+			valueOption(current, tokens[++i]); i++; continue;
+		}
 		if (current.startsWith("-C") && current.length > 2) { valueOption("-C", current.slice(2)); i++; continue; }
-		if (current.startsWith("-c") && current.length > 2) { i++; continue; }
+		if (current.startsWith("-c") && current.length > 2) { configOption("--config", current.slice(2)); i++; continue; }
 		if (current.startsWith("-")) { i++; continue; }
-		return { tokens: segment, index, verb: current, args: tokens.slice(i + 1), paths };
+		return { tokens: segment, index, verb: current, args: tokens.slice(i + 1), paths, inlineAlias };
 	}
-	return { tokens: segment, index, args: [], paths };
+	return { tokens: segment, index, args: [], paths, inlineAlias };
 }
 
 function gitInvocations(command: string): { segments: ShellSegment[]; git: GitInvocation[] } | undefined {
@@ -362,6 +378,7 @@ export function classifyGitWorkflowCommand(command: string): GuardVerdict {
 	// Substitution openers - $(, <(, >(, backtick, subshell ( - can directly
 	// precede a workflow executable, so they count as workflow positions too.
 	if (!parsed && /(?:^|[\s;&|`(<>])(?:[^\s;&|/]+\/)*(git|gh|ghl-)[^\s;&|]*/.test(text)) return { block: true, reason: "Unsupported shell syntax; split the command into a supported, bounded invocation." };
+	if (parsed?.git.some(invocation => invocation.inlineAlias)) return { block: true, reason: "inline git config alias definitions (git -c/--config[-env] alias.*=…) can install an executable shell alias that bypasses this guard; they are blocked. Drop the inline alias or run the underlying command directly." };
 	const segments = parsed?.segments ?? [];
 	const git = parsed?.git ?? [];
 	const hasPrPoll = git.some(invocation => invocation.verb === "pr-poll") || hasGhlToken(segments, "ghl-pr-poll");
