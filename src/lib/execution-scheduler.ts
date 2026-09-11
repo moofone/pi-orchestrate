@@ -106,7 +106,15 @@ export class ExecutionScheduler {
 	/** Capacity is an explicit repository authorization, never added from a feature request. */
 	authorizeCapacity(capacity: number): void {
 		if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("Repository capacity exceeded or must be a positive integer");
-		this.change(state => { state.capacity = capacity; }); this.wake();
+		this.change(state => { state.capacity = capacity; });
+		// A persisted authorization is a new capacity regime from an explicit caller
+		// action: wake tasks stranded in `deferred` by an exhausted recheck budget and
+		// restart that budget (still timer-bounded, so no busy loop). A rejected
+		// authorization — invalid value or lost owner/epoch fence — throws above and
+		// must leave the defer/recheck state untouched.
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined; this.rechecks = 0; this.deferred.clear();
+		this.wake();
 	}
 	admit(manifest: ExecutionManifest, authorization: ExecutionAuthorization, options?: { initializeCapacity: boolean }): void { this.install(manifest, authorization, false, options?.initializeCapacity); }
 	revise(manifest: ExecutionManifest, authorization: ExecutionAuthorization): void { this.install(manifest, authorization, true); }

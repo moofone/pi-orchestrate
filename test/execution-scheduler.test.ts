@@ -203,6 +203,38 @@ test("ordinary capacity deferral performs only the configured bounded local rech
 	await h.scheduler.reconcile(); assert.equal(h.runtime.launches.length, 3); assert.equal(h.store.read().reservations.length, 0); await h.scheduler.shutdown();
 });
 
+test("capacity authorization re-admits tasks stranded by exhausted rechecks; rejected authorization strands them", async () => {
+	const h = harness(1, undefined, 2);
+	h.runtime.launch = async request => { h.runtime.launches.push(request); return { kind: "capacity-deferred", reason: "full", evidence: { kind: "not-started", launchDigest: request.attempt.launchDigest, reason: "full" } }; };
+	await begin(h, 1);
+	await until(() => h.runtime.launches.length === 3); await new Promise(r => setTimeout(r, 30));
+	await h.scheduler.reconcile(); assert.equal(h.runtime.launches.length, 3); assert.equal(h.store.read().reservations.length, 0); assert.equal(h.runtime.controls.length, 0);
+	const untouched = h.store.read();
+	assert.throws(() => h.scheduler.authorizeCapacity(0), /capacity/i);
+	assert.deepEqual(h.store.read(), untouched); await new Promise(r => setTimeout(r, 20));
+	assert.equal(h.runtime.launches.length, 3);
+	h.scheduler.authorizeCapacity(2);
+	await until(() => h.runtime.launches.length === 6); await new Promise(r => setTimeout(r, 30)); await h.scheduler.reconcile();
+	assert.equal(h.runtime.launches.length, 6);
+	h.runtime.launch = async request => {
+		h.runtime.launches.push(request);
+		const outcome: LaunchOutcome = { kind: "known-running", run: { runId: `run-${request.attempt.id}`, artifactDir: `/artifacts/${request.attempt.id}`, ownerSessionFile: request.attempt.ownerSessionFile } };
+		h.runtime.observations.set(request.attempt.id, outcome); h.runtime.intervals.set(request.attempt.id, { start: performance.now() });
+		return outcome;
+	};
+	h.scheduler.authorizeCapacity(3);
+	await until(() => h.runtime.launches.length === 7);
+	const id = h.runtime.launches[6]!.attempt.id;
+	await until(() => h.store.read().attempts.find(a => a.id === id)!.phase === "running");
+	assert.equal(h.store.read().capacity, 3); assert.equal(h.store.read().reservations.length, 1);
+	assert.equal(h.store.read().attempts.filter(a => a.phase === "running").length, 1);
+	h.runtime.finish(id); await until(() => h.store.read().results.length === 1);
+	assert.equal(h.store.read().tasks[0]!.phase, "succeeded"); assert.equal(h.runtime.controls.length, 0);
+	await h.scheduler.shutdown();
+	const fenced = h.store.read(); assert.throws(() => h.scheduler.authorizeCapacity(3), /active coordinator/);
+	assert.deepEqual(h.store.read(), fenced);
+});
+
 test("controller-owned or unknown-transfer workspace is fenced across delivery groups by ID or path", async () => {
 	for (const phase of ["handoff-pending", "controller-owned"] as const) for (const match of ["id", "path"] as const) {
 		const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1); const id = h.runtime.launches[0]!.attempt.id; h.runtime.running(id);
