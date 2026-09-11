@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { createExecutionBridge } from "../../../../src/lib/execution-bridge.ts";
 import { digest, sourceDigest, stableTaskId } from "../../../../src/lib/execution-contract.ts";
+import { resolveWorktreeHelper } from "./worktree-helper.ts";
 
 const args = process.argv.slice(2);
 const [stateRoot, commonDir, sessionFile] = args;
@@ -71,7 +72,7 @@ if (args.length < 8) {
   };
   const events = { on(name, listener) { const listeners = eventListeners.get(name) ?? new Set(); listeners.add(listener); eventListeners.set(name, listeners); return () => listeners.delete(listener); }, emit };
   const runGit = (cwd, argv) => new Promise(resolve => {
-    const helper = argv[0] === "wt", executable = helper ? "/Users/greg/.local/bin/ghl-wt" : "git", actual = helper ? argv.slice(1) : argv;
+    const helper = argv[0] === "wt", executable = helper ? resolveWorktreeHelper() : "git", actual = helper ? argv.slice(1) : argv;
     execFile(executable, actual, { cwd, encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_AUTHOR_NAME: "Crash owner", GIT_AUTHOR_EMAIL: "crash-owner@example.test", GIT_COMMITTER_NAME: "Crash owner", GIT_COMMITTER_EMAIL: "crash-owner@example.test" } }, (error, stdout, stderr) => {
       const code = error ? (typeof error.code === "number" ? error.code : -1) : 0;
       appendJson("git-commands.jsonl", { cwd, argv, code, at: Date.now() });

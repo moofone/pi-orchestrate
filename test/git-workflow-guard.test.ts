@@ -85,6 +85,57 @@ test("blocks raw worktree add/remove, gh pr merge, retired pr-poll", () => {
 	assert.match(blocked("ghl-pr-poll 2166"), /retired/);
 });
 
+/* ---------------------------------------------------------------- *
+ * Round-1 P1 — the lexer treated $(…) and backticks as opaque token
+ * text, so gitInvocations()/hasGhSequence() never saw the workflow
+ * command inside a substitution: $(git worktree add …), `gh pr merge
+ * …` and equivalents executed without a guard verdict. Substitutions
+ * and bare subshells must be parsed, and unparseable ones containing
+ * a workflow executable must fail closed.
+ * ---------------------------------------------------------------- */
+
+test("blocks workflow commands hidden inside shell substitutions", () => {
+	assert.match(blocked("echo $(git worktree add ../ice-wt/sub -b sub)"), /git wt/);
+	assert.match(blocked("$(gh pr merge 2166 --admin)"), /git pr-await 2166/);
+	assert.match(blocked("`git worktree prune`"), /git wt-rm/);
+	assert.match(blocked("echo `gh pr merge 2166 --squash`"), /git pr-await 2166/);
+	assert.match(blocked("diff <(git worktree list) <(git worktree prune)"), /git wt-rm/);
+	assert.match(blocked("(git worktree add ../ice-wt/sub -b sub)"), /git wt/);
+	assert.match(blocked("echo $(outer $(git pr-poll 2166))"), /retired/);
+	assert.match(blocked('git commit -m "$(git worktree prune)"'), /git wt-rm/);
+	assert.match(blocked('echo "$(git worktree prune; echo done)"'), /git wt-rm/);
+});
+
+test("unparseable substitutions carrying a workflow executable fail closed", () => {
+	assert.match(blocked('$(git status "unterminated)'), /Unsupported shell syntax/);
+	assert.match(blocked("echo $(git status"), /Unsupported shell syntax/);
+	assert.match(blocked("echo `git status"), /Unsupported shell syntax/);
+});
+
+test("ordinary git with benign substitutions stays allowed", () => {
+	allowed('git commit -m "rev $(git rev-parse --short HEAD)"');
+	allowed('git commit -m "built $(date +%Y-%m-%d)"');
+	allowed("BRANCH=$(git rev-parse --abbrev-ref HEAD); git status");
+});
+
+test("writer restrictions see workflow commands hidden inside substitutions", () => {
+	for (const command of [
+		"$(git push origin HEAD)",
+		"echo `git push --force origin main`",
+		'git commit -m "$(git pr-await 2210)"',
+		"run <(git wt feat/x)",
+	]) {
+		const verdict = classifyForRole(command, { writer: true });
+		assert.equal(verdict.block, true, `a writer child must not run: ${command}`);
+		assert.match(
+			String((verdict as { reason?: string }).reason ?? ""),
+			/writer child/,
+			`the block must come from the writer path, not an unparsed allow: ${command}`,
+		);
+	}
+	assert.equal(classifyForRole('git commit -m "built $(date)"', { writer: true }).block, false);
+});
+
 test("blocks a prohibited worktree operation after a read-only worktree segment", () => {
 	const command = "git worktree list && git worktree add ../ice-wt/later -b later";
 	assert.match(blocked(command), /git wt/);
@@ -299,13 +350,15 @@ test("mutationTargetDirs realpaths a symlink into the reserved worktree", () => 
 test("registered guard keeps a parent and forged attempt identity out of a reserved workspace", async () => {
   const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-registration-home-")));
   const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });
+  const ownerSession = join(home, "owner.jsonl");
+  writeFileSync(ownerSession, JSON.stringify({ type: "session", id: "owner-header-1" }) + "\n");
   const stateDir = join(home, "orchestrator", "plan-driven-v1", "execution", "repo"); mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(stateDir, "coordinator.json"), JSON.stringify({
     reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
-    attempts: [{ id: "attempt-1", ownerSessionFile: join(home, "owner.jsonl"), run: { runId: "run-1" } }],
+    attempts: [{ id: "attempt-1", ownerSessionFile: ownerSession, workspace: { id: "workspace-1", path: workspace }, run: { runId: "run-1", ownerSessionFile: ownerSession } }],
     deliveries: [],
   }));
-  const priorHome = process.env.HOME, priorStateRoot = process.env.PI_EXECUTION_STATE_ROOT, priorAttempt = process.env.PI_EXECUTION_ATTEMPT_ID, priorRun = process.env.PI_SUBAGENT_RUN_ID, priorParent = process.env.PI_SUBAGENT_PARENT_SESSION, priorAgent = process.env.PI_SUBAGENT_CHILD_AGENT, priorRole = process.env.ORCHESTRATE_ROLE;
+  const priorHome = process.env.HOME, priorStateRoot = process.env.PI_EXECUTION_STATE_ROOT, priorAttempt = process.env.PI_EXECUTION_ATTEMPT_ID, priorRun = process.env.PI_SUBAGENT_RUN_ID, priorParent = process.env.PI_SUBAGENT_PARENT_SESSION, priorAgent = process.env.PI_SUBAGENT_CHILD_AGENT, priorRole = process.env.ORCHESTRATE_ROLE, priorBindings = process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
   process.env.HOME = home; process.env.PI_EXECUTION_STATE_ROOT = join(home, "orchestrator", "plan-driven-v1", "execution"); delete process.env.PI_EXECUTION_ATTEMPT_ID; delete process.env.PI_SUBAGENT_RUN_ID; delete process.env.PI_SUBAGENT_PARENT_SESSION; delete process.env.PI_SUBAGENT_CHILD_AGENT; delete process.env.ORCHESTRATE_ROLE;
   try {
     let handler: ((event: any) => Promise<any>) | undefined;
@@ -322,10 +375,32 @@ test("registered guard keeps a parent and forged attempt identity out of a reser
     process.env.PI_SUBAGENT_PARENT_SESSION = join(home, "owner.jsonl");
     const mixed = await handler!({ toolName: "bash", cwd: workspace, input: { command: `cd ${workspace} && git commit -m own && cd ${home} && git push` } });
     assert.equal(mixed?.block ?? false, true, "every mutation target must be independently authorized");
-    for (const command of ["gh pr create --title x --body y", "git wt branch", "git pr-await 1", "git pr-land 1", "git push", "git worktree list && git worktree add ../later -b later"]) {
+    // Establish the real supported binding: runtime run id + parent session
+    // header id + namespaced extension binding, all matching the persisted
+    // attempt. Labels alone never prove a worker.
+    process.env.PI_SUBAGENT_CHILD_AGENT = "tdd-worker";
+    process.env.PI_SUBAGENT_RUN_ID = "run-1";
+    process.env.PI_SUBAGENT_PARENT_SESSION = "owner-header-1";
+    process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header-1" } });
+    const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m own" } });
+    assert.equal(own?.block ?? false, false, "a verified worker may mutate its own reserved workspace");
+    for (const [command, why] of [
+      ["gh pr create --title x --body y", /never speaks on the PR/],
+      ["git wt branch", /never creates or removes a worktree/],
+      ["git pr-await 1", /never waits on the review/],
+      ["git pr-land 1", /never lands the PR/],
+      ["git push", /writer child commits; code pushes/],
+      ["git worktree list && git worktree add ../later -b later", /never creates or removes a worktree/],
+    ] as const) {
       const worker = await handler!({ toolName: "bash", cwd: workspace, input: { command } });
       assert.equal(worker?.block ?? false, true, `verified execution worker must be blocked from ${command}`);
+      assert.match(String((worker as { reason?: string }).reason ?? ""), why, `the block must come from the worker path: ${command}`);
     }
+    // A forged binding (right shape, wrong owner session) is rejected: the
+    // caller loses the worker role and falls back to the reserved-parent path.
+    process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "forged-header" } });
+    const forgedBinding = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m forged-binding" } });
+    assert.equal(forgedBinding?.block ?? false, true, "a forged owner-session binding is not worker proof");
   } finally {
     if (priorHome === undefined) delete process.env.HOME; else process.env.HOME = priorHome;
     if (priorStateRoot === undefined) delete process.env.PI_EXECUTION_STATE_ROOT; else process.env.PI_EXECUTION_STATE_ROOT = priorStateRoot;
@@ -334,6 +409,7 @@ test("registered guard keeps a parent and forged attempt identity out of a reser
     if (priorParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION; else process.env.PI_SUBAGENT_PARENT_SESSION = priorParent;
     if (priorAgent === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT; else process.env.PI_SUBAGENT_CHILD_AGENT = priorAgent;
     if (priorRole === undefined) delete process.env.ORCHESTRATE_ROLE; else process.env.ORCHESTRATE_ROLE = priorRole;
+    if (priorBindings === undefined) delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]; else process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = priorBindings;
   }
 });
 

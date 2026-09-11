@@ -10,6 +10,7 @@ import { createControllerDeliveryAdapter } from "../src/lib/execution-delivery.t
 import { digest, type DeliveryGroup, type ExecutionManifest, type RepoIdentity } from "../src/lib/execution-contract.ts";
 import type { RuntimeEventBus } from "../src/lib/attempt-runtime.ts";
 import { PR_REVIEW_RECONCILED_EVENT } from "../src/lib/pr-review-events.ts";
+import { resolveWorktreeHelper } from "./fixtures/execution/e2e/worktree-helper.ts";
 
 const evidenceBase = process.env.U8_EVIDENCE_ROOT ? (mkdirSync(process.env.U8_EVIDENCE_ROOT, { recursive: true }), realpathSync(process.env.U8_EVIDENCE_ROOT)) : undefined;
 let evidenceRun = 0;
@@ -195,7 +196,12 @@ function makeRepo() {
   return { root, repoPath: realpathSync(repoPath), remote, base, repo: { commonDir: realpathSync(join(repoPath, ".git")), id: digest(realpathSync(join(repoPath, ".git"))) } as RepoIdentity };
 }
 
-const worktreeHelperPath = "/Users/greg/.local/bin/ghl-wt";
+// The configured `git wt` helper is resolved, not hardcoded: an explicit
+// PI_GIT_WORKFLOW_WT_BIN override, then an executable ghl-wt on PATH. A
+// missing helper fails the file with an actionable provisioning error
+// instead of making the overlap/composition/crash coverage
+// workstation-only (round-2 P1).
+const worktreeHelperPath = resolveWorktreeHelper();
 function makeHarness(scenario: string, capacity = 6) {
   const repo = makeRepo(), sessionFile = join(repo.root, "session.jsonl"), stateRoot = join(repo.root, "state"), ownedRoot = join(repo.root, "repo-wt"), providerRoot = join(repo.root, "provider");
   mkdirSync(ownedRoot); writeFileSync(sessionFile, JSON.stringify({ type: "session", id: sessionId }) + "\n");

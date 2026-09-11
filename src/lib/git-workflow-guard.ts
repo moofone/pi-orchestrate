@@ -163,46 +163,88 @@ function stripComments(command: string): string {
 }
 
 type ShellSegment = string[];
+type LexFrame = { segments: ShellSegment[]; next: number };
 
 /** Minimal shell lexer for guard decisions. It deliberately does not execute
  * shell syntax; quotes are decoded, separators become segment boundaries, and
- * malformed quoting is reported so callers can fail closed. */
-function shellSegments(command: string): ShellSegment[] | undefined {
+ * malformed quoting is reported so callers can fail closed. Command
+ * substitutions - $(...), backticks, process substitution <(...)/>(...) - and
+ * bare subshells are lexed recursively, so a git/gh command hidden inside one
+ * stays visible to the classifier instead of dissolving into an opaque token
+ * (round-1 P1: a substitution could run a worktree add or a pr merge with no
+ * guard verdict). Unterminated substitutions and quoting return undefined so
+ * callers fail closed. `closer` bounds a nested frame: ")" must be closed by
+ * the matching paren, "`" stops exactly at the closing backtick (which must
+ * therefore never be re-lexed as an opener). */
+function lexShellCommands(src: string, start: number, closer: ")" | "`" | undefined, bound: number): LexFrame | undefined {
 	const segments: ShellSegment[] = [];
 	let segment: string[] = [], token = "", quote: "'" | '"' | undefined;
-	let escaped = false, substitutionDepth = 0, comment = false;
+	let escaped = false, comment = false;
 	const flushToken = () => { if (token) { segment.push(token); token = ""; } };
 	const flushSegment = () => { flushToken(); if (segment.length) segments.push(segment); segment = []; };
-	for (let i = 0; i < command.length; i++) {
-		const char = command[i]!;
+	const spliceNested = (nested: LexFrame) => { flushSegment(); for (const nestedSegment of nested.segments) segments.push(nestedSegment); };
+	for (let i = start; i < bound; i++) {
+		const char = src[i]!;
 		if (comment) { if (char === "\n") { comment = false; flushSegment(); } continue; }
 		if (escaped) { token += char; escaped = false; continue; }
 		if (quote) {
 			if (char === quote) quote = undefined;
-			else token += char;
+			else if (quote === '"' && char === "$" && src[i + 1] === "(") {
+				// command substitution executes inside double quotes too
+				const nested = lexShellCommands(src, i + 2, ")", src.length);
+				if (!nested) return undefined;
+				spliceNested(nested);
+				i = nested.next - 1;
+			} else token += char;
 			continue;
 		}
 		if (char === "\\") { escaped = true; continue; }
 		if (char === "'" || char === '"') { quote = char; continue; }
 		if (char === "#" && !token) { comment = true; continue; }
-		if (char === "$" && command[i + 1] === "(") { token += "$("; substitutionDepth++; i++; continue; }
-		if (substitutionDepth > 0) {
-			token += char;
-			if (char === "(") substitutionDepth++;
-			else if (char === ")") substitutionDepth--;
+		if (char === ")" && closer === ")") { flushSegment(); return { segments, next: i + 1 }; }
+		if ((char === "$" || char === "<" || char === ">") && src[i + 1] === "(") {
+			// $(...) substitution and <(...)/>(...) process substitution execute
+			// their contents; keep the nested command list visible to the classifier.
+			const nested = lexShellCommands(src, i + 2, ")", src.length);
+			if (!nested) return undefined;
+			spliceNested(nested);
+			i = nested.next - 1;
+			continue;
+		}
+		if (char === "`") {
+			if (closer === "`") return undefined; // a raw backtick inside backtick content is not valid bash
+			const end = src.indexOf("`", i + 1);
+			if (end === -1) return undefined;
+			const nested = lexShellCommands(src, i + 1, "`", end);
+			if (!nested) return undefined;
+			spliceNested(nested);
+			i = end;
+			continue;
+		}
+		if (char === "(" && !token) {
+			// a bare subshell is a command list too
+			const nested = lexShellCommands(src, i + 1, ")", src.length);
+			if (!nested) return undefined;
+			spliceNested(nested);
+			i = nested.next - 1;
 			continue;
 		}
 		if (char === "\n" || char === ";" || char === "|" || char === "&") {
 			flushSegment();
-			if ((char === "|" || char === "&") && command[i + 1] === char) i++;
+			if ((char === "|" || char === "&") && src[i + 1] === char) i++;
 			continue;
 		}
 		if (/\s/.test(char)) { flushToken(); continue; }
 		token += char;
 	}
-	if (quote || escaped || substitutionDepth !== 0) return undefined;
+	if (quote || escaped) return undefined;
+	if (closer === ")") return undefined; // unterminated $(
 	flushSegment();
-	return segments;
+	return { segments, next: bound };
+}
+
+function shellSegments(command: string): ShellSegment[] | undefined {
+	return lexShellCommands(command, 0, undefined, command.length)?.segments;
 }
 
 function gitCommandToken(token: string): boolean {
@@ -280,7 +322,9 @@ export function classifyGitWorkflowCommand(command: string): GuardVerdict {
 	const text = stripComments(command), parsed = gitInvocations(text);
 	// A malformed shell command containing a workflow executable cannot be
 	// safely classified. Blocking is safer than allowing an unparsed segment.
-	if (!parsed && /(?:^|[\s;&|])(git|gh|ghl-)[^\s;&|]*/.test(text)) return { block: true, reason: "Unsupported shell syntax; split the command into a supported, bounded invocation." };
+	// Substitution openers - $(, <(, >(, backtick, subshell ( - can directly
+	// precede a workflow executable, so they count as workflow positions too.
+	if (!parsed && /(?:^|[\s;&|`(<>])(git|gh|ghl-)[^\s;&|]*/.test(text)) return { block: true, reason: "Unsupported shell syntax; split the command into a supported, bounded invocation." };
 	const segments = parsed?.segments ?? [];
 	const git = parsed?.git ?? [];
 	const hasPrPoll = git.some(invocation => invocation.verb === "pr-poll") || hasToken(segments, "ghl-pr-poll");
