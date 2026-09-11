@@ -99,7 +99,7 @@ import {
   fixerSettleAction,
   type FeaturePrAction,
 } from "./lib/feature-pr.ts";
-import { registerReviewLaunch, type LaunchIntent, type LaunchResult } from "./lib/pr-review-events.ts";
+import { registerReviewLaunch, requestExecutionController, type LaunchIntent, type LaunchResult } from "./lib/pr-review-events.ts";
 import {
   featureTitle,
   isApproved,
@@ -119,6 +119,21 @@ import {
   taskSection,
   type Task,
 } from "./lib/plan-tasks.ts";
+import {
+  canonicalPublicationRepository,
+  createExecutionBridge,
+  executionStatusSummary,
+  isUnambiguousPlanPath,
+  parseExecutionCommand,
+  type ExecutionBridge,
+  type ExecutionApproval,
+} from "./lib/execution-bridge.ts";
+import { canonicalRepoIdentity } from "./lib/execution-store.ts";
+import type { RuntimeEventBus } from "./lib/attempt-runtime.ts";
+import { executionOverlayTodos, executionPreviewSummary, executionProgressSummary, executionManifestsForTarget } from "./lib/execution-projection.ts";
+import { createExecutionHost } from "./lib/execution-host.ts";
+import { createExecutionInterpreter } from "./lib/execution-interpreter.ts";
+import type { ExecutionProfile } from "./lib/execution-contract.ts";
 
 // The latch reads Feature ownership from the same helper; re-exported here so
 // the dispatcher has one public surface and the latch never imports this file.
@@ -1044,6 +1059,34 @@ async function originUrl(pi: ExtensionAPI, cwd: string): Promise<string> {
     return out.code === 0 ? out.stdout.trim() : "";
   } catch {
     return "";
+  }
+}
+/** Resolve the effective fetch and push publication destinations after Git's
+ * insteadOf/pushInsteadOf URL rewriting. The fetch destination is confirmed by
+ * `git ls-remote --get-url`, the documented rewrite-aware expansion lookup
+ * (never connects); the push destination uses `git remote get-url --all --push`,
+ * whose expansion of insteadOf/pushInsteadOf for the push direction is what git
+ * will actually push to (ls-remote has no --push variant). `remote get-url --all`
+ * stays in the loop because `ls-remote --get-url` prints only the first URL of a
+ * multi-URL remote — every distinct expanded destination must be unambiguous and
+ * identical across both lookups, or publication is refused: an approval must
+ * never bind a slug whose expanded transport destination is a different host. */
+export async function publicationRepository(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+  try {
+    const fetch = await pi.exec("git", ["remote", "get-url", "--all", "origin"], { cwd, timeout: 30_000 });
+    const push = await pi.exec("git", ["remote", "get-url", "--all", "--push", "origin"], { cwd, timeout: 30_000 });
+    const expanded = await pi.exec("git", ["ls-remote", "--get-url", "origin"], { cwd, timeout: 30_000 });
+    if (fetch.code !== 0 || push.code !== 0 || expanded.code !== 0) return undefined;
+    const urls = (value: string) => [...new Set(value.split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
+    const fetchRepos = urls(fetch.stdout).map(url => canonicalPublicationRepository(url));
+    const pushRepos = urls(push.stdout).map(url => canonicalPublicationRepository(url));
+    const expandedRepos = urls(expanded.stdout).map(url => canonicalPublicationRepository(url));
+    const single = (list: (string | undefined)[]) => list.length === 1 && list[0] ? list[0] : undefined;
+    const fetchRepo = single(fetchRepos), pushRepo = single(pushRepos), expandedRepo = single(expandedRepos);
+    if (!fetchRepo || !pushRepo || !expandedRepo || fetchRepo !== pushRepo || fetchRepo !== expandedRepo) return undefined;
+    return fetchRepo;
+  } catch {
+    return undefined;
   }
 }
 
@@ -2407,8 +2450,8 @@ function seedFeature(paths: Paths, objective: string): void {
  * The bridge resolves the extension context itself, so a spawn is valid as
  * long as the host has an active session — it does not depend on the ctx this
  * extension captured. What DOES go stale across a session replacement is the
- * captured ctx used for `ui.notify`, `isIdle`, and the phase ceiling's
- * session id, so the chain re-checks the ceiling as it goes.
+ * captured ctx used for `ui.notify` and `isIdle`, so each chain rechecks its
+ * durable ownership before continuing.
  * ------------------------------------------------------------------ */
 
 const RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
@@ -2920,35 +2963,72 @@ async function stopRun(pi: ExtensionAPI, runId: string): Promise<boolean> {
   return reply.success === true;
 }
 
-/* ------------------------------------------------------------------ *
- * Phase capability ceilings
- *
- * Which agent may run in which phase was prose: two paragraphs explaining
- * that `feature-qa` is the automatic pass and `qa-opus` is the end-of-line
- * one, and please do not confuse them. A ceiling makes a wrong agent fail
- * before spawn instead.
- *
- * Only agent allowlists are applied. `allowedTools` is deliberately left
- * open: these reviewers run `git diff` through bash, so a read-only tool
- * ceiling would break the very agents it looks like it should protect.
- *
- * A ceiling is registered against one session id and it constrains the WHOLE
- * session, not just this extension's children — so it is held only while a
- * child is in flight, and re-registered per child rather than once for a
- * multi-hour chain. Phases the parent hands to the model (`plan`, `review`)
- * cannot be ceilinged from here and are deliberately absent.
- * ------------------------------------------------------------------ */
-
-interface CeilingRegistration {
-  dispose(): void;
+async function makeExecutionBridge(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  paths: Paths,
+  signal?: AbortSignal,
+): Promise<ExecutionBridge> {
+  const sessionManager = ctx.sessionManager as unknown as { getSessionFile?: () => string | undefined; getSessionId?: () => string } | undefined;
+  const sessionFile = sessionManager?.getSessionFile?.();
+  if (!sessionFile) throw new Error("A persisted Pi session is required for plan-driven execution");
+  const common = await pi.exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: paths.gitRoot });
+  if (common.code !== 0 || !common.stdout.trim()) throw new Error("Cannot resolve canonical execution repository");
+  const repo = canonicalRepoIdentity(paths.gitRoot, () => common.stdout.trim());
+  const rawConfig = existsSync(SIDECAR_PATH) ? readFileSync(SIDECAR_PATH, "utf8") : "";
+  let config: Record<string, unknown> = {};
+  try { config = JSON.parse(rawConfig) as Record<string, unknown>; } catch { /* defaults below */ }
+  const capacity = typeof config.executionCapacity === "number" && Number.isSafeInteger(config.executionCapacity) && config.executionCapacity > 0 ? config.executionCapacity : 1;
+  const events = (pi as unknown as { events?: RuntimeEventBus }).events;
+  if (!events) throw new Error("Pi event RPC bus unavailable");
+  // pr-await-latch owns the durable controller. This is a process-local request
+  // only; no second controller or synthetic legacy Feature is constructed here.
+  const controller = await requestExecutionController(events, { repo, stateRoot: ORCH_ROOT, repoName: paths.repo, sessionFile });
+  const preset = config.executionPreset === "legacy" ? "legacy" : "plan-driven";
+  const interpretationProfile = config.interpretationProfile && typeof config.interpretationProfile === "object" && !Array.isArray(config.interpretationProfile)
+    ? config.interpretationProfile as ExecutionProfile
+    : undefined;
+  const callerTools = Array.isArray(config.executionCallerTools) ? config.executionCallerTools.map(String) : undefined;
+  const callerAgents = Array.isArray(config.executionCallerAgents) ? config.executionCallerAgents.map(String) : undefined;
+  const approvedPublicationRepository = await publicationRepository(pi, paths.gitRoot);
+  const bridge = createExecutionBridge({
+    pi,
+    events,
+    repo,
+    referencePath: paths.gitRoot,
+    stateRoot: ORCH_ROOT,
+    sessionFile,
+    processStart: `${process.pid}:${sessionManager?.getSessionId?.() ?? "session"}`,
+    capacity,
+    preset,
+    repositoryName: paths.repo,
+    ...(approvedPublicationRepository ? { repository: approvedPublicationRepository } : {}),
+    callerTools,
+    callerAgents,
+    interpretationTransport: createExecutionInterpreter({ events, sessionFile, profile: interpretationProfile, callerTools, callerAgents, signal }),
+    ownedRoot: worktreeFarmFor(paths.repo),
+    ...(controller ? { controller, resolvePr: controller.resolvePr } : {}),
+  });
+  bridge.scheduler.subscribe(state => {
+    const todos = executionOverlayTodos(state);
+    if (todos.length) publishOverlayWidget(todos);
+  });
+  return bridge;
 }
 
-type RegisterCeiling = (input: {
-  sessionId: string;
-  source: string;
-  ceiling: { allowedAgents?: string[]; allowedTools?: string[]; denyExtensions?: boolean };
-}) => CeilingRegistration;
+function executionTarget(value: string): boolean {
+  return /\.md$/i.test(value) || /^(?:task|execution|manifest|feature|delivery)-[A-Za-z0-9._:-]+$/.test(value);
+}
 
+/**
+ * Per-launch agent allowlists for the legacy phase launches.
+ *
+ * The plan-driven execution runtime enforces caller agent ceilings per launch
+ * (execution-policy.ts); these legacy paths never registered session-wide
+ * ambient ceilings again — a registry silently blocks independent concurrent
+ * phases in one session. Each launch checks its own params before the spawn
+ * RPC instead, and an unregistered phase carries no allowlist at all.
+ */
 const PHASE_AGENTS: Record<string, string[]> = {
   implement: ["tdd-worker", "fixer", "feature-qa"],
   qa: ["qa-opus"],
@@ -2956,85 +3036,42 @@ const PHASE_AGENTS: Record<string, string[]> = {
   review: ["plan-reviewer"],
 };
 
-let registerCeiling: RegisterCeiling | null = null;
-
 /**
- * `pi-subagents` lives under `~/.pi/agent/npm/node_modules`, which is not on
- * the module path from this file — the bare specifier always fails here. The
- * absolute path does resolve, and resolves to the SAME module instance the
- * running extension uses, so a ceiling registered through it is enforced.
- * (Verified behaviourally: a non-allowlisted spawn is rejected before launch,
- * not merely accepted by a second, inert registry.)
- *
- * Optional hardening: if it cannot be loaded, phase isolation degrades to the
- * prompt wording that was already there — never to a hard failure.
+ * "" when every agent this launch would start — its own agent plus any nested
+ * spawn records — sits inside the phase allowlist; otherwise the reason the
+ * launch must be refused. Pure check, no session capability mutation.
  */
-const CAPABILITY_CEILING_MODULE = join(
-  homedir(),
-  ".pi/agent/npm/node_modules/pi-subagents/src/api/capability-ceiling.ts",
-);
-
-async function loadCapabilityCeiling(): Promise<void> {
-  for (const specifier of [
-    "pi-subagents/capability-ceiling",
-    pathToFileURL(CAPABILITY_CEILING_MODULE).href,
-  ]) {
-    try {
-      const mod = (await import(specifier)) as {
-        registerSubagentCapabilityCeiling?: RegisterCeiling;
-      };
-      if (typeof mod.registerSubagentCapabilityCeiling === "function") {
-        registerCeiling = mod.registerSubagentCapabilityCeiling;
-        return;
-      }
-    } catch {
-      /* try the next specifier */
+export function phaseAgentViolation(phase: string, params: Record<string, unknown>): string {
+  const allowed = PHASE_AGENTS[phase];
+  if (!allowed) return "";
+  for (const record of [params, ...nestedSpawnRecords(params)]) {
+    const agent = record.agent;
+    if (typeof agent !== "string" || !agent.trim()) {
+      return `${phase} launch carries no explicit agent; ${phase} allowlist: ${allowed.join(", ")}`;
+    }
+    if (!allowed.includes(agent)) {
+      return `agent ${agent} is outside the ${phase} allowlist (${allowed.join(", ")})`;
     }
   }
-  registerCeiling = null;
-}
-
-function applyPhaseCeiling(
-  _pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
-  phase: keyof typeof PHASE_AGENTS | string,
-): CeilingRegistration | null {
-  const allowedAgents = PHASE_AGENTS[phase];
-  if (!registerCeiling || !allowedAgents) return null;
-  try {
-    const sessionId = ctx.sessionManager?.getSessionId?.();
-    if (!sessionId) return null;
-    return registerCeiling({
-      sessionId,
-      source: `orchestrate:${phase}`,
-      ceiling: { allowedAgents },
-    });
-  } catch {
-    return null;
-  }
+  return "";
 }
 
 /**
- * One child, ceilinged for exactly as long as it is in flight.
- *
- * Registering once for a whole Feature would pin the allowlist to the session
- * id captured at the start and would also forbid every other agent in the
- * user's own session for hours. Per child, the ceiling is re-derived from the
- * live context and released the moment the child lands.
+ * One child launch. Agent/profile policy is per launch; this extension never
+ * mutates ambient capabilities in the surrounding session.
  */
-async function runChildInPhase(
+export async function runChildInPhase(
   pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
-  phase: keyof typeof PHASE_AGENTS | string,
+  _ctx: ExtensionCommandContext,
+  phase: string,
   params: Record<string, unknown>,
   onRunId?: (runId: string) => void,
 ): Promise<ChildOutcome> {
-  const ceiling = applyPhaseCeiling(pi, ctx, phase);
-  try {
-    return await runChild(pi, params, onRunId);
-  } finally {
-    ceiling?.dispose();
-  }
+  // Hard per-launch allowlist, refused before the spawn RPC — the legacy
+  // counterpart of the plan-driven runtime's caller-ceiling check.
+  const violation = phaseAgentViolation(phase, params);
+  if (violation) return Promise.resolve({ ok: false, reason: violation });
+  return await runChild(pi, params, onRunId);
 }
 
 function taskScalar(body: string, name: string): string {
@@ -3928,26 +3965,25 @@ export function sessionFixLaunchParams(intent: LaunchIntent): Record<string, unk
  */
 export async function launchSessionFixer(
   pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
+  _ctx: ExtensionCommandContext,
   intent: LaunchIntent,
 ): Promise<LaunchResult> {
   const params = sessionFixLaunchParams(intent);
-  const ceiling = applyPhaseCeiling(pi, ctx, "implement");
-  try {
-    const policy = applySpawnPolicy(params);
-    if (policy.action === "reject") {
-      throw new Error(policy.reason ?? "spawn rejected");
-    }
-    const reply = await rpcCall(pi, "spawn", params);
-    if (!reply.success) throw new Error(rpcErrorText(reply));
-    const runId = reply.data?.details?.runId;
-    if (typeof runId !== "string" || !runId) {
-      throw new Error("spawn reply carried no runId");
-    }
-    return { runId, recovered: false };
-  } finally {
-    ceiling?.dispose();
+  // Same hard per-launch allowlist the legacy implement phase enforces; the
+  // fixer is an implement agent, so this only fires if the builder drifts.
+  const violation = phaseAgentViolation("implement", params);
+  if (violation) throw new Error(violation);
+  const policy = applySpawnPolicy(params);
+  if (policy.action === "reject") {
+    throw new Error(policy.reason ?? "spawn rejected");
   }
+  const reply = await rpcCall(pi, "spawn", params);
+  if (!reply.success) throw new Error(rpcErrorText(reply));
+  const runId = reply.data?.details?.runId;
+  if (typeof runId !== "string" || !runId) {
+    throw new Error("spawn reply carried no runId");
+  }
+  return { runId, recovered: false };
 }
 
 /**
@@ -6330,6 +6366,9 @@ ${loc}
 /orchestrate qa [feature]      end QA: qa-opus xai/grok-4.6 high (auto feature-qa is xai/grok-4.6 high after Tasks 1..N)
 /orchestrate implement [feature] [task]   escape hatch: re-open one Task
 /orchestrate pr [feature]                 escape hatch: land the Feature PR
+/orchestrate run "path/to/plan.md"          import, preview, then ask for explicit approval
+/orchestrate execution status                durable plan-driven execution status
+/orchestrate execution pause <task-id>      targeted pause (resume/retry/cancel likewise)
 
 Tasks, feature-qa, and one git pr-await run in this extension, not as model
 instructions. A Task's "- Command:" becomes a host-run gate when it is written
@@ -6341,6 +6380,10 @@ the session is never asked to implement; pr_round counts those fix writers.
 One chain per Feature: a second approve/resume while one is running is refused.
 autoAdvanceOnLanded (orchestrate.json, default true): harness fail + landed
 work → next Task. Override per Feature with auto_advance_on_landed in status.md.
+Plan-driven runs are versioned separately from legacy Feature records. The
+Markdown path is snapshotted and treated as untrusted data; no source text can
+auto-approve capacity or publication. Controls target durable manifest/task IDs,
+never a process-global current Feature.
 qaModel (orchestrate.json) is the ONE place the reviewer model is set — it
 drives feature-qa, qa-opus, and plan-reviewer launches and the spawn-policy
 pin alike. Changing it also needs modelScope.agents.* in settings.json.
@@ -6354,9 +6397,9 @@ Approve is a TUI card after plan-reviewer finishes, not a fence. Tasks never ove
 
 export default function orchestrateExtension(pi: ExtensionAPI): void {
   overlayPi = pi;
-  void loadCapabilityCeiling();
   void bindRpivTodoOverlaySink(pi);
   let lastCtx: ExtensionContext | undefined;
+  const executionHost = createExecutionHost();
   const events = (pi as ExtensionAPI & { events?: { emit: (e: string, d: unknown) => void; on: (e: string, h: (d: any) => void) => () => void } }).events;
   if (events) {
     registerReviewLaunch(async (intent) => {
@@ -6390,6 +6433,17 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
     // lived to see (F1, F8).
     void reconcileLiveFeaturePrs(pi, ctx);
     armReconcileTimer(pi, ctx);
+    try {
+      const bridge = await executionHost.reload(async signal => makeExecutionBridge(pi, ctx as unknown as ExtensionCommandContext, await resolvePaths(pi, ctx), signal));
+      // Startup only resumes durable work previously owned by this exact
+      // persisted session. Other sessions construct a lease-free observer.
+      await bridge.start({ resumePriorOwner: true });
+    } catch (error) {
+      uiNotify(ctx, `Execution startup unavailable: ${String(error)}`, "warning");
+    }
+  });
+  pi.on("session_shutdown", async () => {
+    await executionHost.shutdown();
   });
   pi.on("session_compact", republishOverlay);
   pi.on("session_tree", republishOverlay);
@@ -6459,6 +6513,90 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       const rest = tokens.slice(1).join(" ");
 
       const paths = await resolvePaths(pi, ctx);
+
+      const parsedExecution = (() => {
+        try { return parseExecutionCommand(raw); } catch (error) {
+          uiNotify(ctx, String(error), "error");
+          return undefined;
+        }
+      })();
+      if (!parsedExecution) return;
+      const executionHead = parsedExecution.verb;
+      const executionSubcommand = executionHead === "execution" || executionHead === "exec" ? parsedExecution.args[0] ?? "" : executionHead;
+      const executionArgs = executionHead === "execution" || executionHead === "exec" ? parsedExecution.args.slice(1) : parsedExecution.args;
+      const immediateExecutionControl = executionSubcommand === "pause" && executionArgs[0]?.toLowerCase() === "now" && executionArgs.length === 2;
+      const controlArgs = immediateExecutionControl ? executionArgs.slice(1) : executionArgs;
+      const targetedStatus = executionSubcommand === "status" && executionArgs.length === 1 && executionTarget(executionArgs[0]!);
+      const targetedControl = ["pause", "resume", "retry", "cancel"].includes(executionSubcommand) && controlArgs.length === 1 && executionTarget(controlArgs[0]!);
+      const shorthandPlanPath = (() => {
+        if (parsedExecution.args.length !== 0) return undefined;
+        if (isUnambiguousPlanPath(raw)) return raw;
+        try {
+          const candidate = parseExecutionCommand(`run ${raw}`).args;
+          return candidate.length === 1 && isUnambiguousPlanPath(candidate[0]!) ? candidate[0] : undefined;
+        } catch { return undefined; }
+      })();
+      const shorthandPlan = !!shorthandPlanPath;
+      const explicitExecution = executionHead === "run" || executionHead === "execution" || executionHead === "exec" || targetedStatus || targetedControl || shorthandPlan;
+      if (explicitExecution) {
+        try {
+          const bridge = await executionHost.get(signal => makeExecutionBridge(pi, ctx, paths, signal));
+          if (executionHead === "run" || executionSubcommand === "run" || shorthandPlan) {
+            const runArgs = shorthandPlanPath ? [shorthandPlanPath] : executionHead === "run" ? parsedExecution.args : executionArgs;
+            if (runArgs.length !== 1) throw new Error("/orchestrate run requires one quoted Markdown plan path");
+            const first = await bridge.run(runArgs[0]!);
+            if (first.kind === "refused") { uiNotify(ctx, first.reason, "error"); return; }
+            if (first.kind === "approval-required") {
+              if (!ctx.hasUI || !ctx.ui?.confirm) {
+                uiNotify(ctx, `Plan ${first.preview.path} imported but not approved. Re-run in an interactive session to approve it.`, "warning");
+                return;
+              }
+              const approve = await ctx.ui.confirm(
+                "Approve plan-driven execution?",
+                executionPreviewSummary(first.preview),
+              );
+              if (!approve) { uiNotify(ctx, "Plan imported but approval was not granted.", "warning"); return; }
+              const publication = first.preview.manifest.deliveryGroups.some(group => group.policy === "pr")
+                ? await ctx.ui.confirm("Authorize publication?", "This approval permits the configured PR controller to publish only validated delivery receipts.")
+                : false;
+              const approval: ExecutionApproval = {
+                token: first.preview.token,
+                capacity: first.preview.boundary.capacity,
+                publication,
+                ...(first.preview.boundary.publicationRepository ? { publicationRepository: first.preview.boundary.publicationRepository } : {}),
+                approvedBy: ctx.sessionManager?.getSessionId?.() || "pi-session",
+                approvedAt: Date.now(),
+              };
+              const started = await bridge.run(first.preview.path, approval);
+              if (started.kind === "started") {
+                uiNotify(ctx, `Started ${started.manifest.id} revision ${started.manifest.revision} (${executionStatusSummary(bridge.status())}).`, "info");
+              } else uiNotify(ctx, started.kind === "refused" ? started.reason : "Execution remains unapproved.", "error");
+              return;
+            }
+            uiNotify(ctx, `Execution already started (${executionStatusSummary(bridge.status())}).`, "info");
+            return;
+          }
+          const subcommand = executionHead === "execution" || executionHead === "exec" ? executionSubcommand : executionHead;
+          if (subcommand === "status") {
+            const target = executionArgs[0];
+            const status = bridge.status();
+            const matches = !target || executionManifestsForTarget(status.state, target).length > 0;
+            uiNotify(ctx, executionProgressSummary(status, target), matches ? "info" : "warning");
+            return;
+          }
+          if (["pause", "resume", "retry", "cancel"].includes(subcommand)) {
+            const target = controlArgs[0];
+            if (!target || controlArgs.length !== 1) throw new Error(`Execution ${subcommand} requires one target ID`);
+            await bridge.control({ targetId: target, action: subcommand as "pause" | "resume" | "retry" | "cancel", ...(subcommand === "pause" && immediateExecutionControl ? { immediate: true } : {}) });
+            uiNotify(ctx, `Execution ${subcommand} accepted for ${target}.`, "info");
+            return;
+          }
+          throw new Error("Unknown execution command; use run, status, pause, resume, retry, or cancel");
+        } catch (error) {
+          uiNotify(ctx, `Execution command refused: ${String(error)}`, "error");
+          return;
+        }
+      }
 
       // Every verb is a reconcile point. The user typing anything at all is a
       // better trigger than the 60s timer, and it costs one `gh pr view` per

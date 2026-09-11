@@ -35,7 +35,7 @@ import {
 	type FSWatcher,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import {
 	ACTIONABLE,
@@ -46,6 +46,7 @@ import {
 	adoptableLatch,
 	ensureDriver,
 	findFeatureOwningPr,
+	listFeaturePrOwners,
 	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	latchOff,
@@ -91,9 +92,15 @@ import {
 } from "./lib/pr-await-core.ts";
 import { classifyGithubStatus, parsePrKey, parseVerdictHead, verdictIdentity } from "./lib/pr-review-identity.ts";
 import { createReviewStore, readPiRunDisk } from "./lib/pr-review-store.ts";
+import { createExecutionStore } from "./lib/execution-store.ts";
 import { createReviewController, type ReviewController } from "./lib/pr-review-controller.ts";
+import type { DeliveryGroup, ExecutionControllerMapping, ExecutionManifest, IntegrationReceipt, WorkspaceRef } from "./lib/execution-contract.ts";
 import {
 	requestReviewLaunch,
+	EXECUTION_CONTROLLER_BINDING_EVENT,
+	PR_REVIEW_RECONCILED_EVENT,
+	type ExecutionControllerBindingRequest,
+	type ExecutionControllerBinding,
 	type LaunchIntent,
 	type LaunchResult,
 	type OwnerLookup,
@@ -752,8 +759,13 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const store = createReviewStore(stateDir());
 		reviewCtrl = createReviewController({
 			store,
-			lookupOwner: (prKey): OwnerLookup => {
+			lookupOwner: (prKey, current): OwnerLookup => {
 				const held = latch;
+				if (current?.kind === "execution") {
+					const execution = store.list().find(ob => ob.pr.host === prKey.host && ob.pr.owner === prKey.owner && ob.pr.repo === prKey.repo && ob.pr.number === prKey.number && ob.owner.kind === "execution" && ob.owner.id === current.id && ob.owner.generation === current.generation);
+					if (!execution) return { status: "unavailable", reason: "durable execution owner lookup failed" };
+					return { status: "execution", owner: execution.owner, worktree: execution.worktree };
+				}
 				const fake: LatchState = {
 					pr: prKey.number,
 					cwd: held?.cwd ?? "",
@@ -958,6 +970,81 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	/**
+	 * Plan-driven PR delivery asks the latch for this one existing controller.
+	 * The execution bridge durably bootstraps an exact mapping before this
+	 * resolver is retried; explicitly legacy manifests retain the Feature
+	 * adapter. No synthetic Feature or guessed PR is created here.
+	 */
+	const executionEvents = (pi as unknown as { events?: { on: (event: string, handler: (data: any) => void) => () => void; emit: (event: string, data: unknown) => void } }).events;
+	executionEvents?.on(EXECUTION_CONTROLLER_BINDING_EVENT, (request: ExecutionControllerBindingRequest) => {
+		if (!request || request.claimed) return;
+		request.claimed = true;
+		const controller = getController();
+		const executionMappingFor = (manifest: ExecutionManifest, group: DeliveryGroup, workspace: WorkspaceRef, expectedHead: string): ExecutionControllerMapping | undefined => {
+			if (!request.stateRoot) return undefined;
+			try {
+				const state = createExecutionStore({ stateRoot: join(request.stateRoot, "plan-driven-v1"), repo: request.repo }).read();
+				if (state.activeRevisions[manifest.id] !== manifest.revision || !state.manifests.some(item => item.id === manifest.id && item.revision === manifest.revision && item.repo.id === request.repo.id)) return undefined;
+				const exact = (state.controllerMappings ?? []).filter(item => item.manifestId === manifest.id && item.manifestRevision === manifest.revision && item.groupId === group.id && item.ownerId === group.ownerId && item.workspace.id === workspace.id && item.workspace.path === workspace.path && item.workspace.repoId === request.repo.id && item.workspace.baseCommit === manifest.baseCommit);
+				if (exact.length === 1) return exact[0];
+				// A controller obligation is itself a durable mapping after a prior
+				// handoff; no legacy Feature record is needed to reload it.
+				const obligations = createReviewStore(stateDir()).list().filter(ob => ob.owner.kind === "execution" && ob.owner.id === group.ownerId && ob.owner.generation && ob.worktree === workspace.path && ob.head === expectedHead);
+				if (obligations.length === 1) {
+					const ob = obligations[0]!;
+					return { manifestId: manifest.id, manifestRevision: manifest.revision, groupId: group.id, ownerId: ob.owner.id, generation: ob.owner.generation, pr: { repo: `${ob.pr.host}/${ob.pr.owner}/${ob.pr.repo}`, number: Number(ob.pr.number) }, workspace, head: ob.head };
+				}
+				return undefined;
+			} catch { return undefined; }
+		};
+		const ownerFor = (manifest: ExecutionManifest, group: DeliveryGroup, workspace: WorkspaceRef, expectedHead: string): { kind: "execution"; mapping: ExecutionControllerMapping } | { kind: "feature"; feature: FeaturePrOwner } | undefined => {
+			const mapping = executionMappingFor(manifest, group, workspace, expectedHead);
+			if (mapping) return { kind: "execution", mapping };
+			// Plan-driven groups never fall back to a legacy Feature record. The
+			// legacy adapter remains isolated for explicitly compiled legacy plans.
+			if (manifest.preset !== "legacy") return undefined;
+			// Read on every resolver call: a removed/renamed Feature must become a
+			// refusal instead of reusing a stale bridge-time PR mapping.
+			const ownerCandidates = listFeaturePrOwners({ root: join(homedir(), "orchestrator"), phases: ["pr", "implementing", "feature-qa"] })
+				.filter(owner => !request.repoName || owner.repo === request.repoName)
+				.filter(owner => owner.pr && (!request.repoName || owner.repo === request.repoName));
+			const id = group.ownerId.trim();
+			const exact = ownerCandidates.filter(owner => [owner.dir, owner.name, basename(owner.dir)].includes(id));
+			return exact.length === 1 ? { kind: "feature", feature: exact[0]! } : undefined;
+		};
+		const binding: ExecutionControllerBinding = {
+			controller,
+			controllerId: "pr-review-controller-v1",
+			resolvePr: async ({ manifest, group, receipt, workspace }: { manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef }) => {
+				if (manifest.repo.id !== request.repo.id || manifest.repo.commonDir !== request.repo.commonDir || workspace.repoId !== request.repo.id) return { kind: "refused", reason: "Foreign execution repository" };
+				const owner = ownerFor(manifest, group, workspace, receipt.afterCommit);
+				if (!owner) return { kind: "refused", reason: "Ambiguous, stale, or foreign execution delivery owner" };
+				if (owner.kind === "execution") {
+					if (owner.mapping.head !== receipt.afterCommit) return { kind: "refused", reason: "Execution delivery head changed" };
+					return { kind: "authorized", pr: owner.mapping.pr, generation: owner.mapping.generation, ownerId: owner.mapping.ownerId, ownerKind: "execution" };
+				}
+				const slug = originSlug(owner.feature.worktree ?? "");
+				if (!slug || !parsePrKey({ slug, pr: owner.feature.pr })) return { kind: "refused", reason: "Feature origin/PR mapping is unavailable" };
+				return { kind: "authorized", pr: { repo: slug, number: Number(owner.feature.pr) }, generation: owner.feature.dir, ownerId: owner.feature.dir, ownerKind: "feature" };
+			},
+			verifyMerge: async ({ pr, workspace, head }) => {
+				const key = parsePrKey({ slug: pr.repo, pr: pr.number });
+				if (!key || !head) return undefined;
+				try {
+					const result = await pi.exec("gh", ["pr", "view", String(key.number), "--repo", `${key.owner}/${key.repo}`, "--json", "state,mergeCommit,url"], { cwd: workspace.path, timeout: SHORT_MS });
+					if (result.code !== 0) return undefined;
+					const view = JSON.parse(String(result.stdout ?? "")) as { state?: unknown; url?: unknown; mergeCommit?: { oid?: unknown } };
+					const commit = view.mergeCommit?.oid;
+					const url = view.url;
+					if (String(view.state).toUpperCase() !== "MERGED" || typeof commit !== "string" || !/^[a-f0-9]{40}$/i.test(commit) || typeof url !== "string" || !url) return undefined;
+					return { commit: commit.toLowerCase(), url, observedAt: Date.now() };
+				} catch { return undefined; }
+			},
+		};
+		request.resolve(binding);
+	});
+
+	/**
 	 * The Grok/Claude stop-hook injects one undelivered ACTIONABLE verdict on
 	 * Stop. Pi has no Stop hook — the session has already yielded — so the
 	 * latch must deliver that verdict itself or review fixes never start.
@@ -980,6 +1067,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (!hit) {
 			try {
 				await getController().reconcile();
+				executionEvents?.emit(PR_REVIEW_RECONCILED_EVENT, { sessionFile: sessionId });
 			} catch {
 				/* never take the session down */
 			}
@@ -1093,6 +1181,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		});
 		if (!ack.accepted) return;
 		const report = await ctrl.reconcile({ ownerId: owner.id });
+		executionEvents?.emit(PR_REVIEW_RECONCILED_EVENT, { sessionFile: sessionId, pr });
 		if (ack.kind === "env") {
 			lastRefusedFingerprint = fp;
 			return;
@@ -1434,6 +1523,8 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 
 	pi.on("session_shutdown", async () => {
 		// Leave the waiter. Aborting it was the D-2 self-inflicted stall.
+		// Keep the process-local execution binding registered: a later session
+		// start must still reuse this one durable controller.
 		stopWatch();
 		pendingCommands.clear();
 		seenCwds.clear();

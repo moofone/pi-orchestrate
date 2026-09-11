@@ -24,7 +24,7 @@ import {
 } from "./plan-tasks.ts";
 
 export type OverlayTodoStatus = "pending" | "in_progress" | "completed";
-export type OverlayTodoKind = "planner" | "plan-reviewer" | "approve" | "task" | "qa";
+export type OverlayTodoKind = "planner" | "plan-reviewer" | "approve" | "task" | "qa" | "execution-feature" | "execution-task" | "execution-delivery";
 
 /** Reserved overlay ids so Task N keeps id N. */
 export const OVERLAY_PLANNER_ID = 1001;

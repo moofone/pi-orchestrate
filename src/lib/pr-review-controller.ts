@@ -209,6 +209,11 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 				return { ok: false, reason: "owner generation changed" };
 			}
 		}
+		if (ob.owner.kind === "execution") {
+			if (lookup.status !== "execution" || lookup.owner.id !== ob.owner.id || lookup.owner.generation !== ob.owner.generation) {
+				return { ok: false, reason: "execution owner lookup failed", recovery: true };
+			}
+		}
 		if (ob.owner.kind === "session") {
 			if (lookup.status === "feature") {
 				return { ok: false, reason: "session still holds this PR; feature transfer requires release" };

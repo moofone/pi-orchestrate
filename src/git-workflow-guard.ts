@@ -11,8 +11,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	classifyForRole,
 	classifyViewRepeat,
-	isWorktreeMutation,
 	mutationTargetDirs,
+	durableExecutionReservation,
+	verifiedDurableExecutionReservation,
+	durableExecutionWorkspaceFence,
 	isWriterRole,
 	viewRepeatKey,
 } from "./lib/git-workflow-guard.ts";
@@ -26,6 +28,9 @@ export {
 	extractPrNumber,
 	isWorktreeMutation,
 	mutationTargetDirs,
+	durableExecutionReservation,
+	verifiedDurableExecutionReservation,
+	durableExecutionWorkspaceFence,
 	isWriterRole,
 	viewRepeatKey,
 	VIEW_REPEAT_LIMIT,
@@ -44,20 +49,37 @@ export default function (pi: ExtensionAPI) {
 		if (!command) return;
 
 		let writerReserved = false;
-		if (!writer && isWorktreeMutation(command)) {
-			try {
-				const fallback =
-					(typeof (event as { cwd?: string }).cwd === "string" && (event as { cwd?: string }).cwd) ||
-					process.cwd();
-				const store = createReviewStore(stateDir());
-				writerReserved = mutationTargetDirs(command, fallback).some((dir) =>
-					Boolean(store.writerForWorktree(dir)),
-				);
-			} catch {
-				writerReserved = false;
-			}
+		let executionRole: "worker" | "parent" | undefined;
+		try {
+			const fallback =
+				(typeof (event as { cwd?: string }).cwd === "string" && (event as { cwd?: string }).cwd) ||
+				process.cwd();
+			// Caller identity is established independently of the mutation predicate;
+			// targeting a reserved path is never worker proof.
+			const targets = mutationTargetDirs(command, fallback);
+			// Labels select the writer policy only. They never authorize a durable
+			// execution workspace; every target must carry the exact runtime-bound
+			// attempt/session/run evidence.
+			const verified = targets.map(dir => verifiedDurableExecutionReservation(dir));
+			const executionWorker = verified.length > 0 && verified.every(Boolean) && new Set(verified.map(item => item?.attemptId)).size === 1 ? verified[0] : undefined;
+			const reserved = targets.some(dir => durableExecutionReservation(dir) || durableExecutionWorkspaceFence(dir));
+			if (executionWorker) executionRole = "worker";
+			else if (reserved || verified.some(Boolean)) executionRole = "parent";
+			const store = createReviewStore(stateDir());
+			writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
+		} catch {
+			// Lookup failure must not degrade to ordinary git rules: that would
+			// allow a commit inside a reserved worker workspace exactly when the
+			// fence is unverifiable. Fail closed as a reserved parent — mutations
+			// are fenced, read-only commands still pass.
+			writerReserved = false;
+			executionRole = "parent";
 		}
-		const first = classifyForRole(command, { writer, writerReserved });
+		// A writer label without exact execution proof is treated as an
+		// untrusted caller for reserved workspaces. Keep label-based publication
+		// restrictions for ordinary/unreserved writer sessions.
+		const reservedWithoutExecutionProof = writer && executionRole === "parent";
+		const first = classifyForRole(command, { writer: reservedWithoutExecutionProof ? false : writer, writerReserved: writerReserved || executionRole === "parent", ...(executionRole ? { executionRole } : {}) });
 		if (first.block) return first;
 
 		const key = viewRepeatKey(command);

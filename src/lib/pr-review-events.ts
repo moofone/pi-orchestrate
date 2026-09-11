@@ -6,11 +6,43 @@
  */
 import { PR_REVIEW_PROTOCOL_VERSION, type PrKey } from "./pr-review-identity.ts";
 import type { ReviewOwner } from "./pr-review-store.ts";
+import type { DeliveryGroup, ExecutionManifest, IntegrationReceipt, RepoIdentity, WorkspaceRef } from "./execution-contract.ts";
+import type { ReviewController } from "./pr-review-controller.ts";
 
 export const PR_REVIEW_LAUNCH_EVENT = "pi.pr-review.launch";
 export const PR_REVIEW_QUERY_EVENT = "pi.pr-review.query";
 export const PR_REVIEW_PUBLISH_EVENT = "pi.pr-review.publish";
 export const PR_REVIEW_PROTOCOL = PR_REVIEW_PROTOCOL_VERSION;
+export const PR_REVIEW_RECONCILED_EVENT = "pi.pr-review.reconciled";
+/** Process-local request used by plan-driven execution to reuse the one durable
+ * PR controller owned by pr-await-latch. A missing listener is represented as
+ * undefined; execution still remains local-only unless a PR delivery asks for
+ * the binding, at which point the delivery reports the missing adapter. */
+export const EXECUTION_CONTROLLER_BINDING_EVENT = "pi.execution.controller.binding";
+export type ExecutionPrResolver = (request: {
+	manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef;
+}) => Promise<{ kind: "authorized"; pr: { repo: string; number: number }; generation: string; ownerId?: string; ownerKind?: "feature" | "execution" | "session" } | { kind: "refused" | "unknown"; reason: string }>;
+export type ExecutionControllerBinding = {
+	controller: Pick<ReviewController, "handoff" | "status" | "observeVerdict" | "reconcile">;
+	controllerId: string;
+	resolvePr: ExecutionPrResolver;
+	verifyMerge: (request: { pr: { repo: string; number: number }; workspace: WorkspaceRef; head: string }) => Promise<{ commit: string; url: string; observedAt: number } | undefined>;
+};
+export type ExecutionControllerBindingRequest = {
+	repo: RepoIdentity;
+	/** Durable execution namespace used to resolve plan-driven group ownership. */
+	stateRoot?: string;
+	repoName?: string;
+	sessionFile: string;
+	claimed: boolean;
+	resolve: (binding: ExecutionControllerBinding) => void;
+};
+export function requestExecutionController(events: PrLifecycleBus, request: Omit<ExecutionControllerBindingRequest, "claimed" | "resolve">): Promise<ExecutionControllerBinding | undefined> {
+	let binding: ExecutionControllerBinding | undefined;
+	const payload: ExecutionControllerBindingRequest = { ...request, claimed: false, resolve: value => { binding = value; } };
+	events.emit(EXECUTION_CONTROLLER_BINDING_EVENT, payload);
+	return Promise.resolve(payload.claimed ? binding : undefined);
+}
 
 export type PrLifecycleBus = {
 	emit: (event: string, data: unknown) => void;
@@ -68,6 +100,7 @@ export type PublishResult = {
 
 export type OwnerLookup =
 	| { status: "feature"; owner: ReviewOwner; worktree?: string }
+	| { status: "execution"; owner: ReviewOwner; worktree?: string }
 	| { status: "session"; owner: ReviewOwner; worktree?: string }
 	| { status: "observer" }
 	| { status: "unavailable"; reason: string };

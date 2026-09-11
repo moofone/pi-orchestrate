@@ -2622,8 +2622,8 @@ test("L4: the skill still leaves a solo session its own latch, verdict, and fix"
   );
   assert.match(
     src,
-    /`read_comments_and_fix` \| fix current-head findings[^|]*`git pr-await` once/,
-    "the solo `next=` table still tells that session to fix, push, and re-await",
+    /`read_comments_and_fix` \| dispatch a `fixer` child[^|]*one push[^|]*`git pr-await` once/,
+    "the solo `next=` table delegates fixes, then keeps push and re-await with the owner",
   );
 
   const harness = skillSection("Harness");
@@ -3244,6 +3244,126 @@ test("session fixer launch returns when the child is spawned, not when it exits"
   const result = (await withDeadline(p, 500)) as { runId?: string; reason?: string };
   assert.notEqual(result.reason, "TEST_TIMEOUT", "must not wait for the child to exit");
   assert.equal(result.runId, "run-session-1");
+});
+
+/* ---------------------------------------------------------------- *
+ * Per-launch phase agent allowlists — hard enforcement on the legacy
+ * launch paths (implement/QA/plan/review and the session fixer).
+ *
+ * The plan-driven runtime enforces caller agent ceilings per launch;
+ * the legacy paths must keep an equivalent exact per-launch check.
+ * A session-wide ambient registry is explicitly NOT restored: it would
+ * silently block independent concurrent phases in one session.
+ * ---------------------------------------------------------------- */
+
+const SESSION_FIX_INTENT = {
+  v: 1,
+  idempotencyKey: "k-session-allowlist",
+  pr: { host: "github.com", owner: "moofone", repo: "icemining", number: "99" },
+  owner: { kind: "session", id: "s1", generation: "g1" },
+  worktree: "/tmp/wt",
+  expectedHead: "abc",
+  verdictIds: ["v1"],
+  next: "read_comments_and_fix",
+  body: "next=read_comments_and_fix\nhead=abc",
+  validation: "commit-only",
+  publication: "controller",
+};
+
+function phaseAgentViolationFn() {
+  const fn = (orch as never as {
+    phaseAgentViolation?: (phase: string, params: Record<string, unknown>) => string;
+  }).phaseAgentViolation;
+  assert.equal(
+    typeof fn,
+    "function",
+    "phaseAgentViolation must be exported so the per-launch phase allowlist is testable",
+  );
+  return fn as (phase: string, params: Record<string, unknown>) => string;
+}
+
+test("phase allowlist: every legacy launch's own agent sits inside its phase", () => {
+  const violation = phaseAgentViolationFn();
+  const paths = promptContractPaths();
+  assert.equal(
+    violation(
+      "implement",
+      orch.workerLaunchParams(
+        paths,
+        { id: "1", title: "t", status: "pending", complexity: "simple" } as never,
+        "/tmp/wt",
+        "# Feature: t\n",
+      ),
+    ),
+    "",
+    "tdd-worker is an implement agent",
+  );
+  assert.equal(
+    violation("implement", orch.reviewFixLaunchParams(paths, "13", "/tmp/wt", { next: "read_comments_and_fix", output: "" })),
+    "",
+    "fixer is an implement agent",
+  );
+  assert.equal(violation("implement", orch.qaLaunchParams(paths, "f", "/tmp/wt", "feature-qa")), "", "feature-qa is an implement agent");
+  assert.equal(violation("qa", orch.qaLaunchParams(paths, "f", "/tmp/wt", "qa-opus")), "", "qa-opus is a qa agent");
+  assert.equal(violation("plan", orch.plannerLaunchParams(paths, "objective")), "", "planner is a plan agent");
+  assert.equal(violation("review", orch.reviewLaunchParams(paths, "/tmp/wt", "f")), "", "plan-reviewer is a review agent");
+  assert.equal(violation("implement", orch.sessionFixLaunchParams(SESSION_FIX_INTENT as never)), "", "the session fixer launches under the implement allowlist");
+});
+
+test("phase allowlist: a phase-foreign agent is a violation, top level or nested", () => {
+  const violation = phaseAgentViolationFn();
+  assert.match(violation("implement", { agent: "qa-opus" }), /allowlist|implement/);
+  assert.match(violation("qa", { agent: "tdd-worker" }), /allowlist|qa/);
+  assert.match(violation("plan", { agent: "plan-reviewer" }), /allowlist|plan/);
+  assert.match(violation("review", { agent: "planner" }), /allowlist|review/);
+  assert.match(
+    violation("qa", { agent: "qa-opus", parallel: [{ agent: "planner" }] }),
+    /planner/,
+    "nested spawn records sit under the same launch allowlist",
+  );
+  assert.match(violation("qa", { task: "no agent at all" }), /agent/, "an unnamed launch is not a silent pass");
+});
+
+test("phase allowlist: unregistered phases carry no allowlist (registry parity)", () => {
+  const violation = phaseAgentViolationFn();
+  assert.equal(violation("unregistered", { agent: "qa-opus" }), "");
+});
+
+test("runChildInPhase rejects a phase-foreign agent before the spawn RPC", async () => {
+  assert.equal(
+    typeof (orch as Record<string, unknown>).runChildInPhase,
+    "function",
+    "runChildInPhase must be exported so the legacy phase launch path is testable",
+  );
+  const pi = makeFakePi();
+  const spawn = captureSpawn(pi);
+  const runChildInPhase = (orch as never as { runChildInPhase: Function }).runChildInPhase;
+  const outcome = (await withDeadline(
+    runChildInPhase(pi, makeFakeCtx().ctx, "qa", { agent: "tdd-worker", task: "x" }),
+    500,
+  )) as { ok?: boolean; reason?: string };
+  assert.equal(outcome.ok, false);
+  assert.match(String(outcome.reason), /qa/);
+  assert.equal(spawn.requestId, "", "a phase-foreign launch must not reach the bus");
+});
+
+test("runChildInPhase still launches an agent inside the phase allowlist", async () => {
+  const pi = makeFakePi();
+  const spawn = captureSpawn(pi);
+  const runChildInPhase = (orch as never as { runChildInPhase: Function }).runChildInPhase;
+  const p = runChildInPhase(pi, makeFakeCtx().ctx, "qa", { agent: "qa-opus", task: "x" }) as Promise<{
+    ok?: boolean;
+  }>;
+  await Promise.resolve();
+  assert.notEqual(spawn.requestId, "", "an allowlisted phase launch must reach the bus");
+  pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
+    success: true,
+    data: { details: { runId: "run-qa-allow" } },
+  });
+  await Promise.resolve();
+  pi.events.emit(ASYNC_COMPLETE_EVENT, { runId: "run-qa-allow", success: true, state: "complete" });
+  const outcome = (await withDeadline(p, 500)) as { ok?: boolean };
+  assert.equal(outcome.ok, true);
 });
 
 test("P2 F7: the tdd-worker contract commits and never pushes", () => {
@@ -6142,4 +6262,66 @@ test("P5 F21: the idle-parent gate covers exactly the phases that own a writer",
       "`planning` and `reviewing` own no worktree, and a `paused` or `blocked` " +
       "Feature is not running anything for the parent to stay out of the way of",
   );
+});
+
+/** Scriptable git for the publication-destination boundary: each answer is
+ * keyed by the exact `git` argv the production lookups must issue. */
+function publicationGitExec(answers: Record<string, { code: number; stdout: string; stderr?: string }>) {
+  const calls: string[] = [];
+  const exec = async (_cmd: string, args: string[]) => {
+    const key = args.join(" ");
+    calls.push(key);
+    return answers[key] ?? { code: 1, stdout: "", stderr: `unexpected git invocation: ${key}` };
+  };
+  return { exec, calls };
+}
+
+test("publicationRepository resolves fetch and push through the rewrite-aware expanded lookups", async () => {
+  // insteadOf rewrites the configured https URL into scp form for fetch;
+  // pushInsteadOf rewrites the push URL into ssh form on the same host. Every
+  // expanded answer must canonicalize to one approved slug.
+  const git = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "git@gh-alias:acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "ssh://git@gh-alias/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "https://gh-alias/acme/approved.git\n" },
+  });
+  const repo = await orch.publicationRepository({ exec: git.exec } as never, "/tmp/publication-cwd");
+  assert.equal(repo, "gh-alias/acme/approved");
+  assert.ok(git.calls.includes("ls-remote --get-url origin"), "the fetch destination must be confirmed by the insteadOf-expansion lookup (git ls-remote --get-url)");
+  assert.ok(git.calls.includes("remote get-url --all --push origin"), "the push destination must be resolved push-aware (no ls-remote --push variant exists)");
+});
+
+test("publicationRepository refuses when the ls-remote insteadOf expansion diverges from the configured remote", async () => {
+  // The reviewer's exact scenario: configured URLs name github.com/acme/approved
+  // (what a non-expanding lookup would report) while the expanded transport
+  // truth is a rewritten host. Approval must not bind the configured slug.
+  const git = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "git@gh-alias:acme/elsewhere.git\n" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: git.exec } as never, "/tmp/publication-cwd"), undefined);
+});
+
+test("publicationRepository refuses pushInsteadOf host retargeting, multi-URL ambiguity, and lookup failure", async () => {
+  const retarget = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "git@ssh.foreign-host.dev:acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: retarget.exec } as never, "/tmp/publication-cwd"), undefined, "pushInsteadOf must not retarget publication to a host the approval did not name");
+
+  const ambiguous = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\nhttps://github.com/acme/other.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: ambiguous.exec } as never, "/tmp/publication-cwd"), undefined, "a multi-URL remote stays an ambiguous publication destination");
+
+  const failed = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 1, stdout: "", stderr: "no such remote" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: failed.exec } as never, "/tmp/publication-cwd"), undefined, "an unavailable expanded lookup must fail closed");
 });
