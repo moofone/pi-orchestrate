@@ -503,7 +503,25 @@ test("U8 AE8 public bridge pause-A preserves observable independent B progress",
   const h = makeHarness("pause");
   try {
     const manifest = await approved(h); await eventually(() => h.provider.events(), events => events.some(e => e.event === "ready" && e.taskId === "a1") && events.some(e => e.event === "ready" && e.taskId === "b1"), "independently gated pause-A and B activity");
-    const beforePauseAt = Date.now(), beforePause = h.bridge.store.read(), beforeA = beforePause.tasks.find(item => item.taskId === taskId(manifest, "a1"))!, beforeB = beforePause.tasks.find(item => item.taskId === taskId(manifest, "b1"))!, beforeBReceipts = beforePause.results.filter(item => item.taskId === taskId(manifest, "b1"));
+    // A child "ready" event is provider-side boot proof, not scheduler-acknowledged
+    // running: the acknowledged launch can transiently persist the conservative
+    // recovery-needed fence when the scheduler's own status observation races the
+    // child's atomic status write, and the fixture bus stays quiet until the next
+    // runtime event. Barrier on the authoritative persisted state instead: drive
+    // the scheduler's own re-observation and require both attempts and task
+    // records to acknowledge running before the pause proof starts.
+    const beforePause = await (async () => {
+      const deadline = Date.now() + 12_000;
+      for (;;) {
+        await h.bridge.scheduler.reconcile();
+        const state = h.bridge.store.read(), a = state.attempts.find(item => item.taskId === taskId(manifest, "a1")), b = state.attempts.find(item => item.taskId === taskId(manifest, "b1"));
+        const ra = state.tasks.find(item => item.taskId === taskId(manifest, "a1")), rb = state.tasks.find(item => item.taskId === taskId(manifest, "b1"));
+        if (a?.phase === "running" && b?.phase === "running" && ra?.phase === "running" && rb?.phase === "running") return state;
+        assert.ok(Date.now() < deadline, `scheduler-acknowledged running barrier: ${JSON.stringify({ attempts: [a, b].map(item => item && { phase: item.phase, reason: item.reason ?? null }), records: [ra, rb].map(item => item && { phase: item.phase, intent: item.intent, reason: item.reason ?? null }) })}`);
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+    })();
+    const beforePauseAt = Date.now(), beforeA = beforePause.tasks.find(item => item.taskId === taskId(manifest, "a1"))!, beforeB = beforePause.tasks.find(item => item.taskId === taskId(manifest, "b1"))!, beforeBReceipts = beforePause.results.filter(item => item.taskId === taskId(manifest, "b1"));
     assert.equal(beforeA.phase, "running"); assert.equal(beforeB.phase, "running"); assert.equal(beforeBReceipts.length, 0); assert.equal(beforeA.intent, "none");
     await h.bridge.control({ targetId: "feature-a", action: "pause" }); await eventually(() => h.bridge.store.read(), state => state.tasks.find(item => item.taskId === taskId(manifest, "a1"))?.intent === "pause", "public pause owner intent persisted");
     const pauseAt = Date.now(), paused = h.bridge.store.read(), a = paused.tasks.find(item => item.taskId === taskId(manifest, "a1"))!, b = paused.tasks.find(item => item.taskId === taskId(manifest, "b1"))!, pauseBReceipts = paused.results.filter(item => item.taskId === taskId(manifest, "b1")); assert.equal(a.intent, "pause"); assert.equal(a.phase, "running"); assert.equal(b.phase, "running"); assert.equal(pauseBReceipts.length, 0);
