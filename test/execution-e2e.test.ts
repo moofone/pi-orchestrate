@@ -356,13 +356,22 @@ test("U8 AE3 gamma failure explains its dependent block and targeted retry prese
 });
 
 test("U8 AE4 explicit five is refused at capacity two; concurrency-only revision retains all tasks", async () => {
+  // Capacity-two execution runs the six tasks as three serialized waves, and each
+  // real-Git wave pays worktree provisioning, child spawn, child run, terminal
+  // observation, and receipt validation — measured ≈5.3s per wave under the full
+  // parallel suite, plus the final delivery-group integration. 30s is that
+  // workload-derived capped budget (≈3 waves + integration, ≥2× the worst need
+  // observed in the retained 79facbb snapshot), not a retry-until-green: the
+  // six-succeeded assertion, capacity-two first-wave check, and
+  // notification-driven release flow below are unchanged.
+  const capacityWaveBudgetMs = 30_000;
   const h = makeHarness("capacity", 2);
   try {
     const refused = await h.bridge.run(h.planPath); assert.equal(refused.kind, "refused"); assert.match(refused.reason, /capacity|simultaneous/i); assert.equal(h.provider.spawnParams.length, 1, "only interpretation child may run");
     writeFileSync(h.planPath, "# Capacity revision\n\ncapacity-revision keeps all five worker identities and removes only the simultaneous-five request.\n"); const preview = await h.bridge.run(h.planPath); assert.equal(preview.kind, "approval-required"); if (preview.kind !== "approval-required") return; assert.equal(preview.preview.manifest.tasks.length, 6); assert.equal(preview.preview.manifest.constraints.parallelGroups.length, 0); assert.deepEqual(preview.preview.manifest.tasks.map(t => t.text.split("\n")[0]!.replace("TASK_ID: ", "")).sort(), ["a1", "a2", "a3", "a4", "a5", "b1"]); assert.equal(h.provider.spawnParams.filter(p => String(p.task).includes("TASK_ID:")).length, 0);
     const started = await h.bridge.run(h.planPath, { token: preview.preview.token, capacity: 2, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(started.kind, "started");
     await eventually(() => h.provider.events(), events => events.filter(e => e.event === "ready" && e.mode === "worker").length === 2, "capacity-two first wave"); assert.equal(h.provider.events().filter(e => e.event === "start" && e.mode === "worker").length, 2); release(h);
-    await eventually(() => h.bridge.store.read(), state => state.attempts.filter(a => a.phase === "succeeded").length === 6, "all five workers plus B complete");
+    await eventually(() => h.bridge.store.read(), state => state.attempts.filter(a => a.phase === "succeeded").length === 6, "all five workers plus B complete", capacityWaveBudgetMs);
     const events = h.provider.events().filter(e => e.event === "start" && e.mode === "worker"); assert.equal(new Set(events.filter(e => /^a[1-5]$/.test(String(e.taskId))).map(e => e.taskId)).size, 5);
   } finally { release(h); await close(h); }
 });
