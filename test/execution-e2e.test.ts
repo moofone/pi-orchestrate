@@ -214,7 +214,10 @@ function makeRepo() {
   writeFileSync(join(repoPath, "test/check.mjs"), 'import { test } from "node:test"; test("check fixture passes", () => {});\n');
   writeFileSync(join(repoPath, "test/fail.mjs"), 'import { test } from "node:test"; test("combined gate fails", () => { throw new Error("intentional combined gate"); });\n');
   writeFileSync(join(repoPath, "README.md"), "e2e\n"); writeFileSync(join(repoPath, ".gitignore"), ".execution-check-*/\ntest/.execution-check-*/\n"); git(repoPath, ["add", "."]); git(repoPath, ["commit", "-m", "fixture base"]);
-  git(repoPath, ["remote", "add", "origin", remote]); git(repoPath, ["push", "-u", "origin", "main"]); const base = git(repoPath, ["rev-parse", "HEAD"]).trim();
+  git(repoPath, ["remote", "add", "origin", remote]); git(repoPath, ["push", "-u", "origin", "main"]); // Model a cloned checkout: the explicit caller refresh happens at fixture setup,
+  // because bridge preview/approval never fetch (round-2 P2). Remote-tracking refs must already exist locally.
+  git(repoPath, ["fetch", "origin"]); git(repoPath, ["remote", "set-head", "origin", "--auto"]);
+  const base = git(repoPath, ["rev-parse", "HEAD"]).trim();
   return { root, repoPath: realpathSync(repoPath), remote, base, repo: { commonDir: realpathSync(join(repoPath, ".git")), id: digest(realpathSync(join(repoPath, ".git"))) } as RepoIdentity };
 }
 

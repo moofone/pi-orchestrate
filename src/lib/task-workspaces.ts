@@ -18,7 +18,7 @@ export type TaskWorkspaceOptions = {
 	repo: RepoIdentity; referencePath: string; ownedRoot: string; git: WorkspaceGit;
 	/** Consult current epoch, exclusive reservation, and delivery ownership fence. */
 	owns: (workspace: WorkspaceRef, writer: { attemptId: string } | { integrationId: string }) => Promise<boolean>;
-	/** True only for an authorized full SHA recorded after the initial fetch. */
+	/** True only for an authorized full SHA recorded by the bridge (resolved from immutable local state or explicitly refreshed). */
 	isFetchedBase: (commit: string) => Promise<boolean>;
 	readJournal: (workspaceId: string) => Promise<WorkspaceJournal | undefined>;
 	/** Durable compare-and-swap; reject if current record differs from expected. */

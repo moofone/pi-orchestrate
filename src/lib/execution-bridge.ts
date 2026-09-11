@@ -217,6 +217,7 @@ export type ExecutionBridgeOptions = {
   capacity: number;
   interpretationTransport: InterpretationTransport;
   ownedRoot?: string;
+  /** Caller-authorized base ref/SHA; resolved from already-present local state, never fetched implicitly. */
   baseCommit?: string;
   remainingBudget?: number;
   callerTools?: string[];
@@ -260,7 +261,10 @@ export type ExecutionBridge = {
   readonly scheduler: ExecutionScheduler;
   readonly delivery: ExecutionDelivery;
   start(options?: { resumePriorOwner?: boolean }): Promise<void>;
+  /** Detached, approval-gated interpretation. Never fetches or mutates the reference repository; binds the locally resolved base SHA into the manifest and token. */
   preview(planPath: string): Promise<ExecutionPreview>;
+  /** Explicit latest-code workflow: fetch origin, re-resolve the authorized base, retarget future previews. The only fetch path on the bridge. */
+  refreshBase(): Promise<string>;
   run(planPath: string, approval?: ExecutionApproval): Promise<ExecutionRunResult>;
   control(control: SchedulerControl): Promise<void>;
   status(): ReturnType<ExecutionScheduler["progress"]>;
@@ -313,17 +317,34 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     const result = await options.pi.exec("git", [...argv], { cwd });
     return { exitCode: result.code ?? -1, stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? "") };
   });
+  // Base authorization contract: preview and approval are detached,
+  // approval-gated operations and must never fetch or otherwise mutate the
+  // reference repository. The base is resolved read-only from already-present
+  // immutable local state and its exact SHA is bound into the manifest,
+  // preview token and authorization. Once authorized, the base is sticky:
+  // moving refs (e.g. a fetch by another process) can never retarget it. Only
+  // the explicit refreshBase() port fetches, and it is the only operation that
+  // retargets the authorized base.
+  const requestedBase = () => options.baseCommit ?? "origin/HEAD";
+  const recordBase = (commit: string) => { authorizedBase = commit; authorizedBases.add(commit); };
   const baseCommit = async (): Promise<string> => {
     if (authorizedBase) return authorizedBase;
+    const resolved = await git(options.referencePath, ["rev-parse", `${requestedBase()}^{commit}`]);
+    const commit = resolved.stdout.trim();
+    if (resolved.exitCode !== 0 || !/^[a-f0-9]{40}$/i.test(commit)) throw new Error(`Authorized base ${requestedBase()} is not present in the reference repository; preview never fetches — run an explicit base refresh (bridge.refreshBase() or git fetch origin) and preview again`);
+    if (options.baseCommit && commit.toLowerCase() !== options.baseCommit.toLowerCase()) throw new Error("Local base changed from caller-authorized commit");
+    recordBase(commit);
+    return commit;
+  };
+  /** The only repository-mutating base operation: explicit caller-initiated fetch plus re-resolve. Never invoked by preview or approval. */
+  const refreshBase = async (): Promise<string> => {
     const fetched = await git(options.referencePath, ["fetch", "origin"]);
     if (fetched.exitCode !== 0) throw new Error(`Cannot fetch authorized base: ${fetched.stderr}`);
-    const requested = options.baseCommit ?? "origin/HEAD";
-    const resolved = await git(options.referencePath, ["rev-parse", `${requested}^{commit}`]);
+    const resolved = await git(options.referencePath, ["rev-parse", `${requestedBase()}^{commit}`]);
     const commit = resolved.stdout.trim();
     if (resolved.exitCode !== 0 || !/^[a-f0-9]{40}$/i.test(commit)) throw new Error("Fetched base did not resolve to a full immutable commit");
     if (options.baseCommit && commit.toLowerCase() !== options.baseCommit.toLowerCase()) throw new Error("Fetched base changed from caller-authorized commit");
-    authorizedBase = commit;
-    authorizedBases.add(commit);
+    recordBase(commit);
     return commit;
   };
   const ownedRootCandidate = options.ownedRoot ?? join(dirname(options.referencePath), `${basename(options.referencePath)}-wt`);
@@ -662,6 +683,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       previewFingerprints.set(preview.token, digest({ path, sourceDigest: preview.sourceDigest, boundary: preview.boundary, manifest: preview.manifest, unresolvedDecisions: preview.unresolvedDecisions, conflicts: preview.conflicts }));
       return structuredClone(preview);
     },
+    refreshBase,
     async run(planPath, approval) {
       let preview: ExecutionPreview;
       try {
