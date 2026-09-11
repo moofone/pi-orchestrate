@@ -155,7 +155,7 @@ function manifestFor(identity: { id: string; revision: number; repo: RepoIdentit
   ];
   let features = [featureA, featureB];
   if (scenario === "dependency") {
-    const follow = task("followup", featureA.id, "delivery-a", source, ["a1", "a2"]); tasks = [...tasks, follow]; groups[0]!.requiredTaskIds = tasks.map(item => item.id); bTask = task("b1", featureB.id, "delivery-b", source); 
+    const follow = task("followup", featureA.id, "delivery-a", source, ["a1", "a2"]); tasks = [...tasks, follow]; groups[0]!.requiredTaskIds = tasks.map(item => item.id); bTask = task("b1", featureB.id, "delivery-b", source);
   } else if (scenario === "gamma") {
     tasks = [task("gamma", featureA.id, "delivery-a", source), task("gamma-dependent", featureA.id, "delivery-a", source, ["gamma"]), task("sibling", featureA.id, "delivery-a", source), task("b1", featureB.id, "delivery-b", source)]; groups[0]!.requiredTaskIds = ["gamma", "gamma-dependent", "sibling"]; groups[1]!.requiredTaskIds = ["b1"]; bTask = tasks[3]!;
   } else if (["conflict", "controller-conflict"].includes(scenario)) {
