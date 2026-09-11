@@ -1573,9 +1573,16 @@ test("W2: subagentToolGuard blocks unknown cursor billing and mutates writer inp
   assert.equal(guard({ toolName: "bash", input: { command: "ls" } }), undefined);
 
   const writerInput = { agent: "tdd-worker", model: "inherit", task: "do the thing" };
-  const blockedWriter = guard({ toolName: "subagent", input: writerInput });
-  assert.equal(blockedWriter?.block, true, "parent must not spawn tdd-worker; the extension launches it");
-  assert.match(String(blockedWriter?.reason), /tdd-worker/);
+  assert.equal(
+    guard({ toolName: "subagent", input: writerInput }),
+    undefined,
+    "solo parent can dispatch tdd-worker; /orchestrate is not required",
+  );
+  assert.equal(
+    writerInput.model,
+    "openai-codex/gpt-5.6-luna:xhigh",
+    "inherit still pins onto the writer",
+  );
 
   const blocked = guard({
     toolName: "subagent",
@@ -4051,7 +4058,7 @@ test("T1: orchestrate.ts does not sendTurn planner, review, or resume prompts", 
   );
 });
 
-test("T1: subagentToolGuard blocks every orchestrate child on the parent tool path", () => {
+test("T1: subagentToolGuard allows shared writers and blocks orchestrate-only children", () => {
   const guard = (
     orch as never as {
       subagentToolGuard: (event: {
@@ -4060,7 +4067,17 @@ test("T1: subagentToolGuard blocks every orchestrate child on the parent tool pa
       }) => { block: true; reason: string } | undefined;
     }
   ).subagentToolGuard;
-  for (const agent of ["tdd-worker", "fixer", "feature-qa", "qa-opus", "plan-reviewer", "planner"]) {
+  assert.equal(
+    guard({ toolName: "subagent", input: { agent: "tdd-worker" } }),
+    undefined,
+    "solo parent can dispatch tdd-worker",
+  );
+  assert.equal(
+    guard({ toolName: "subagent", input: { agent: "fixer" } }),
+    undefined,
+    "solo parent can dispatch fixer",
+  );
+  for (const agent of ["feature-qa", "qa-opus", "plan-reviewer", "planner"]) {
     const blocked = guard({ toolName: "subagent", input: { agent, model: "xai/grok-4.6:high" } });
     assert.equal(blocked?.block, true, `parent must not spawn ${agent}`);
   }
