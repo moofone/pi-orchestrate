@@ -1,4 +1,4 @@
-import { digest, occupiesCapacity, type CoordinatorState, type ExecutionManifest } from "./execution-contract.ts";
+import { digest, occupiesCapacity, type CoordinatorState, type DeliveryGroup, type DeliveryRecord, type ExecutionManifest } from "./execution-contract.ts";
 import type { ExecutionPreview } from "./execution-bridge.ts";
 import type { OverlayTodo } from "./overlay.ts";
 
@@ -42,6 +42,17 @@ export function executionProgressSummary(progress: { state: CoordinatorState; er
  return lines.join("\n");
 }
 
+/** Merge-dependent work completes only after a verified merge: `merged` is
+ * the sole terminal success; `closed-unmerged` is terminal WITHOUT merge
+ * evidence and must stay visibly unsuccessful. A `local` delivery that
+ * validated keeps its established completion semantics without a merge. The
+ * feature rows and the delivery rows must agree, so both project through this
+ * one predicate — a feature never completes before every applicable group
+ * completes under the same policy-specific rule. */
+function deliveryGroupCompleted(group: DeliveryGroup, delivery: DeliveryRecord | undefined): boolean {
+	return delivery?.phase === "merged" || (group.policy === "local" && delivery?.phase === "ready");
+}
+
 /** Project durable plan-driven records into the existing rpiv-todo overlay.
  * Numeric IDs are intentionally in a disjoint range from legacy Task IDs. The
  * durable IDs remain in each subject/metadata, so a display ID never becomes
@@ -52,7 +63,10 @@ export function executionOverlayTodos(state: CoordinatorState): OverlayTodo[] {
  for (const manifest of state.manifests.filter(m => state.activeRevisions[m.id] === m.revision).sort((a, b) => a.id.localeCompare(b.id))) {
   const records = manifest.tasks.map(task => state.tasks.find(record => record.manifestId === manifest.id && record.taskId === task.id));
   const phases = records.map(record => record?.phase ?? "pending");
-  const featureStatus = phases.length > 0 && phases.every(phase => phase === "succeeded") ? "completed" : phases.some(phase => ["preparing", "launching", "running", "stopping", "validating", "recovery-needed"].includes(phase)) ? "in_progress" : "pending";
+  const groups = manifest.deliveryGroups.map(group => ({ group, delivery: state.deliveries.find(item => item.groupId === group.id) }));
+  const tasksSucceeded = phases.length > 0 && phases.every(phase => phase === "succeeded");
+  const groupsCompleted = groups.length > 0 && groups.every(({ group, delivery }) => deliveryGroupCompleted(group, delivery));
+  const featureStatus = tasksSucceeded && groupsCompleted ? "completed" : phases.some(phase => ["preparing", "launching", "running", "stopping", "validating", "recovery-needed"].includes(phase)) ? "in_progress" : "pending";
   const featureId = next++;
   todos.push({ id: featureId, subject: `Execution Feature ${manifest.id}`, status: featureStatus, activeForm: featureStatus === "in_progress" ? "running plan-driven execution" : undefined, metadata: { kind: "execution-feature", taskId: manifest.id } });
   const taskIds = new Map<string, number>();
@@ -69,12 +83,7 @@ export function executionOverlayTodos(state: CoordinatorState): OverlayTodo[] {
   }
   for (const group of manifest.deliveryGroups) {
    const delivery = state.deliveries.find(item => item.groupId === group.id);
-   // Merge-dependent work completes only after a verified merge. `merged` is
-   // the sole terminal success; `closed-unmerged` is terminal WITHOUT merge
-   // evidence and must stay visibly unsuccessful (its phase remains in the
-   // row subject). A `local` delivery that validated keeps its established
-   // completion semantics without a merge.
-   const status = delivery?.phase === "merged" || (group.policy === "local" && delivery?.phase === "ready") ? "completed" : ["integrating", "handoff-pending", "controller-owned"].includes(delivery?.phase ?? "") ? "in_progress" : "pending";
+   const status = deliveryGroupCompleted(group, delivery) ? "completed" : ["integrating", "handoff-pending", "controller-owned"].includes(delivery?.phase ?? "") ? "in_progress" : "pending";
    const todo: OverlayTodo = { id: next++, subject: `Execution Delivery ${group.id} — ${delivery?.phase ?? "pending"}`, status, metadata: { kind: "execution-delivery", taskId: group.id } };
    if (status === "in_progress") todo.activeForm = delivery?.reason ? `blocked: ${delivery.reason}` : "reconciling delivery";
    todos.push(todo);
