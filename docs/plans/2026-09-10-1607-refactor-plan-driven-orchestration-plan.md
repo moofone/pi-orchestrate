@@ -404,8 +404,8 @@ Updated during implementation at the user's request. A unit is checked off only 
 | U4 | Complete | Commits `dc5f340`, `3cb030c`; raw paths/artifact freshness/allowed branch query verified; parent 15 targeted tests/full check pass; independent recheck READY |
 | U5 | Complete | Commits `a7b7892`, `0b69c44`; four original race repros fixed; parent full check passes; independent recheck READY |
 | U6 | Complete | Commits `040475a`, `69c7788`; canonical PR identities and exact pre-handoff composition verified; parent 20 targeted tests/full check pass; independent recheck READY |
-| U7 | In progress | All five reviewed lanes integrated at `742b984`; combined package check passes; wiring command/lifecycle/production ports and central ownership guard |
-| U8 | Pending | Waits for integrated implementation |
+| U7 | Complete | Phase A, C1/C2 and C3 independently READY through `bdc6216`; parent full 703-test check passes; production registration, publication/ownership, cross-process wake and crash/stop recovery regressions verified |
+| U8 | In progress | Prove AE1–AE9 through real commands/adapters, controlled subprocess workers, overlap intervals and durable crash checkpoints; no live publication authorized |
 
 ### Active lane ownership
 
