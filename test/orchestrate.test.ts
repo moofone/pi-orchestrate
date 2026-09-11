@@ -3239,6 +3239,126 @@ test("session fixer launch returns when the child is spawned, not when it exits"
   assert.equal(result.runId, "run-session-1");
 });
 
+/* ---------------------------------------------------------------- *
+ * Per-launch phase agent allowlists — hard enforcement on the legacy
+ * launch paths (implement/QA/plan/review and the session fixer).
+ *
+ * The plan-driven runtime enforces caller agent ceilings per launch;
+ * the legacy paths must keep an equivalent exact per-launch check.
+ * A session-wide ambient registry is explicitly NOT restored: it would
+ * silently block independent concurrent phases in one session.
+ * ---------------------------------------------------------------- */
+
+const SESSION_FIX_INTENT = {
+  v: 1,
+  idempotencyKey: "k-session-allowlist",
+  pr: { host: "github.com", owner: "moofone", repo: "icemining", number: "99" },
+  owner: { kind: "session", id: "s1", generation: "g1" },
+  worktree: "/tmp/wt",
+  expectedHead: "abc",
+  verdictIds: ["v1"],
+  next: "read_comments_and_fix",
+  body: "next=read_comments_and_fix\nhead=abc",
+  validation: "commit-only",
+  publication: "controller",
+};
+
+function phaseAgentViolationFn() {
+  const fn = (orch as never as {
+    phaseAgentViolation?: (phase: string, params: Record<string, unknown>) => string;
+  }).phaseAgentViolation;
+  assert.equal(
+    typeof fn,
+    "function",
+    "phaseAgentViolation must be exported so the per-launch phase allowlist is testable",
+  );
+  return fn as (phase: string, params: Record<string, unknown>) => string;
+}
+
+test("phase allowlist: every legacy launch's own agent sits inside its phase", () => {
+  const violation = phaseAgentViolationFn();
+  const paths = promptContractPaths();
+  assert.equal(
+    violation(
+      "implement",
+      orch.workerLaunchParams(
+        paths,
+        { id: "1", title: "t", status: "pending", complexity: "simple" } as never,
+        "/tmp/wt",
+        "# Feature: t\n",
+      ),
+    ),
+    "",
+    "tdd-worker is an implement agent",
+  );
+  assert.equal(
+    violation("implement", orch.reviewFixLaunchParams(paths, "13", "/tmp/wt", { next: "read_comments_and_fix", output: "" })),
+    "",
+    "fixer is an implement agent",
+  );
+  assert.equal(violation("implement", orch.qaLaunchParams(paths, "f", "/tmp/wt", "feature-qa")), "", "feature-qa is an implement agent");
+  assert.equal(violation("qa", orch.qaLaunchParams(paths, "f", "/tmp/wt", "qa-opus")), "", "qa-opus is a qa agent");
+  assert.equal(violation("plan", orch.plannerLaunchParams(paths, "objective")), "", "planner is a plan agent");
+  assert.equal(violation("review", orch.reviewLaunchParams(paths, "/tmp/wt", "f")), "", "plan-reviewer is a review agent");
+  assert.equal(violation("implement", orch.sessionFixLaunchParams(SESSION_FIX_INTENT as never)), "", "the session fixer launches under the implement allowlist");
+});
+
+test("phase allowlist: a phase-foreign agent is a violation, top level or nested", () => {
+  const violation = phaseAgentViolationFn();
+  assert.match(violation("implement", { agent: "qa-opus" }), /allowlist|implement/);
+  assert.match(violation("qa", { agent: "tdd-worker" }), /allowlist|qa/);
+  assert.match(violation("plan", { agent: "plan-reviewer" }), /allowlist|plan/);
+  assert.match(violation("review", { agent: "planner" }), /allowlist|review/);
+  assert.match(
+    violation("qa", { agent: "qa-opus", parallel: [{ agent: "planner" }] }),
+    /planner/,
+    "nested spawn records sit under the same launch allowlist",
+  );
+  assert.match(violation("qa", { task: "no agent at all" }), /agent/, "an unnamed launch is not a silent pass");
+});
+
+test("phase allowlist: unregistered phases carry no allowlist (registry parity)", () => {
+  const violation = phaseAgentViolationFn();
+  assert.equal(violation("unregistered", { agent: "qa-opus" }), "");
+});
+
+test("runChildInPhase rejects a phase-foreign agent before the spawn RPC", async () => {
+  assert.equal(
+    typeof (orch as Record<string, unknown>).runChildInPhase,
+    "function",
+    "runChildInPhase must be exported so the legacy phase launch path is testable",
+  );
+  const pi = makeFakePi();
+  const spawn = captureSpawn(pi);
+  const runChildInPhase = (orch as never as { runChildInPhase: Function }).runChildInPhase;
+  const outcome = (await withDeadline(
+    runChildInPhase(pi, makeFakeCtx().ctx, "qa", { agent: "tdd-worker", task: "x" }),
+    500,
+  )) as { ok?: boolean; reason?: string };
+  assert.equal(outcome.ok, false);
+  assert.match(String(outcome.reason), /qa/);
+  assert.equal(spawn.requestId, "", "a phase-foreign launch must not reach the bus");
+});
+
+test("runChildInPhase still launches an agent inside the phase allowlist", async () => {
+  const pi = makeFakePi();
+  const spawn = captureSpawn(pi);
+  const runChildInPhase = (orch as never as { runChildInPhase: Function }).runChildInPhase;
+  const p = runChildInPhase(pi, makeFakeCtx().ctx, "qa", { agent: "qa-opus", task: "x" }) as Promise<{
+    ok?: boolean;
+  }>;
+  await Promise.resolve();
+  assert.notEqual(spawn.requestId, "", "an allowlisted phase launch must reach the bus");
+  pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
+    success: true,
+    data: { details: { runId: "run-qa-allow" } },
+  });
+  await Promise.resolve();
+  pi.events.emit(ASYNC_COMPLETE_EVENT, { runId: "run-qa-allow", success: true, state: "complete" });
+  const outcome = (await withDeadline(p, 500)) as { ok?: boolean };
+  assert.equal(outcome.ok, true);
+});
+
 test("P2 F7: the tdd-worker contract commits and never pushes", () => {
   const paths = promptContractPaths();
   const plan = "# Feature: t\n\n### Task 1 — do the thing\n\n- Command: `npm test`\n";

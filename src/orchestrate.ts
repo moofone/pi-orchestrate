@@ -3006,19 +3006,56 @@ function executionTarget(value: string): boolean {
 }
 
 /**
+ * Per-launch agent allowlists for the legacy phase launches.
+ *
+ * The plan-driven execution runtime enforces caller agent ceilings per launch
+ * (execution-policy.ts); these legacy paths never registered session-wide
+ * ambient ceilings again — a registry silently blocks independent concurrent
+ * phases in one session. Each launch checks its own params before the spawn
+ * RPC instead, and an unregistered phase carries no allowlist at all.
+ */
+const PHASE_AGENTS: Record<string, string[]> = {
+  implement: ["tdd-worker", "fixer", "feature-qa"],
+  qa: ["qa-opus"],
+  plan: ["planner"],
+  review: ["plan-reviewer"],
+};
+
+/**
+ * "" when every agent this launch would start — its own agent plus any nested
+ * spawn records — sits inside the phase allowlist; otherwise the reason the
+ * launch must be refused. Pure check, no session capability mutation.
+ */
+export function phaseAgentViolation(phase: string, params: Record<string, unknown>): string {
+  const allowed = PHASE_AGENTS[phase];
+  if (!allowed) return "";
+  for (const record of [params, ...nestedSpawnRecords(params)]) {
+    const agent = record.agent;
+    if (typeof agent !== "string" || !agent.trim()) {
+      return `${phase} launch carries no explicit agent; ${phase} allowlist: ${allowed.join(", ")}`;
+    }
+    if (!allowed.includes(agent)) {
+      return `agent ${agent} is outside the ${phase} allowlist (${allowed.join(", ")})`;
+    }
+  }
+  return "";
+}
+
+/**
  * One child launch. Agent/profile policy is per launch; this extension never
  * mutates ambient capabilities in the surrounding session.
  */
-async function runChildInPhase(
+export async function runChildInPhase(
   pi: ExtensionAPI,
   _ctx: ExtensionCommandContext,
-  _phase: string,
+  phase: string,
   params: Record<string, unknown>,
   onRunId?: (runId: string) => void,
 ): Promise<ChildOutcome> {
-  // Phase ceilings were session-wide ambient state. Per-launch agent/profile
-  // policy is enforced by the runtime; this extension never owns the session
-  // capability registry.
+  // Hard per-launch allowlist, refused before the spawn RPC — the legacy
+  // counterpart of the plan-driven runtime's caller-ceiling check.
+  const violation = phaseAgentViolation(phase, params);
+  if (violation) return Promise.resolve({ ok: false, reason: violation });
   return await runChild(pi, params, onRunId);
 }
 
@@ -3917,6 +3954,10 @@ export async function launchSessionFixer(
   intent: LaunchIntent,
 ): Promise<LaunchResult> {
   const params = sessionFixLaunchParams(intent);
+  // Same hard per-launch allowlist the legacy implement phase enforces; the
+  // fixer is an implement agent, so this only fires if the builder drifts.
+  const violation = phaseAgentViolation("implement", params);
+  if (violation) throw new Error(violation);
   const policy = applySpawnPolicy(params);
   if (policy.action === "reject") {
     throw new Error(policy.reason ?? "spawn rejected");
