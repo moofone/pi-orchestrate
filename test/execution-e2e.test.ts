@@ -272,10 +272,28 @@ async function approved(h: Harness, capacity = 6, publication = false): Promise<
   const second = await h.bridge.run(h.planPath, { token: first.preview.token, capacity, publication, ...(first.preview.boundary.publicationRepository ? { publicationRepository: first.preview.boundary.publicationRepository } : {}), approvedBy: h.sessionFile, approvedAt: Date.now() });
   assert.equal(second.kind, "started", JSON.stringify(second)); if (second.kind !== "started") throw new Error("start fixture"); return second.manifest;
 }
-async function eventually<T>(read: () => T, predicate: (value: T) => boolean, label: string, ms = 12_000): Promise<T> {
-  const deadline = Date.now() + ms; let value = read();
+/** Consolidated E2E eventual budget. Every wait in this file observes a real
+ * pipeline — real Node child processes, real Git worktrees/cherry-picks, real
+ * `node --test` combined checks, and real controller handoffs — while the full
+ * parallel suite loads the CPU. Measured pipelines: AE4's three capacity-2 waves
+ * ≈5.3s per wave plus the final delivery-group integration ≈18–20s total; the
+ * retained AE7 controller-conflict run (execution-e2e-jVSf08 at 3773d68) had all
+ * six workers terminal by ≈8.8s and delivery-b integrated, checked, and handed
+ * off by ≈11.6s, but delivery-a's first integration intent hit a benign
+ * receipt-validation race ("missing validated current result") and its retry was
+ * still composing at ≈12.1s when the previous 12s default expired — the true
+ * need was ≈15s under suite load (≈2× under heavier load). AE9's legacy preset
+ * pays the same per-child cost four times strictly serialized at capacity 1.
+ * 30s is the workload-derived capped default covering all of these (≈2× the
+ * observed ≈15s AE7 need, ≈1.5× AE4's ≈18–20s three-wave need), not a
+ * retry-until-green: every predicate still asserts exact ledger phases, each
+ * wait stays individually bounded, and short synchronous negative gates remain
+ * immediate asserts outside this helper. */
+const E2E_EVENTUAL_BUDGET_MS = 30_000;
+async function eventually<T>(read: () => T, predicate: (value: T) => boolean, label: string, ms = E2E_EVENTUAL_BUDGET_MS): Promise<T> {
+  const startedAt = Date.now(); const deadline = startedAt + ms; let value = read();
   while (!predicate(value) && Date.now() < deadline) { await new Promise(resolve => setTimeout(resolve, 15)); value = read(); }
-  assert.ok(predicate(value), `${label}: ${JSON.stringify(value)}`); return value;
+  assert.ok(predicate(value), `${label}: timed out after ${Date.now() - startedAt}ms of ${ms}ms budget: ${JSON.stringify(value)}`); return value;
 }
 function taskId(manifest: ExecutionManifest, logical: string): string { return manifest.tasks.find(task => task.text.includes(`TASK_ID: ${logical}`))!.id; }
 function ledger(path: string): Array<Record<string, unknown>> { return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : []; }
@@ -359,12 +377,13 @@ test("U8 AE4 explicit five is refused at capacity two; concurrency-only revision
   // Capacity-two execution runs the six tasks as three serialized waves, and each
   // real-Git wave pays worktree provisioning, child spawn, child run, terminal
   // observation, and receipt validation — measured ≈5.3s per wave under the full
-  // parallel suite, plus the final delivery-group integration. 30s is that
-  // workload-derived capped budget (≈3 waves + integration, ≥2× the worst need
-  // observed in the retained 79facbb snapshot), not a retry-until-green: the
+  // parallel suite, plus the final delivery-group integration, for an observed
+  // worst need of ≈18–20s. This wait pins the shared 30s E2E eventual budget:
+  // ≈1.5× that measured three-wave need (not ≥2× — 2×18–20s would be 36–40s; the
+  // previous comment's arithmetic was wrong). Capped, not a retry-until-green: the
   // six-succeeded assertion, capacity-two first-wave check, and
   // notification-driven release flow below are unchanged.
-  const capacityWaveBudgetMs = 30_000;
+  const capacityWaveBudgetMs = E2E_EVENTUAL_BUDGET_MS;
   const h = makeHarness("capacity", 2);
   try {
     const refused = await h.bridge.run(h.planPath); assert.equal(refused.kind, "refused"); assert.match(refused.reason, /capacity|simultaneous/i); assert.equal(h.provider.spawnParams.length, 1, "only interpretation child may run");
