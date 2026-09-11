@@ -1061,18 +1061,30 @@ async function originUrl(pi: ExtensionAPI, cwd: string): Promise<string> {
     return "";
   }
 }
-/** Resolve the effective fetch and push URLs, after Git's insteadOf/pushInsteadOf expansion.
- * Multiple destinations are ambiguous and cannot be approved for publication. */
-async function publicationRepository(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+/** Resolve the effective fetch and push publication destinations after Git's
+ * insteadOf/pushInsteadOf URL rewriting. The fetch destination is confirmed by
+ * `git ls-remote --get-url`, the documented rewrite-aware expansion lookup
+ * (never connects); the push destination uses `git remote get-url --all --push`,
+ * whose expansion of insteadOf/pushInsteadOf for the push direction is what git
+ * will actually push to (ls-remote has no --push variant). `remote get-url --all`
+ * stays in the loop because `ls-remote --get-url` prints only the first URL of a
+ * multi-URL remote — every distinct expanded destination must be unambiguous and
+ * identical across both lookups, or publication is refused: an approval must
+ * never bind a slug whose expanded transport destination is a different host. */
+export async function publicationRepository(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
   try {
     const fetch = await pi.exec("git", ["remote", "get-url", "--all", "origin"], { cwd, timeout: 30_000 });
     const push = await pi.exec("git", ["remote", "get-url", "--all", "--push", "origin"], { cwd, timeout: 30_000 });
-    if (fetch.code !== 0 || push.code !== 0) return undefined;
+    const expanded = await pi.exec("git", ["ls-remote", "--get-url", "origin"], { cwd, timeout: 30_000 });
+    if (fetch.code !== 0 || push.code !== 0 || expanded.code !== 0) return undefined;
     const urls = (value: string) => [...new Set(value.split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
-    const fetchRepos = urls(fetch.stdout).map(url => canonicalPublicationRepository(url.includes("://") || url.startsWith("git@") ? url.replace(/^git@([^:]+):/, "https://$1/").replace(/\/\.git$/, "") : url));
-    const pushRepos = urls(push.stdout).map(url => canonicalPublicationRepository(url.replace(/^git@([^:]+):/, "https://$1/").replace(/\/\.git$/, "")));
-    if (fetchRepos.length !== 1 || pushRepos.length !== 1 || !fetchRepos[0] || !pushRepos[0] || fetchRepos[0] !== pushRepos[0]) return undefined;
-    return fetchRepos[0];
+    const fetchRepos = urls(fetch.stdout).map(url => canonicalPublicationRepository(url));
+    const pushRepos = urls(push.stdout).map(url => canonicalPublicationRepository(url));
+    const expandedRepos = urls(expanded.stdout).map(url => canonicalPublicationRepository(url));
+    const single = (list: (string | undefined)[]) => list.length === 1 && list[0] ? list[0] : undefined;
+    const fetchRepo = single(fetchRepos), pushRepo = single(pushRepos), expandedRepo = single(expandedRepos);
+    if (!fetchRepo || !pushRepo || !expandedRepo || fetchRepo !== pushRepo || fetchRepo !== expandedRepo) return undefined;
+    return fetchRepo;
   } catch {
     return undefined;
   }
@@ -2990,7 +3002,7 @@ async function makeExecutionBridge(
     ...(approvedPublicationRepository ? { repository: approvedPublicationRepository } : {}),
     callerTools,
     callerAgents,
-    interpretationTransport: createExecutionInterpreter({ events, cwd: paths.gitRoot, sessionFile, profile: interpretationProfile, callerTools, callerAgents, signal }),
+    interpretationTransport: createExecutionInterpreter({ events, sessionFile, profile: interpretationProfile, callerTools, callerAgents, signal }),
     ownedRoot: worktreeFarmFor(paths.repo),
     ...(controller ? { controller, resolvePr: controller.resolvePr } : {}),
   });

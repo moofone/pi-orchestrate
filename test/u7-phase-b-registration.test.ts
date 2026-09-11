@@ -42,14 +42,14 @@ function harness(_repo: RepoIdentity, stateRoot: string, exec: (file: string, ar
 }
 
 async function runDefaultBootstrapCase(input: {
-  fetch?: string; push?: string; missingOrigin?: boolean; approvePublication?: boolean; changeAfterPreview?: boolean; mutateFence?: "owner" | "lifecycle";
+  fetch?: string; push?: string; expanded?: string; approved?: string; missingOrigin?: boolean; approvePublication?: boolean; changeAfterPreview?: boolean; mutateFence?: "owner" | "lifecycle";
 } = {}): Promise<{ pushes: number; creates: number; state: ReturnType<ReturnType<typeof createExecutionBridge>["store"]["read"]> }> {
   const localRoot = realpathSync(mkdtempSync(join(tmpdir(), "u7-default-case-")));
   process.env.GHL_LATCH_STATE_DIR = join(localRoot, "latch"); mkdirSync(process.env.GHL_LATCH_STATE_DIR, { recursive: true });
   const commonDir = join(localRoot, "repo.git"); mkdirSync(commonDir, { recursive: true });
   const repo = { commonDir, id: digest(commonDir) }, stateRoot = join(localRoot, "orchestrator"), ownedRoot = join(localRoot, "owned"); mkdirSync(ownedRoot);
   const planPath = join(localRoot, "plan.md"); writeFileSync(planPath, "# approved plan\n");
-  const baseCommit = "a".repeat(40), integratedHead = "c".repeat(40), approved = "github.com/acme/approved";
+  const baseCommit = "a".repeat(40), integratedHead = "c".repeat(40), approved = input.approved ?? "github.com/acme/approved";
   const group: DeliveryGroup = { id: "group-default-case", featureIds: ["feature-default-case"], requiredTaskIds: [], checks: [], policy: "pr", completion: "merged", ownerId: "execution-default-case" };
   const task = { id: "task-default-case", featureId: group.featureIds[0]!, deliveryGroupId: group.id, text: "bootstrap", mode: "read-only" as const, dependencies: [], scope: ["src"], profile: {}, checks: [], provenance: ["text", "mode", "dependencies", "scope", "profile", "deliveryGroupId"].map(field => ({ field, origin: "inferred" as const, reason: "fixture" })) };
   const manifestFor = (source: { path: string; bytes: string; digest: string }, id: string, revision: number): ExecutionManifest => ({
@@ -78,6 +78,7 @@ async function runDefaultBootstrapCase(input: {
       if (input.missingOrigin) return { code: 1, stdout: "", stderr: "no origin" };
       return { code: 0, stdout: `${args.includes("--push") ? currentPush : currentFetch}\n`, stderr: "" };
     }
+    if (file === "git" && args[0] === "ls-remote" && args[1] === "--get-url") return { code: 0, stdout: `${input.expanded ?? currentFetch}\n`, stderr: "" };
     if (file === "gh" && args[0] === "pr" && args[1] === "list") return { code: 0, stdout: "[]", stderr: "" };
     if (file === "git" && args[0] === "rev-parse") return { code: 0, stdout: `${integratedHead}\n`, stderr: "" };
     if (file === "git" && args[0] === "branch") return { code: 0, stdout: `${bridge?.store.read().controllerBootstrapIntents?.[0]?.branch ?? "branch"}\n`, stderr: "" };
@@ -257,6 +258,35 @@ test("default publication rejects missing, invalid, foreign, and ambiguous desti
   }
 });
 
+test("default publication consults the rewrite-aware ls-remote expansion and refuses divergence", async () => {
+  // git ls-remote --get-url is the documented insteadOf-expansion lookup. When
+  // its expanded fetch destination diverges from the configured remote URL
+  // (here: insteadOf rewrites onto a foreign gh-alias host), the configured
+  // URLs would bind an approval slug the transport never reaches.
+  const result = await runDefaultBootstrapCase({ expanded: "git@gh-alias:acme/elsewhere.git" });
+  assert.equal(result.pushes, 0, "a rewritten expanded destination must refuse publication before any effect");
+  assert.equal(result.creates, 0, "a rewritten expanded destination must refuse PR creation");
+});
+
+test("default publication accepts insteadOf- and pushInsteadOf-expanded destinations that canonicalize to the approved slug", async () => {
+  // insteadOf rewrites the fetch URL into scp form; pushInsteadOf rewrites the
+  // push URL into ssh:// form on the same host; the expanded lookup agrees with
+  // the fetch URL. Every destination still canonicalizes to the approved slug.
+  const ok = await runDefaultBootstrapCase({
+    fetch: "git@github.com:acme/approved.git",
+    push: "ssh://git@github.com/acme/approved.git",
+    expanded: "git@github.com:acme/approved.git",
+  });
+  assert.equal(ok.pushes, 1, "rewrite-expanded destinations that match the approved slug must publish");
+  assert.equal(ok.creates, 1);
+});
+
+test("default publication refuses a pushInsteadOf expansion that retargets a foreign host", async () => {
+  const result = await runDefaultBootstrapCase({ push: "git@ssh.foreign-host.dev:acme/approved.git" });
+  assert.equal(result.pushes, 0, "a pushInsteadOf host rewrite must never push to an unapproved host");
+  assert.equal(result.creates, 0);
+});
+
 test("missing publication approval and destination changes after preview refuse before effects", async () => {
   const missing = await runDefaultBootstrapCase({ approvePublication: false });
   assert.equal(missing.pushes, 0);
@@ -292,6 +322,7 @@ test("default bootstrap creates once, fences unknown retries, then discovers the
   let bridge: ReturnType<typeof createExecutionBridge> | undefined;
   const h = harness(repo, stateRoot, async (file, args) => {
     if (file === "git" && args[0] === "remote" && args[1] === "get-url") return { code: 0, stdout: "https://github.com/acme/bootstrap.git\n", stderr: "" };
+    if (file === "git" && args[0] === "ls-remote" && args[1] === "--get-url") return { code: 0, stdout: "https://github.com/acme/bootstrap.git\n", stderr: "" };
     if (file === "gh" && args[0] === "pr" && args[1] === "list") {
       listCalls++;
       assert.equal(args[args.indexOf("--repo") + 1], "github.com/acme/bootstrap");

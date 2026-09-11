@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createExecutionInterpreter } from "../src/lib/execution-interpreter.ts";
@@ -22,6 +22,8 @@ import type { InterpretationRequest } from "../src/lib/plan-import.ts";
 class EnvelopeBus implements RuntimeEventBus {
   readonly listeners = new Map<string, Set<(data: unknown) => void>>();
   readonly spawns: Record<string, unknown>[] = [];
+  /** Existence of the spawn cwd, probed at the moment the spawn RPC is issued. */
+  spawnCwdExisted = false;
   readonly sessionFile: string;
   private readonly spawnData: unknown;
   private readonly completion: unknown;
@@ -44,6 +46,7 @@ class EnvelopeBus implements RuntimeEventBus {
     }
     if (request.method !== "spawn") throw new Error(`Unexpected RPC: ${request.method}`);
     this.spawns.push(request.params as Record<string, unknown>);
+    this.spawnCwdExisted = existsSync(String((request.params as Record<string, unknown>).cwd));
     reply(this.spawnData);
     queueMicrotask(() => this.emit("subagent:async-complete", this.completion));
   }
@@ -55,7 +58,9 @@ function harness(spawnData: unknown, completion: unknown) {
   mkdirSync(root, { recursive: true });
   writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "parent" }) + "\n");
   const bus = new EnvelopeBus(sessionFile, spawnData, completion);
-  const interpreter = createExecutionInterpreter({ events: bus, cwd: root, sessionFile });
+  // No cwd option: the transport owns spawn isolation internally (review round
+  // 2, PR#13) and must never accept a caller-directed working directory.
+  const interpreter = createExecutionInterpreter({ events: bus, sessionFile });
   const request: InterpretationRequest = {
     prompt: "Interpret the plan snapshot.",
     schema: { type: "object" },
@@ -80,6 +85,22 @@ test("production interpreter resolves the committed single-run spawn envelope in
   assert.deepEqual(value, structured, "the transport must resolve the run's structuredOutput");
   assert.equal(h.bus.spawns.length, 1);
   assert.equal((h.bus.spawns[0] as Record<string, unknown>).async, true, "the launch must stay a detached async spawn");
+});
+
+test("interpretation spawns into a fresh disposable directory, never the caller's reference checkout", async () => {
+  const h = harness(faithfulSpawnData, faithfulCompletion);
+  const value = await h.interpreter(h.request);
+  assert.deepEqual(value, structured, "cwd isolation must not change interpretation output resolution");
+  assert.equal(h.bus.spawns.length, 1);
+  const spawn = h.bus.spawns[0] as Record<string, unknown>;
+  const spawnCwd = String(spawn.cwd);
+  assert.notEqual(spawnCwd, h.root, "the detached, unreviewed interpretation run must never execute in the caller's reference directory");
+  assert.ok(!spawnCwd.startsWith(h.root), "the interpretation cwd must not live inside the reference directory tree");
+  assert.ok(spawnCwd.startsWith(tmpdir()), "the interpretation cwd must be an isolated disposable directory under the OS temp root");
+  assert.equal(h.bus.spawnCwdExisted, true, "the disposable directory must exist when the spawn is issued");
+  assert.equal(spawn.worktree, false, "the run stays a plain detached spawn inside the disposable directory");
+  assert.equal(existsSync(spawnCwd), false, "the disposable directory must be removed with plain fs once the request settles (never git worktree/checkout machinery)");
+  assert.ok(String(spawn.task).includes(JSON.stringify(h.request.source)), "the exact snapshot bytes must still travel inside the prompt, independent of the working directory");
 });
 
 test("workflow-mode spawn identity stays rejected as lacking single-run identity", async () => {

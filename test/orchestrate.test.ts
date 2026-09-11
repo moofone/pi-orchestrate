@@ -6246,3 +6246,65 @@ test("P5 F21: the idle-parent gate covers exactly the phases that own a writer",
       "Feature is not running anything for the parent to stay out of the way of",
   );
 });
+
+/** Scriptable git for the publication-destination boundary: each answer is
+ * keyed by the exact `git` argv the production lookups must issue. */
+function publicationGitExec(answers: Record<string, { code: number; stdout: string; stderr?: string }>) {
+  const calls: string[] = [];
+  const exec = async (_cmd: string, args: string[]) => {
+    const key = args.join(" ");
+    calls.push(key);
+    return answers[key] ?? { code: 1, stdout: "", stderr: `unexpected git invocation: ${key}` };
+  };
+  return { exec, calls };
+}
+
+test("publicationRepository resolves fetch and push through the rewrite-aware expanded lookups", async () => {
+  // insteadOf rewrites the configured https URL into scp form for fetch;
+  // pushInsteadOf rewrites the push URL into ssh form on the same host. Every
+  // expanded answer must canonicalize to one approved slug.
+  const git = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "git@gh-alias:acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "ssh://git@gh-alias/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "https://gh-alias/acme/approved.git\n" },
+  });
+  const repo = await orch.publicationRepository({ exec: git.exec } as never, "/tmp/publication-cwd");
+  assert.equal(repo, "gh-alias/acme/approved");
+  assert.ok(git.calls.includes("ls-remote --get-url origin"), "the fetch destination must be confirmed by the insteadOf-expansion lookup (git ls-remote --get-url)");
+  assert.ok(git.calls.includes("remote get-url --all --push origin"), "the push destination must be resolved push-aware (no ls-remote --push variant exists)");
+});
+
+test("publicationRepository refuses when the ls-remote insteadOf expansion diverges from the configured remote", async () => {
+  // The reviewer's exact scenario: configured URLs name github.com/acme/approved
+  // (what a non-expanding lookup would report) while the expanded transport
+  // truth is a rewritten host. Approval must not bind the configured slug.
+  const git = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "git@gh-alias:acme/elsewhere.git\n" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: git.exec } as never, "/tmp/publication-cwd"), undefined);
+});
+
+test("publicationRepository refuses pushInsteadOf host retargeting, multi-URL ambiguity, and lookup failure", async () => {
+  const retarget = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "git@ssh.foreign-host.dev:acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: retarget.exec } as never, "/tmp/publication-cwd"), undefined, "pushInsteadOf must not retarget publication to a host the approval did not name");
+
+  const ambiguous = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\nhttps://github.com/acme/other.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: ambiguous.exec } as never, "/tmp/publication-cwd"), undefined, "a multi-URL remote stays an ambiguous publication destination");
+
+  const failed = publicationGitExec({
+    "remote get-url --all origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "remote get-url --all --push origin": { code: 0, stdout: "https://github.com/acme/approved.git\n" },
+    "ls-remote --get-url origin": { code: 1, stdout: "", stderr: "no such remote" },
+  });
+  assert.equal(await orch.publicationRepository({ exec: failed.exec } as never, "/tmp/publication-cwd"), undefined, "an unavailable expanded lookup must fail closed");
+});

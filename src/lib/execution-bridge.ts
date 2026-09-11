@@ -155,14 +155,24 @@ function createGitHubExecutionPrBootstrap(pi: ExecutionPi): ExecutionPrBootstrap
   const destination = async (request: ExecutionPrBootstrapRequest): Promise<{ repository: string } | { reason: string }> => {
     const approved = canonicalPublicationRepository(request.repository);
     if (!approved) return { reason: "Approved publication repository is missing or noncanonical" };
+    // Rewrite-aware lookups (PR#13 review round 2): the fetch destination is
+    // confirmed by `git ls-remote --get-url`, the documented insteadOf-expansion
+    // lookup; the push destination uses `git remote get-url --all --push`, whose
+    // insteadOf/pushInsteadOf expansion is what git will actually push to
+    // (ls-remote has no --push variant). `remote get-url --all` fences multi-URL
+    // ambiguity that `ls-remote --get-url` (first URL only) cannot see. Any
+    // unavailable, ambiguous, or divergent expanded destination refuses: an
+    // approval must never push to a rewritten host it did not name.
     const fetch = await run("git", ["remote", "get-url", "--all", "origin"], request.workspace.path, 30_000);
     const push = await run("git", ["remote", "get-url", "--all", "--push", "origin"], request.workspace.path, 30_000);
+    const expanded = await run("git", ["ls-remote", "--get-url", "origin"], request.workspace.path, 30_000);
     const fetchUrls = fetch.code === 0 ? uniqueRemote(String(fetch.stdout ?? "")) : [];
     const pushUrls = push.code === 0 ? uniqueRemote(String(push.stdout ?? "")) : [];
-    const fetchRepos = fetchUrls.map(parseRemote), pushRepos = pushUrls.map(parseRemote);
-    if (fetch.code !== 0 || push.code !== 0 || fetchUrls.length !== 1 || pushUrls.length !== 1 || !fetchRepos[0] || !pushRepos[0]) return { reason: "Effective GitHub repository destination is unavailable, ambiguous, or noncanonical" };
-    const fetchSet = new Set(fetchRepos as string[]), pushSet = new Set(pushRepos as string[]);
-    if (fetchSet.size !== 1 || pushSet.size !== 1 || !fetchSet.has(approved) || !pushSet.has(approved)) return { reason: "Effective fetch/push destination does not match approved publication repository" };
+    const expandedUrls = expanded.code === 0 ? uniqueRemote(String(expanded.stdout ?? "")) : [];
+    const fetchRepos = fetchUrls.map(parseRemote), pushRepos = pushUrls.map(parseRemote), expandedRepos = expandedUrls.map(parseRemote);
+    if (fetch.code !== 0 || push.code !== 0 || expanded.code !== 0 || fetchUrls.length !== 1 || pushUrls.length !== 1 || expandedUrls.length !== 1 || !fetchRepos[0] || !pushRepos[0] || !expandedRepos[0]) return { reason: "Effective GitHub repository destination is unavailable, ambiguous, or noncanonical" };
+    const fetchSet = new Set(fetchRepos as string[]), pushSet = new Set(pushRepos as string[]), expandedSet = new Set(expandedRepos as string[]);
+    if (fetchSet.size !== 1 || pushSet.size !== 1 || expandedSet.size !== 1 || !fetchSet.has(approved) || !pushSet.has(approved) || !expandedSet.has(approved)) return { reason: "Effective fetch/push destination after URL rewrite expansion does not match approved publication repository" };
     return { repository: approved };
   };
   const discover = async (request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapDiscovery> => {
