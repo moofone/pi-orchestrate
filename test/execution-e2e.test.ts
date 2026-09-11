@@ -61,6 +61,7 @@ class ChildProvider implements RuntimeEventBus {
     if (["five", "capacity", "handoff"].includes(this.scenario) && /^a[1-5]$/.test(taskId)) return barrier;
     if (this.scenario === "dependency" && /^a[3-5]$/.test(taskId)) return barrier;
     if (this.scenario === "sparse" && taskId === "alpha") return barrier;
+    if (this.scenario === "late-ready" && ["a1", "b1"].includes(taskId)) return barrier;
     if (this.scenario === "pause" && taskId === "a1") return join(this.root, "barrier-a");
     if (this.scenario === "pause" && taskId === "b1") return join(this.root, "barrier-b");
     if (["recovery", "reload"].includes(this.scenario) && taskId === "recovery") return barrier;
@@ -96,13 +97,33 @@ class ChildProvider implements RuntimeEventBus {
       mode: interpretation ? "interpret" : "worker", runId, sessionId, sessionFile: this.sessionFile, artifactDir,
       eventsPath: join(this.root, "children.jsonl"), taskId, agent: params.agent,
       snapshotPaths: taskId === "followup" ? ["src/a1.txt", "src/a2.txt", "src/a3.txt", "src/a4.txt", "src/a5.txt", "src/b1.txt"] : [],
+      readyDelayMs: this.scenario === "late-ready" ? 2_000 : undefined,
       barrier: this.barrierFor(taskId), fail: !interpretation && this.shouldFail(taskId), malformed: !interpretation && this.scenario === "malformed", output, outputKind: params.agent === "plan-reviewer" ? "artifact" : undefined,
     };
     mkdirSync(artifactDir, { recursive: true }); writeFileSync(configPath, JSON.stringify(config));
     this.spawnParams.push(structuredClone(params));
-    const child = spawn(process.execPath, [childPath, configPath], { cwd: String(params.cwd), env: { ...process.env, NODE_NO_WARNINGS: "1" }, stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn(process.execPath, [childPath, configPath], { cwd: String(params.cwd), env: { ...process.env, NODE_NO_WARNINGS: "1" }, stdio: ["ignore", "pipe", "pipe"] });
     this.processes.set(runId, child); this.starts.set(runId, Date.now());
     child.stderr?.on("data", value => writeFileSync(join(artifactDir, "stderr.log"), String(value), { flag: "a" }));
+    // The child's one deterministic readiness/status line — emitted only after its
+    // atomic running-artifact publication — becomes the supported
+    // `subagent:child-status` runtime event. The line's run/session identity is
+    // cross-checked against this spawn before it reaches the bus, so the
+    // production runtime subscription (which wakes scheduler reconciliation) only
+    // ever sees exact live-child evidence.
+    child.stdout?.setEncoding("utf8");
+    let statusLines = "";
+    child.stdout?.on("data", chunk => {
+      statusLines += chunk;
+      for (;;) {
+        const index = statusLines.indexOf("\n"); if (index < 0) break;
+        const line = statusLines.slice(0, index); statusLines = statusLines.slice(index + 1);
+        try {
+          const note = JSON.parse(line) as Record<string, unknown>;
+          if (note.type === "child-status" && note.runId === runId && note.sessionId === sessionId) this.emit("subagent:child-status", { runId, sessionId, mode: "single", state: String(note.state ?? "running") });
+        } catch { /* Malformed child stdout is not a runtime event. */ }
+      }
+    });
     child.on("close", (code, signal) => {
       this.ends.set(runId, Date.now());
       this.processes.delete(runId);
@@ -171,7 +192,7 @@ function manifestFor(identity: { id: string; revision: number; repo: RepoIdentit
     tasks = [task("alpha", featureA.id, "delivery-a", source), task("beta", featureA.id, "delivery-a", source, revised ? ["alpha"] : [], [], true)]; groups[0]!.requiredTaskIds = tasks.map(item => item.id); bTask = task("b1", featureB.id, "delivery-b", source); features = [featureA]; groups = [groups[0]!];
     if (discovered) { const discoveredTask = task("discovered", featureA.id, "delivery-a", source); tasks.push(discoveredTask); groups[0]!.requiredTaskIds = tasks.map(item => item.id); }
     if (source.bytes.includes("new-feature")) { const featureC = { id: "feature-c", title: "New Feature", scope: "src/" }; const c = task("new", featureC.id, "delivery-c", source); features.push(featureC); tasks.push(c); groups.push({ id: "delivery-c", featureIds: [featureC.id], requiredTaskIds: [c.id], checks: [], policy: "local", completion: "validated", ownerId: featureC.id }); }
-  } else if (scenario === "pause") {
+  } else if (scenario === "pause" || scenario === "late-ready") {
     tasks = [task("a1", featureA.id, "delivery-a", source), task("b1", featureB.id, "delivery-b", source)]; groups[0]!.requiredTaskIds = ["a1"]; groups[1]!.requiredTaskIds = ["b1"]; features = [featureA, featureB];
   } else if (["recovery", "reload"].includes(scenario)) {
     tasks = [task("recovery", featureA.id, "delivery-a", source)]; groups[0]!.requiredTaskIds = ["recovery"]; bTask = task("b1", featureB.id, "delivery-b", source); groups = [groups[0]!]; features = [featureA];
@@ -503,24 +524,19 @@ test("U8 AE8 public bridge pause-A preserves observable independent B progress",
   const h = makeHarness("pause");
   try {
     const manifest = await approved(h); await eventually(() => h.provider.events(), events => events.some(e => e.event === "ready" && e.taskId === "a1") && events.some(e => e.event === "ready" && e.taskId === "b1"), "independently gated pause-A and B activity");
-    // A child "ready" event is provider-side boot proof, not scheduler-acknowledged
-    // running: the acknowledged launch can transiently persist the conservative
-    // recovery-needed fence when the scheduler's own status observation races the
-    // child's atomic status write, and the fixture bus stays quiet until the next
-    // runtime event. Barrier on the authoritative persisted state instead: drive
-    // the scheduler's own re-observation and require both attempts and task
-    // records to acknowledge running before the pause proof starts.
-    const beforePause = await (async () => {
-      const deadline = Date.now() + 12_000;
-      for (;;) {
-        await h.bridge.scheduler.reconcile();
-        const state = h.bridge.store.read(), a = state.attempts.find(item => item.taskId === taskId(manifest, "a1")), b = state.attempts.find(item => item.taskId === taskId(manifest, "b1"));
-        const ra = state.tasks.find(item => item.taskId === taskId(manifest, "a1")), rb = state.tasks.find(item => item.taskId === taskId(manifest, "b1"));
-        if (a?.phase === "running" && b?.phase === "running" && ra?.phase === "running" && rb?.phase === "running") return state;
-        assert.ok(Date.now() < deadline, `scheduler-acknowledged running barrier: ${JSON.stringify({ attempts: [a, b].map(item => item && { phase: item.phase, reason: item.reason ?? null }), records: [ra, rb].map(item => item && { phase: item.phase, intent: item.intent, reason: item.reason ?? null }) })}`);
-        await new Promise(resolve => setTimeout(resolve, 15));
-      }
-    })();
+    // Fixture/provider parity: after each child atomically publishes its running
+    // status artifact, the provider decodes the child's exact-run/session
+    // readiness line into the supported `subagent:child-status` runtime event;
+    // the production runtime subscription (attempt-runtime) wakes the scheduler
+    // to reread the authoritative persisted state, so the acknowledged launch
+    // cannot remain conservatively fenced (recovery-needed) when its
+    // post-launch observation raced the artifact write. This barrier therefore
+    // reads the store passively — no reconcile loop, no synthetic production calls.
+    const beforePause = await eventually(() => h.bridge.store.read(), state => {
+      const a = state.attempts.find(item => item.taskId === taskId(manifest, "a1")), b = state.attempts.find(item => item.taskId === taskId(manifest, "b1"));
+      const ra = state.tasks.find(item => item.taskId === taskId(manifest, "a1")), rb = state.tasks.find(item => item.taskId === taskId(manifest, "b1"));
+      return a?.phase === "running" && b?.phase === "running" && ra?.phase === "running" && rb?.phase === "running";
+    }, "scheduler-acknowledged running barrier");
     const beforePauseAt = Date.now(), beforeA = beforePause.tasks.find(item => item.taskId === taskId(manifest, "a1"))!, beforeB = beforePause.tasks.find(item => item.taskId === taskId(manifest, "b1"))!, beforeBReceipts = beforePause.results.filter(item => item.taskId === taskId(manifest, "b1"));
     assert.equal(beforeA.phase, "running"); assert.equal(beforeB.phase, "running"); assert.equal(beforeBReceipts.length, 0); assert.equal(beforeA.intent, "none");
     await h.bridge.control({ targetId: "feature-a", action: "pause" }); await eventually(() => h.bridge.store.read(), state => state.tasks.find(item => item.taskId === taskId(manifest, "a1"))?.intent === "pause", "public pause owner intent persisted");
@@ -531,6 +547,33 @@ test("U8 AE8 public bridge pause-A preserves observable independent B progress",
     writeGateEvidence(h, "ae8-public-pause", { before: { at: beforePauseAt, a: { phase: beforeA.phase, intent: beforeA.intent }, b: { phase: beforeB.phase, intent: beforeB.intent }, bReceipts: beforeBReceipts }, pause: { at: pauseAt, action: "pause", target: "feature-a", a: { phase: a.phase, intent: a.intent }, b: { phase: b.phase, intent: b.intent }, bReceipts: pauseBReceipts }, afterB: { at: afterBAt, a: { phase: afterBA.phase, intent: afterBA.intent }, b: { phase: afterBB.phase, intent: afterBB.intent }, bReceipts: afterBReceipts.map(item => ({ digest: item.digest, taskId: item.taskId })) } });
     await h.bridge.control({ targetId: "feature-a", action: "resume" }); releasePause(h, "a"); await eventually(() => h.bridge.store.read(), state => state.tasks.find(item => item.taskId === taskId(manifest, "a1"))?.phase === "succeeded", "resumed A completion");
   } finally { releasePause(h, "a"); releasePause(h, "b"); await close(h); }
+});
+
+test("U8 AE8 supported child-status notification unfences the raced live child without manual reconcile", async () => {
+  const h = makeHarness("late-ready");
+  try {
+    const manifest = await approved(h);
+    // Deterministic ordering: the fixture withholds its running-artifact
+    // publication (and therefore the readiness notification) long enough that the
+    // scheduler's initial launch observation precedes the artifact and
+    // conservatively fences the live attempts.
+    const fenced = await eventually(() => h.bridge.store.read(), state => [taskId(manifest, "a1"), taskId(manifest, "b1")].every(id => {
+      const attempt = state.attempts.find(item => item.taskId === id);
+      return attempt?.phase === "recovery-needed" && /Run status\/owner artifact unavailable/.test(attempt.reason ?? "");
+    }), "initial launch observation precedes artifact ready");
+    // No reconcile call and no synthetic production call: after the fixture child
+    // atomically publishes its running artifact it emits the supported
+    // child-status readiness notification; the production runtime subscription
+    // must wake the scheduler to reread the authoritative state and unfence the
+    // still-live children on its own.
+    const unfenced = await eventually(() => h.bridge.store.read(), state => [taskId(manifest, "a1"), taskId(manifest, "b1")].every(id => {
+      const attempt = state.attempts.find(item => item.taskId === id), record = state.tasks.find(item => item.taskId === id);
+      return attempt?.phase === "running" && !!attempt.run && record?.phase === "running" && record.intent === "none";
+    }), "readiness notification unfences live children");
+    writeGateEvidence(h, "ae8-child-status-unfence", { fenced: { a: fenced.attempts.find(item => item.taskId === taskId(manifest, "a1"))?.reason, b: fenced.attempts.find(item => item.taskId === taskId(manifest, "b1"))?.reason }, unfenced: { a: unfenced.attempts.find(item => item.taskId === taskId(manifest, "a1"))?.phase, b: unfenced.attempts.find(item => item.taskId === taskId(manifest, "b1"))?.phase }, manualReconcileCalls: 0 });
+    release(h);
+    await eventually(() => h.bridge.store.read(), state => state.attempts.every(a => a.phase === "succeeded"), "unfenced live children reach terminal");
+  } finally { release(h); await close(h); }
 });
 
 test("U8 AE8 approved shared nondefault PR grouping creates one fenced obligation and reconciles persisted ack", async () => {

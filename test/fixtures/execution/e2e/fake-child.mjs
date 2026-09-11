@@ -12,6 +12,7 @@ const log = event => appendFileSync(eventsPath, `${JSON.stringify({ runId, pid: 
 const writeJson = (path, value) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(value)); renameSync(tmp, path); };
 mkdirSync(artifactDir, { recursive: true });
 log({ event: "start", at: startedAt, cwd: process.cwd(), taskId: config.taskId, mode: config.mode, agent: config.agent });
+if (config.readyDelayMs) await new Promise(resolve => setTimeout(resolve, config.readyDelayMs));
 writeJson(join(artifactDir, "status.json"), { lifecycleArtifactVersion: 3, runId, sessionId: config.sessionId, mode: "single", state: "running", steps: [] });
 writeJson(join(artifactDir, "startup-snapshot.json"), {
   cwd: process.cwd(),
@@ -19,6 +20,10 @@ writeJson(join(artifactDir, "startup-snapshot.json"), {
   agent: config.agent,
   files: Object.fromEntries((config.snapshotPaths ?? []).map(path => [path, (() => { try { return readFileSync(join(process.cwd(), path), "utf8"); } catch { return null; } })()])),
 });
+// Supported readiness/status notification (the `subagent:child-status` runtime
+// event shape), emitted only after the atomic running-artifact publication above,
+// with exact run/session identity. The parent provider event bridge decodes it.
+process.stdout.write(`${JSON.stringify({ version: 1, type: "child-status", runId, sessionId: config.sessionId, state: "running", at: Date.now() })}\n`);
 log({ event: "ready", at: Date.now(), taskId: config.taskId, mode: config.mode });
 
 const waitFor = async path => {
