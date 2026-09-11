@@ -60,14 +60,21 @@ class ChildProvider implements RuntimeEventBus {
     if (["five", "capacity", "handoff"].includes(this.scenario) && /^a[1-5]$/.test(taskId)) return barrier;
     if (this.scenario === "dependency" && /^a[3-5]$/.test(taskId)) return barrier;
     if (this.scenario === "sparse" && taskId === "alpha") return barrier;
-    if (this.scenario === "recovery" && taskId === "recovery") return barrier;
+    if (this.scenario === "pause" && taskId === "a1") return barrier;
+    if (["recovery", "reload"].includes(this.scenario) && taskId === "recovery") return barrier;
     return undefined;
   }
   private async rpc(request: Record<string, unknown>): Promise<void> {
     const method = String(request.method ?? "");
     if (method === "ping") {
-      this.reply(request, true, { version: 1, methods: ["spawn", "status", "stop"], capabilities: { asyncSpawn: true, stop: true }, session: { sessionId, sessionFile: this.sessionFile } });
+      const durable = this.scenario === "reload";
+      this.reply(request, true, { version: 1, methods: ["spawn", "status", "stop", ...(durable ? ["lookup"] : [])], capabilities: { asyncSpawn: true, stop: true, ...(durable ? { durableSpawn: { version: 1, lookup: true } } : {}) }, session: { sessionId, sessionFile: this.sessionFile } });
       return;
+    }
+    if (method === "lookup" && this.scenario === "reload") {
+      const pendingPath = join(this.root, "pending-old-reply.json");
+      const pending = JSON.parse(readFileSync(pendingPath, "utf8")) as { response: unknown };
+      this.reply(request, true, { state: "known", reply: pending.response }); return;
     }
     if (method === "status") { this.reply(request, true, { state: "known" }); return; }
     if (method === "stop") {
@@ -102,7 +109,18 @@ class ChildProvider implements RuntimeEventBus {
       this.emit("subagent:process-terminal", { runId, sessionId });
       this.emit("subagent:async-complete", { runId, sessionId, mode: "single", success: code === 0 && !signal, results: [{ ...(outputValue === undefined ? {} : { structuredOutput: outputValue }) }], summary: `child ${taskId}`, ...(signal ? { interrupted: true } : {}) });
     });
-    this.reply(request, true, { details: { mode: "single", runId, asyncDir: artifactDir } });
+    const response = { details: { mode: "single", runId, asyncDir: artifactDir } };
+    if (this.scenario === "reload" && taskId === "recovery") {
+      writeFileSync(join(this.root, "pending-old-reply.json"), JSON.stringify({ request, response }));
+      return;
+    }
+    this.reply(request, true, response);
+  }
+  releasePendingOldReply(): void {
+    const pendingPath = join(this.root, "pending-old-reply.json");
+    const pending = JSON.parse(readFileSync(pendingPath, "utf8")) as { request: Record<string, unknown>; response: unknown };
+    this.reply(pending.request, true, pending.response);
+    writeFileSync(join(this.root, "released-old-reply.json"), JSON.stringify({ requestId: pending.request.requestId, releasedAt: Date.now() }));
   }
   private interpret(task: string): unknown {
     const match = /Required identity: (\{.*\})/.exec(task); if (!match) throw new Error("interpreter identity missing");
@@ -139,17 +157,21 @@ function manifestFor(identity: { id: string; revision: number; repo: RepoIdentit
     const follow = task("followup", featureA.id, "delivery-a", source, ["a1", "a2"]); tasks = [...tasks, follow]; groups[0]!.requiredTaskIds = tasks.map(item => item.id); bTask = task("b1", featureB.id, "delivery-b", source); 
   } else if (scenario === "gamma") {
     tasks = [task("gamma", featureA.id, "delivery-a", source), task("gamma-dependent", featureA.id, "delivery-a", source, ["gamma"]), task("sibling", featureA.id, "delivery-a", source), task("b1", featureB.id, "delivery-b", source)]; groups[0]!.requiredTaskIds = ["gamma", "gamma-dependent", "sibling"]; groups[1]!.requiredTaskIds = ["b1"]; bTask = tasks[3]!;
-  } else if (scenario === "conflict") {
+  } else if (["conflict", "controller-conflict"].includes(scenario)) {
     groups[0]!.checks = [check("combined-a", true)]; groups[1]!.checks = [check("combined-b")];
+    if (scenario === "controller-conflict") groups[1] = { ...groups[1]!, policy: "pr", completion: "merged" };
   } else if (scenario === "handoff") {
     groups = [{ id: "shared-review", featureIds: [featureA.id, featureB.id], requiredTaskIds: [...tasks.map(item => item.id), bTask.id], checks: [], policy: "pr", completion: "merged", ownerId: "shared-owner" }]; tasks = [...tasks.map(item => ({ ...item, deliveryGroupId: "shared-review" })), { ...bTask, deliveryGroupId: "shared-review" }];
   } else if (scenario === "degraded") {
     tasks = [task("a1", featureA.id, "delivery-a", source), task("b1", featureB.id, "delivery-b", source)]; groups[0]!.requiredTaskIds = ["a1"]; bTask = tasks[1]!;
   } else if (scenario === "sparse") {
-    const revised = source.bytes.includes("dependency") || source.bytes.includes("new-feature");
+    const revised = source.bytes.includes("dependency"), discovered = source.bytes.includes("in-scope");
     tasks = [task("alpha", featureA.id, "delivery-a", source), task("beta", featureA.id, "delivery-a", source, revised ? ["alpha"] : [], [], revised)]; groups[0]!.requiredTaskIds = tasks.map(item => item.id); bTask = task("b1", featureB.id, "delivery-b", source); features = [featureA]; groups = [groups[0]!];
+    if (discovered) { const discoveredTask = task("discovered", featureA.id, "delivery-a", source); tasks.push(discoveredTask); groups[0]!.requiredTaskIds = tasks.map(item => item.id); }
     if (source.bytes.includes("new-feature")) { const featureC = { id: "feature-c", title: "New Feature", scope: "src/" }; const c = task("new", featureC.id, "delivery-c", source); features.push(featureC); tasks.push(c); groups.push({ id: "delivery-c", featureIds: [featureC.id], requiredTaskIds: [c.id], checks: [], policy: "local", completion: "validated", ownerId: featureC.id }); }
-  } else if (scenario === "recovery") {
+  } else if (scenario === "pause") {
+    tasks = [task("a1", featureA.id, "delivery-a", source), task("b1", featureB.id, "delivery-b", source)]; groups[0]!.requiredTaskIds = ["a1"]; groups[1]!.requiredTaskIds = ["b1"]; features = [featureA, featureB];
+  } else if (["recovery", "reload"].includes(scenario)) {
     tasks = [task("recovery", featureA.id, "delivery-a", source)]; groups[0]!.requiredTaskIds = ["recovery"]; bTask = task("b1", featureB.id, "delivery-b", source); groups = [groups[0]!]; features = [featureA];
   }
   const allTasks = groups.some(group => group.id === "delivery-b") ? (tasks.some(item => item.id === "b1") ? tasks : [...tasks, bTask]) : tasks;
@@ -181,6 +203,7 @@ function makeHarness(scenario: string, capacity = 6) {
     events: provider,
     async exec(file: string, args: string[], options: { cwd: string; timeout?: number }) {
       gitInvocations.push(file === "git" ? [...args] : [file, ...args]);
+      if (file === "git" && isGitMutation(args)) appendFileSync(join(provider.root, "git-mutations.jsonl"), `${JSON.stringify({ cwd: options.cwd, argv: args, at: Date.now() })}\n`);
       const helper = file === "git" && args[0] === "wt";
       const executable = helper ? worktreeHelperPath : file;
       const actual = helper ? args.slice(1) : [...args], cwd = options.cwd;
@@ -189,7 +212,7 @@ function makeHarness(scenario: string, capacity = 6) {
   };
   const bridge = createExecutionBridge({ pi, events: provider, repo: repo.repo, referencePath: repo.repoPath, stateRoot, sessionFile, processStart: `e2e:${process.pid}:${scenario}`, capacity, ownedRoot, interpretationTransport: createExecutionInterpreter({ events: provider, cwd: repo.repoPath, sessionFile }) });
   const planPath = join(repo.root, `${scenario}.md`); writeFileSync(planPath, scenario === "five" ? readFileSync(fiveWorkersPath, "utf8") : `# Sparse ${scenario}\n\nThis is the ${scenario} fixture.\n`);
-  return { ...repo, sessionFile, stateRoot, ownedRoot, provider, pi, bridge, planPath };
+  return { ...repo, sessionFile, stateRoot, ownedRoot, provider, pi, bridge, planPath, gitInvocations };
 }
 
 type Harness = ReturnType<typeof makeHarness>;
@@ -211,7 +234,7 @@ function retainHarnessEvidence(h: Harness): void {
     overlapIntervals: starts.map(start => ({ runId: start.runId, taskId: start.taskId, pid: start.pid, start: start.at, end: ends.find(end => end.runId === start.runId)?.at ?? null })),
     combinedChecks: state.integrationReceipts.flatMap(receipt => receipt.checks.map(check => ({ intentId: receipt.intentId, checkId: check.checkId, invocationId: check.invocationId, status: check.status, startedAt: check.startedAt, finishedAt: check.finishedAt }))),
     stateCounts: stateCounts(state), crashSnapshots: readdirSync(h.provider.root).filter(name => name.startsWith("snapshot-")).sort().map(name => join(h.provider.root, name)),
-    artifacts: [join(h.provider.root, "children.jsonl"), join(h.provider.root, "rpc-events.jsonl"), join(h.provider.root, "git-commands.jsonl"), join(h.provider.root, "controller-state.json")].filter(existsSync),
+    artifacts: readdirSync(h.provider.root).filter(name => /^(children|rpc-events|git-commands|git-mutations|controller-state|controller-calls|checkpoint-|snapshot-|pending-old-reply|released-old-reply|resume-|gate-)/.test(name)).map(name => join(h.provider.root, name)).filter(existsSync),
   };
   writeFileSync(join(h.root, "evidence-index.json"), JSON.stringify(evidence, null, 2));
   if (evidenceBase) appendFileSync(join(evidenceBase, "index.jsonl"), `${JSON.stringify(evidence)}\n`);
@@ -227,6 +250,9 @@ async function eventually<T>(read: () => T, predicate: (value: T) => boolean, la
   assert.ok(predicate(value), `${label}: ${JSON.stringify(value)}`); return value;
 }
 function taskId(manifest: ExecutionManifest, logical: string): string { return manifest.tasks.find(task => task.text.includes(`TASK_ID: ${logical}`))!.id; }
+function ledger(path: string): Array<Record<string, unknown>> { return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : []; }
+function writeGateEvidence(h: Harness, name: string, value: unknown): void { writeFileSync(join(h.provider.root, `gate-${name}.json`), JSON.stringify(value, null, 2)); }
+function isGitMutation(args: readonly string[]): boolean { return new Set(["wt", "add", "commit", "cherry-pick", "merge", "reset", "checkout", "update-ref"]).has(args[0] ?? ""); }
 function release(h: Harness) { mkdirSync(join(h.provider.root, "barrier"), { recursive: true }); writeFileSync(join(h.provider.root, "barrier", "release"), "release\n"); }
 async function close(h: Harness) { retainHarnessEvidence(h); await h.bridge.shutdown(); await h.provider.dispose(); }
 function crashOwnerArgs(h: Harness, mode: string): string[] { return ["--experimental-strip-types", crashOwnerPath, h.stateRoot, h.repo.commonDir, h.sessionFile, h.repoPath, h.ownedRoot, h.planPath, h.provider.root, mode]; }
@@ -312,30 +338,70 @@ test("U8 AE4 explicit five is refused at capacity two; concurrency-only revision
   } finally { release(h); await close(h); }
 });
 
-test("U8 AE5 sparse Markdown gates an in-scope addition and explicit dependency/new-feature revision", async () => {
+test("U8 AE5 approved revision executes discovered in-scope task while alpha stays gated, then fences explicit dependency revision", async () => {
   const h = makeHarness("sparse");
   try {
-    const first = await h.bridge.run(h.planPath); assert.equal(first.kind, "approval-required", JSON.stringify(first)); if (first.kind !== "approval-required") return; assert.equal(first.preview.manifest.tasks.length, 2); assert.equal(first.preview.manifest.tasks[1]!.dependencies.length, 0);
-    const started = await h.bridge.run(h.planPath, { token: first.preview.token, capacity: 6, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(started.kind, "started", JSON.stringify(started));
+    const first = await h.bridge.run(h.planPath); assert.equal(first.kind, "approval-required", JSON.stringify(first)); if (first.kind !== "approval-required") return;
+    assert.deepEqual(first.preview.manifest.tasks.map(item => item.text.split("\n")[0]), ["TASK_ID: alpha", "TASK_ID: beta"]); assert.equal(first.preview.manifest.tasks[1]!.dependencies.length, 0);
+    const started = await h.bridge.run(h.planPath, { token: first.preview.token, capacity: 6, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(started.kind, "started", JSON.stringify(started)); if (started.kind !== "started") return;
     await eventually(() => h.provider.events(), events => events.some(e => e.event === "ready" && e.taskId === "alpha"), "gated retained alpha worker");
-    const before = new Map(["alpha", "beta"].map(id => [id, h.provider.events().filter(e => e.event === "start" && e.taskId === id).length]));
-    writeFileSync(h.planPath, "# Sparse revision\n\nnew-feature dependency\n"); const revised = await h.bridge.run(h.planPath); assert.equal(revised.kind, "approval-required", JSON.stringify(revised)); if (revised.kind !== "approval-required") return; assert.equal(revised.preview.manifest.revision, 2); assert.ok(revised.preview.manifest.features.some(f => f.id === "feature-c")); assert.deepEqual(revised.preview.manifest.tasks.find(t => t.text.includes("TASK_ID: beta"))!.dependencies.length, 1); assert.equal(revised.preview.manifest.tasks.find(t => t.text.includes("TASK_ID: beta"))!.provenance.find(p => p.field === "dependencies")!.origin, "explicit"); assert.equal(h.provider.spawnParams.filter(p => String(p.task).includes("TASK_ID: new")).length, 0);
-    const approvedRevision = await h.bridge.run(h.planPath, { token: revised.preview.token, capacity: 6, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(approvedRevision.kind, "started", JSON.stringify(approvedRevision)); release(h);
-    await eventually(() => h.bridge.store.read(), state => state.tasks.some(t => t.taskId === taskId(approvedRevision.manifest, "new") && t.phase === "succeeded"), "new feature post-approval launch");
-    assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "alpha").length, before.get("alpha"));
+    await eventually(() => h.bridge.store.read(), state => state.tasks.some(item => item.taskId === taskId(started.manifest, "beta") && item.phase === "succeeded"), "initial beta receipt");
+    const initialStarts = Object.fromEntries(["alpha", "beta", "discovered"].map(id => [id, h.provider.events().filter(e => e.event === "start" && e.taskId === id).length]));
+    writeFileSync(h.planPath, "# Sparse revision\n\nin-scope\n"); const discoveredPreview = await h.bridge.run(h.planPath); assert.equal(discoveredPreview.kind, "approval-required", JSON.stringify(discoveredPreview)); if (discoveredPreview.kind !== "approval-required") return;
+    const discoveredTask = discoveredPreview.preview.manifest.tasks.find(item => item.text.includes("TASK_ID: discovered"))!; assert.equal(discoveredTask.featureId, "feature-a"); assert.deepEqual(discoveredTask.scope, ["src/"]); assert.equal(discoveredTask.dependencies.length, 0); assert.equal(discoveredPreview.preview.manifest.revision, 2);
+    const discoveredStarted = await h.bridge.run(h.planPath, { token: discoveredPreview.preview.token, capacity: 6, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(discoveredStarted.kind, "started", JSON.stringify(discoveredStarted)); if (discoveredStarted.kind !== "started") return;
+    await eventually(() => h.bridge.store.read(), state => state.tasks.some(item => item.taskId === taskId(discoveredStarted.manifest, "discovered") && item.phase === "succeeded"), "discovered in-scope task receipt while alpha gated");
+    const alphaAttempt = h.bridge.store.read().attempts.find(item => item.taskId === taskId(discoveredStarted.manifest, "alpha"))!; assert.equal(alphaAttempt.phase, "running"); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "alpha").length, Number(initialStarts.alpha ?? 0)); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "beta").length, Number(initialStarts.beta ?? 0));
+    writeFileSync(h.planPath, "# Sparse dependency revision\n\ndependency\n"); const dependencyPreview = await h.bridge.run(h.planPath); assert.equal(dependencyPreview.kind, "approval-required", JSON.stringify(dependencyPreview)); if (dependencyPreview.kind !== "approval-required") return; assert.equal(dependencyPreview.preview.manifest.revision, 3);
+    const revisedBeta = dependencyPreview.preview.manifest.tasks.find(item => item.text.includes("TASK_ID: beta"))!; assert.deepEqual(revisedBeta.dependencies, [taskId(dependencyPreview.preview.manifest, "alpha")]); assert.equal(revisedBeta.provenance.find(item => item.field === "dependencies")!.origin, "explicit");
+    await new Promise(resolve => setTimeout(resolve, 50)); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "beta").length, Number(initialStarts.beta ?? 0), "revision remains approval-fenced before approval");
+    const dependencyStarted = await h.bridge.run(h.planPath, { token: dependencyPreview.preview.token, capacity: 6, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(dependencyStarted.kind, "started", JSON.stringify(dependencyStarted)); if (dependencyStarted.kind !== "started") return;
+    await new Promise(resolve => setTimeout(resolve, 50)); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "beta").length, Number(initialStarts.beta ?? 0), "changed dependency waits for its gated prerequisite"); release(h);
+    await eventually(() => h.bridge.store.read(), state => state.tasks.some(item => item.taskId === taskId(dependencyStarted.manifest, "beta") && item.phase === "succeeded"), "explicit dependency post-approval launch");
+    assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "alpha").length, Number(initialStarts.alpha ?? 0)); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "discovered").length, 1); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "beta").length, Number(initialStarts.beta ?? 0) + 1);
+    writeGateEvidence(h, "ae5-in-scope-and-explicit", { revisions: [1, 2, 3], discovered: { taskId: discoveredTask.id, featureId: discoveredTask.featureId, scope: discoveredTask.scope, receipts: 1 }, alphaStarts: Number(initialStarts.alpha ?? 0), betaStarts: Number(initialStarts.beta ?? 0) + 1, explicitDependency: revisedBeta.dependencies, approvalFenced: true });
+  } finally { release(h); await close(h); }
+});
+
+test("U8 AE5 new-feature discovery requires its own approval and launches only afterward", async () => {
+  const h = makeHarness("sparse");
+  try {
+    const first = await h.bridge.run(h.planPath); assert.equal(first.kind, "approval-required", JSON.stringify(first)); if (first.kind !== "approval-required") return;
+    const started = await h.bridge.run(h.planPath, { token: first.preview.token, capacity: 6, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(started.kind, "started", JSON.stringify(started)); if (started.kind !== "started") return;
+    await eventually(() => h.provider.events(), events => events.some(e => e.event === "ready" && e.taskId === "alpha"), "new-feature alpha gate"); await eventually(() => h.bridge.store.read(), state => state.tasks.some(item => item.taskId === taskId(started.manifest, "beta") && item.phase === "succeeded"), "new-feature baseline beta");
+    writeFileSync(h.planPath, "# Sparse new feature revision\n\nnew-feature\n"); const preview = await h.bridge.run(h.planPath); assert.equal(preview.kind, "approval-required", JSON.stringify(preview)); if (preview.kind !== "approval-required") return; assert.equal(preview.preview.manifest.revision, 2); assert.ok(preview.preview.manifest.features.some(item => item.id === "feature-c")); assert.ok(preview.preview.manifest.tasks.some(item => item.text.includes("TASK_ID: new")));
+    const beforeNew = h.provider.events().filter(e => e.event === "start" && e.taskId === "new").length; await new Promise(resolve => setTimeout(resolve, 50)); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "new").length, beforeNew, "new feature remains approval-fenced");
+    const approvedRevision = await h.bridge.run(h.planPath, { token: preview.preview.token, capacity: 6, publication: false, approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(approvedRevision.kind, "started", JSON.stringify(approvedRevision)); if (approvedRevision.kind !== "started") return; await eventually(() => h.bridge.store.read(), state => state.tasks.some(item => item.taskId === taskId(approvedRevision.manifest, "new") && item.phase === "succeeded"), "new feature post-approval launch"); assert.equal(h.provider.events().filter(e => e.event === "start" && e.taskId === "new").length, 1);
+    writeGateEvidence(h, "ae5-new-feature", { revision: 2, featureId: "feature-c", taskId: taskId(approvedRevision.manifest, "new"), preApprovalStarts: beforeNew, postApprovalStarts: 1, alphaStillGatedBeforeRelease: h.bridge.store.read().attempts.some(item => item.taskId === taskId(approvedRevision.manifest, "alpha") && item.phase === "running") });
   } finally { release(h); await close(h); }
 });
 
 test("U8 AE6 same-PID reload and true exited-owner startup reconcile one real run", async () => {
   const h = makeHarness("recovery"); let replacement: ExecutionBridge | undefined; let crash: ChildProcess | undefined;
   try {
-    const manifest = await approved(h); await eventually(() => h.provider.events(), events => events.some(e => e.event === "start" && e.taskId === "recovery"), "recovery child launch"); const recoveryStart = h.provider.events().find(e => e.event === "start" && e.taskId === "recovery")!; await eventually(() => h.provider.events(), events => events.some(e => e.event === "ready" && e.runId === recoveryStart.runId), "recovery child readiness"); const recoveryStatusPath = join(h.provider.root, "runs", String(recoveryStart.runId), "status.json"); const recoveryStatus = JSON.parse(readFileSync(recoveryStatusPath, "utf8")); assert.equal(recoveryStatus.state, "running"); assert.equal(existsSync(`${recoveryStatusPath}.${recoveryStart.pid}.tmp`), false); await eventually(() => h.bridge.store.read(), state => state.attempts.some(a => a.taskId === taskId(manifest, "recovery") && ["running", "launching"].includes(a.phase)), "persisted running run");
+    const manifest = await approved(h); await eventually(() => h.provider.events(), events => events.some(e => e.event === "start" && e.taskId === "recovery"), "recovery child launch"); const recoveryStart = h.provider.events().find(e => e.event === "start" && e.taskId === "recovery")!; await eventually(() => h.provider.events(), events => events.some(e => e.event === "ready" && e.runId === recoveryStart.runId), "recovery child readiness"); const recoveryStatusPath = join(h.provider.root, "runs", String(recoveryStart.runId), "status.json"); const recoveryStatus = JSON.parse(readFileSync(recoveryStatusPath, "utf8")); assert.equal(recoveryStatus.state, "running"); assert.equal(existsSync(`${recoveryStatusPath}.${recoveryStart.pid}.tmp`), false); await eventually(() => h.bridge.store.read(), state => state.attempts.some(a => a.taskId === taskId(manifest, "recovery") && ["running", "launching", "recovery-needed"].includes(a.phase) && !!a.run), "persisted real run");
     await h.bridge.shutdown();
     crash = spawn(process.execPath, ["--experimental-strip-types", crashOwnerPath, join(h.stateRoot, "plan-driven-v1"), h.repo.commonDir, h.sessionFile], { stdio: ["ignore", "pipe", "pipe"] }); await new Promise<void>((resolve, reject) => { crash!.stdout?.once("data", () => resolve()); crash!.once("error", reject); }); const crashedPid = crash.pid!; crash.kill("SIGKILL"); await new Promise(resolve => crash!.once("close", resolve)); assert.ok(crashedPid > 0);
     replacement = createExecutionBridge({ ...((h as any).bridge ? {} : {}), pi: h.pi, events: h.provider, repo: h.repo, referencePath: h.repoPath, stateRoot: h.stateRoot, sessionFile: h.sessionFile, processStart: `e2e-reload:${process.pid}`, capacity: 6, ownedRoot: h.ownedRoot, interpretationTransport: createExecutionInterpreter({ events: h.provider, cwd: h.repoPath, sessionFile: h.sessionFile }) });
     await replacement.start({ resumePriorOwner: true }); const active = replacement.store.read(); assert.equal(active.reservations.length, 1); assert.equal(h.provider.spawnParams.filter(p => String(p.task).includes("TASK_ID: recovery")).length, 1, "the crash-owner must not replay a launch");
     release(h); await eventually(() => replacement!.store.read(), state => state.attempts.some(a => a.taskId === taskId(manifest, "recovery") && a.phase === "succeeded"), "reconciled recovery terminal");
   } finally { release(h); retainHarnessEvidence(h); if (replacement) await replacement.shutdown(); else await h.bridge.shutdown(); if (crash && crash.exitCode === null) crash.kill("SIGKILL"); await h.provider.dispose(); }
+});
+
+test("U8 AE6 same-PID reload fences a pending old-instance external reply after replacement acquires", async () => {
+  const h = makeHarness("reload"); let replacement: ExecutionBridge | undefined;
+  try {
+    const manifest = await approved(h); await eventually(() => existsSync(join(h.provider.root, "pending-old-reply.json")), value => value, "old bridge pending external spawn reply");
+    const oldState = h.bridge.store.read(), oldOwner = oldState.owner; assert.ok(oldOwner); assert.equal(oldState.results.length, 0); assert.equal(oldState.reservations.length, 1);
+    await h.bridge.shutdown();
+    replacement = createExecutionBridge({ pi: h.pi, events: h.provider, repo: h.repo, referencePath: h.repoPath, stateRoot: h.stateRoot, sessionFile: h.sessionFile, processStart: `e2e-replacement:${process.pid}`, capacity: 6, ownedRoot: h.ownedRoot, interpretationTransport: createExecutionInterpreter({ events: h.provider, cwd: h.repoPath, sessionFile: h.sessionFile }) });
+    await replacement.start({ resumePriorOwner: true }); await eventually(() => replacement!.store.read(), state => state.owner?.instanceId !== oldOwner.instanceId && state.attempts.some(item => item.taskId === taskId(manifest, "recovery") && item.phase === "running"), "replacement owns running child");
+    const before = replacement.store.read(), replacementOwner = before.owner!; const beforeReservations = before.reservations.map(item => ({ id: item.id, attemptId: item.attemptId, workspacePath: item.workspacePath, slots: item.slots })); const beforeReceipts = before.results.map(item => item.digest);
+    h.provider.releasePendingOldReply(); await eventually(() => existsSync(join(h.provider.root, "released-old-reply.json")), value => value, "released old-instance reply"); await new Promise(resolve => setTimeout(resolve, 100));
+    const after = replacement.store.read(); assert.deepEqual(after.results.map(item => item.digest), beforeReceipts, "old callback cannot create a receipt"); assert.deepEqual(after.reservations.map(item => ({ id: item.id, attemptId: item.attemptId, workspacePath: item.workspacePath, slots: item.slots })), beforeReservations, "old callback cannot alter reservations"); assert.equal(after.owner?.instanceId, replacementOwner.instanceId); assert.equal(after.owner?.processStart, replacementOwner.processStart); assert.notEqual(after.owner?.instanceId, oldOwner.instanceId); assert.equal(after.attempts.find(item => item.taskId === taskId(manifest, "recovery"))!.phase, "running");
+    writeGateEvidence(h, "ae6-old-instance-reply", { oldRequestId: JSON.parse(readFileSync(join(h.provider.root, "pending-old-reply.json"), "utf8")).request.requestId, releasedAfterReplacementOwner: replacementOwner.instanceId, beforeReceipts, afterReceipts: after.results.map(item => item.digest), beforeReservations, afterReservations: after.reservations.map(item => ({ id: item.id, attemptId: item.attemptId, workspacePath: item.workspacePath, slots: item.slots })), oldAuthorityRejected: after.owner?.instanceId !== oldOwner.instanceId }); release(h);
+    await eventually(() => replacement!.store.read(), state => state.attempts.some(item => item.taskId === taskId(manifest, "recovery") && item.phase === "succeeded"), "replacement terminal receipt after old reply fence");
+  } finally { release(h); if (replacement) await replacement.shutdown(); else await h.bridge.shutdown(); await h.provider.dispose(); }
 });
 
 test("U8 AE6 real owner death before spawn RPC retains unknown reservation without replay", async () => {
@@ -378,8 +444,9 @@ test("U8 AE6 real owner death after Git mutation keeps completed journal and nev
 test("U8 AE6 real owner death after controller persistence keeps pending fence and reconciles one transfer", async () => {
   const h = makeHarness("recovery"); let owner: ChildProcess | undefined; let replacement: ChildProcess | undefined;
   try {
-    owner = startCrashOwner(h, "controller"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-controller-persist-before-local-ack.json")), value => value, "controller persistence before local acknowledgement checkpoint"); await waitForStopped(owner, "controller owner stopped at exact checkpoint"); const before = h.bridge.store.read(); writeCrashSnapshot(h, "controller-persist-before-local-ack", "before", before); assert.equal(before.deliveries[0]?.phase, "handoff-pending"); assert.equal(before.deliveries[0]?.acknowledgement, undefined); await killOwner(owner); owner = undefined;
-    replacement = startCrashOwner(h, "resume-controller"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.deliveries[0]?.phase === "controller-owned", "persisted controller acknowledgement"); const after = h.bridge.store.read(); writeCrashSnapshot(h, "controller-persist-before-local-ack", "after", after); assert.equal(after.deliveries.length, 1); assert.ok(after.deliveries[0]!.acknowledgement); assert.equal(readFileSync(join(h.provider.root, "controller-state.json"), "utf8").split("requestId").length - 1, 1);
+    owner = startCrashOwner(h, "controller"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-controller-persist-before-local-ack.json")), value => value, "controller persistence before local acknowledgement checkpoint"); await waitForStopped(owner, "controller owner stopped at exact checkpoint"); const before = h.bridge.store.read(); writeCrashSnapshot(h, "controller-persist-before-local-ack", "before", before); assert.equal(before.deliveries[0]?.phase, "handoff-pending"); assert.equal(before.deliveries[0]?.acknowledgement, undefined); const deliveryHead = before.deliveries[0]!.handoff!.head; const controllerCallsBefore = ledger(join(h.provider.root, "controller-calls.jsonl")); const gitMutationsBefore = ledger(join(h.provider.root, "git-mutations.jsonl")); assert.equal(controllerCallsBefore.length, 1); assert.ok(gitMutationsBefore.length > 0); assert.equal(JSON.parse(readFileSync(join(h.provider.root, "controller-state.json"), "utf8")).view.head, deliveryHead); await killOwner(owner); owner = undefined;
+    replacement = startCrashOwner(h, "resume-controller"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.deliveries[0]?.phase === "controller-owned", "persisted controller acknowledgement"); const after = h.bridge.store.read(); writeCrashSnapshot(h, "controller-persist-before-local-ack", "after", after); assert.equal(after.deliveries.length, 1); assert.ok(after.deliveries[0]!.acknowledgement); assert.equal(after.deliveries[0]!.handoff!.head, deliveryHead); assert.equal(JSON.parse(readFileSync(join(h.provider.root, "controller-state.json"), "utf8")).view.head, deliveryHead); assert.equal(ledger(join(h.provider.root, "controller-calls.jsonl")).length, controllerCallsBefore.length); assert.deepEqual(ledger(join(h.provider.root, "git-mutations.jsonl")), gitMutationsBefore);
+    writeGateEvidence(h, "ae6-controller-ledgers", { controllerCalls: controllerCallsBefore.length, gitMutations: gitMutationsBefore.length, deliveryHead, unchangedAcrossRestart: true });
   } finally { if (replacement) await stopOwner(h, replacement); if (owner) await killOwner(owner); await close(h); }
 });
 
@@ -390,22 +457,53 @@ test("U8 malformed lifecycle evidence never yields a successful receipt", async 
   } finally { await close(h); }
 });
 
-test("U8 AE7 failed combined gate blocks A while independent B reaches ready", async () => {
-  const h = makeHarness("conflict");
+test("U8 AE7 failed A gate stays blocked while independent B completes deterministic controller lifecycle", async () => {
+  const h = makeHarness("controller-conflict"), controllerStatePath = join(h.root, "controller-state.json"), controllerCallsPath = join(h.provider.root, "controller-calls.jsonl"); let bridge: ExecutionBridge | undefined, controllerReady = false;
+  type ControllerState = { view?: { pr: string; owner: { kind: "feature" | "execution" | "session"; id: string; generation: string }; worktree: string; head: string; state: "waiting_review" | "merged"; pendingCount: number }; acknowledgement?: { requestId: string; controllerId: string; obligationId: string; generation: string; acceptedAt: number } };
+  const readControllerState = (): ControllerState => existsSync(controllerStatePath) ? JSON.parse(readFileSync(controllerStatePath, "utf8")) as ControllerState : {};
+  const writeControllerState = (value: ControllerState) => writeFileSync(controllerStatePath, JSON.stringify(value));
+  const controller = {
+    handoff(request: any) { const state: ControllerState = { view: { pr: "github.com/acme/e2e#7", owner: request.owner, worktree: request.worktree, head: request.head, state: "waiting_review", pendingCount: 1 } }; appendFileSync(controllerCallsPath, `${JSON.stringify({ action: "handoff", head: request.head, worktree: request.worktree })}\n`); writeControllerState(state); return { ok: true, state: "waiting_review" as const }; },
+    status() { const state = readControllerState(); return controllerReady && state.view ? [state.view] : []; },
+  };
+  const delivery = createControllerDeliveryAdapter({
+    controller, controllerId: "ae7-controller",
+    acknowledged: request => readControllerState().acknowledgement?.requestId === request.id ? readControllerState().acknowledgement : undefined,
+    verifyMerge: async request => readControllerState().view?.state === "merged" ? { commit: request.head, url: `https://${request.pr.repo}/pull/${request.pr.number}`, observedAt: Date.now() } : undefined,
+  });
+  bridge = createExecutionBridge({ pi: h.pi, events: h.provider, repo: h.repo, referencePath: h.repoPath, stateRoot: h.stateRoot, sessionFile: h.sessionFile, processStart: "e2e-ae7-controller", capacity: 6, ownedRoot: h.ownedRoot, repository: "github.com/acme/e2e", delivery, resolvePr: async () => ({ kind: "authorized", pr: { repo: "github.com/acme/e2e", number: 7 }, generation: "ae7-generation", ownerId: "feature-b", ownerKind: "execution" }), interpretationTransport: createExecutionInterpreter({ events: h.provider, cwd: h.repoPath, sessionFile: h.sessionFile }) });
   try {
-    const manifest = await approved(h); await eventually(() => h.bridge.store.read(), state => state.tasks.every(t => t.phase === "succeeded"), "all worker receipts"); await eventually(() => h.bridge.store.read(), state => state.deliveries.some(d => d.groupId === "delivery-a" && d.phase === "blocked") && state.deliveries.some(d => d.groupId === "delivery-b" && d.phase === "ready"), "independent delivery gates");
-    const state = h.bridge.store.read(); assert.match(state.deliveries.find(d => d.groupId === "delivery-a")!.reason ?? "", /combined gate|failed/i); assert.equal(state.deliveries.find(d => d.groupId === "delivery-b")!.phase, "ready"); assert.equal(state.manifests.find(m => m.id === manifest.id)!.deliveryGroups.length, 2);
-  } finally { await close(h); }
+    const first = await bridge.run(h.planPath); assert.equal(first.kind, "approval-required", JSON.stringify(first)); if (first.kind !== "approval-required") return; assert.equal(first.preview.boundary.publication, true);
+    const started = await bridge.run(h.planPath, { token: first.preview.token, capacity: 6, publication: true, publicationRepository: "github.com/acme/e2e", approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(started.kind, "started", JSON.stringify(started)); if (started.kind !== "started") return; release(h);
+    await eventually(() => bridge.store.read(), state => state.deliveries.some(item => item.groupId === "delivery-a" && item.phase === "blocked") && state.deliveries.some(item => item.groupId === "delivery-b" && item.phase === "handoff-pending"), "A blocked while B handoff pending");
+    const beforeController = bridge.store.read(), request = beforeController.deliveries.find(item => item.groupId === "delivery-b")!.handoff!; assert.equal(beforeController.deliveries.find(item => item.groupId === "delivery-a")!.phase, "blocked"); assert.equal(beforeController.deliveries.find(item => item.groupId === "delivery-b")!.phase, "handoff-pending"); assert.equal(ledger(controllerCallsPath).length, 1);
+    controllerReady = true; writeControllerState({ ...readControllerState(), acknowledgement: { requestId: request.id, controllerId: "ae7-controller", obligationId: digest([{ host: "github.com", owner: "acme", repo: "e2e", number: "7" }, readControllerState().view!.owner, readControllerState().view!.worktree, request.head]), generation: request.generation, acceptedAt: 1 } }); h.provider.emit(PR_REVIEW_RECONCILED_EVENT, { pr: request.pr });
+    await eventually(() => bridge.store.read(), state => state.deliveries.find(item => item.groupId === "delivery-b")?.phase === "controller-owned", "B controller acknowledgement"); assert.equal(bridge.store.read().deliveries.find(item => item.groupId === "delivery-a")!.phase, "blocked"); assert.equal(ledger(controllerCallsPath).length, 1);
+    writeControllerState({ ...readControllerState(), view: { ...readControllerState().view!, state: "merged", pendingCount: 0 } }); h.provider.emit(PR_REVIEW_RECONCILED_EVENT, { pr: request.pr }); await eventually(() => bridge.store.read(), state => state.deliveries.find(item => item.groupId === "delivery-b")?.phase === "merged", "B verified controller merge");
+    const state = bridge.store.read(); assert.equal(state.deliveries.find(item => item.groupId === "delivery-a")!.phase, "blocked"); assert.equal(state.deliveries.find(item => item.groupId === "delivery-b")!.phase, "merged"); assert.equal(state.manifests.find(item => item.id === started.manifest.id)!.deliveryGroups.length, 2); assert.equal(ledger(controllerCallsPath).length, 1);
+    writeGateEvidence(h, "ae7-controller-lifecycle", { a: state.deliveries.find(item => item.groupId === "delivery-a")!.phase, bPhases: ["handoff-pending", "controller-owned", "merged"], controllerCalls: ledger(controllerCallsPath).length, deliveryHead: request.head });
+  } finally { release(h); if (bridge) await bridge.shutdown(); await h.provider.dispose(); retainHarnessEvidence(h); }
+});
+
+test("U8 AE8 public bridge pause-A preserves observable independent B progress", async () => {
+  const h = makeHarness("pause");
+  try {
+    const manifest = await approved(h); await eventually(() => h.provider.events(), events => events.some(e => e.event === "ready" && e.taskId === "a1") && events.some(e => e.event === "start" && e.taskId === "b1"), "pause-A and independent B activity");
+    await h.bridge.control({ targetId: "feature-a", action: "pause" }); await eventually(() => h.bridge.store.read(), state => state.tasks.find(item => item.taskId === taskId(manifest, "a1"))?.intent === "pause" && state.tasks.find(item => item.taskId === taskId(manifest, "b1"))?.phase === "succeeded", "paused A with B progress");
+    const paused = h.bridge.store.read(), a = paused.tasks.find(item => item.taskId === taskId(manifest, "a1"))!, b = paused.tasks.find(item => item.taskId === taskId(manifest, "b1"))!; assert.equal(a.intent, "pause"); assert.equal(a.phase, "running"); assert.equal(b.phase, "succeeded"); assert.equal(paused.results.filter(item => item.taskId === taskId(manifest, "b1")).length, 1);
+    writeGateEvidence(h, "ae8-public-pause", { action: "pause", target: "feature-a", aPhase: a.phase, aIntent: a.intent, bPhase: b.phase, bReceipts: paused.results.filter(item => item.taskId === taskId(manifest, "b1")).length }); await h.bridge.control({ targetId: "feature-a", action: "resume" }); release(h); await eventually(() => h.bridge.store.read(), state => state.tasks.find(item => item.taskId === taskId(manifest, "a1"))?.phase === "succeeded", "resumed A completion");
+  } finally { release(h); await close(h); }
 });
 
 test("U8 AE8 approved shared nondefault PR grouping creates one fenced obligation and reconciles persisted ack", async () => {
-  const h = makeHarness("handoff"), controllerStatePath = join(h.root, "controller-state.json"); let handoffs = 0;
+  const h = makeHarness("handoff"), controllerStatePath = join(h.root, "controller-state.json"), controllerCallsPath = join(h.provider.root, "controller-calls.jsonl"), gitMutationsPath = join(h.provider.root, "git-mutations.jsonl"); let handoffs = 0;
   type ControllerState = { view?: { pr: string; owner: { kind: "feature" | "execution" | "session"; id: string; generation: string }; worktree: string; head: string; state: "waiting_review" | "merged"; pendingCount: number }; acknowledgement?: { requestId: string; controllerId: string; obligationId: string; generation: string; acceptedAt: number } };
   const readControllerState = (): ControllerState => existsSync(controllerStatePath) ? JSON.parse(readFileSync(controllerStatePath, "utf8")) as ControllerState : {};
   const writeControllerState = (value: ControllerState) => writeFileSync(controllerStatePath, JSON.stringify(value));
   const controller = {
     handoff(request: any) {
       handoffs++;
+      appendFileSync(controllerCallsPath, `${JSON.stringify({ action: "handoff", requestId: request.id, head: request.head, worktree: request.worktree })}\n`);
       writeControllerState({ view: { pr: "github.com/acme/e2e#7", owner: request.owner, worktree: request.worktree, head: "unacknowledged-controller-head", state: "waiting_review", pendingCount: 0 } });
       return { ok: true, state: "waiting_review" as const };
     },
@@ -422,11 +520,11 @@ test("U8 AE8 approved shared nondefault PR grouping creates one fenced obligatio
     const started = await bridge.run(h.planPath, { token: first.preview.token, capacity: 6, publication: true, publicationRepository: "github.com/acme/e2e", approvedBy: h.sessionFile, approvedAt: Date.now() }); assert.equal(started.kind, "started", JSON.stringify(started)); release(h);
     await eventually(() => bridge.store.read(), state => state.tasks.filter(t => t.phase === "succeeded").length === 6 && state.deliveries.some(d => d.groupId === "shared-review" && d.phase === "handoff-pending"), "persisted handoff before acknowledgement");
     assert.equal(handoffs, 1); assert.equal(bridge.store.read().deliveries[0]!.acknowledgement, undefined);
-    const request = bridge.store.read().deliveries[0]!.handoff!; const persistedView = readControllerState().view!; writeControllerState({ ...readControllerState(), view: { ...persistedView, head: request.head }, acknowledgement: { requestId: request.id, controllerId: "e2e-controller", obligationId: digest([{ host: "github.com", owner: "acme", repo: "e2e", number: "7" }, persistedView.owner, persistedView.worktree, request.head]), generation: request.generation, acceptedAt: 1 } });
+    const request = bridge.store.read().deliveries[0]!.handoff!; const deliveryHead = request.head; const persistedView = readControllerState().view!; const controllerCallsBefore = ledger(controllerCallsPath); const gitMutationsBefore = ledger(gitMutationsPath); assert.equal(controllerCallsBefore.length, 1); assert.ok(gitMutationsBefore.length > 0); writeControllerState({ ...readControllerState(), view: { ...persistedView, head: request.head }, acknowledgement: { requestId: request.id, controllerId: "e2e-controller", obligationId: digest([{ host: "github.com", owner: "acme", repo: "e2e", number: "7" }, persistedView.owner, persistedView.worktree, request.head]), generation: request.generation, acceptedAt: 1 } });
     h.provider.emit(PR_REVIEW_RECONCILED_EVENT, { pr: request.pr }); await eventually(() => bridge.store.read(), state => state.deliveries[0]!.phase === "controller-owned", "controller-reconciled persisted acknowledgement");
     const startsBeforeMerge = h.provider.events().filter(e => e.event === "start" && e.mode === "worker").length;
     writeControllerState({ ...readControllerState(), view: { ...readControllerState().view!, state: "merged" } }); h.provider.emit(PR_REVIEW_RECONCILED_EVENT, { pr: request.pr }); await eventually(() => bridge.store.read(), state => state.deliveries[0]!.phase === "merged", "verified merge after controller reconciliation");
-    const actualRun = h.provider.events().find(e => e.event === "end" && e.taskId === "b1")!; h.provider.emit("subagent:async-complete", { runId: actualRun.runId, sessionId, mode: "single", success: true }); h.provider.emit("subagent:async-complete", { runId: actualRun.runId, sessionId, mode: "single", success: true }); await bridge.scheduler.reconcile(); assert.equal(handoffs, 1); assert.equal(h.provider.events().filter(e => e.event === "start" && e.mode === "worker").length, startsBeforeMerge); assert.equal(bridge.store.read().deliveries.length, 1);
+    const actualRun = h.provider.events().find(e => e.event === "end" && e.taskId === "b1")!; h.provider.emit("subagent:async-complete", { runId: actualRun.runId, sessionId, mode: "single", success: true }); h.provider.emit(PR_REVIEW_RECONCILED_EVENT, { pr: request.pr }); h.provider.emit("subagent:async-complete", { runId: actualRun.runId, sessionId, mode: "single", success: true }); h.provider.emit(PR_REVIEW_RECONCILED_EVENT, { pr: request.pr }); await bridge.scheduler.reconcile(); assert.equal(handoffs, 1); assert.equal(ledger(controllerCallsPath).length, controllerCallsBefore.length); assert.deepEqual(ledger(gitMutationsPath), gitMutationsBefore); assert.equal(h.provider.events().filter(e => e.event === "start" && e.mode === "worker").length, startsBeforeMerge); assert.equal(bridge.store.read().deliveries.length, 1); assert.equal(bridge.store.read().deliveries[0]!.handoff!.head, deliveryHead); assert.equal(readControllerState().view!.head, deliveryHead); writeGateEvidence(h, "ae8-ledgers", { controllerCalls: ledger(controllerCallsPath).length, gitMutations: ledger(gitMutationsPath).length, deliveryHead, unchangedAfterDuplicateReorderedNotifications: true });
   } finally { release(h); retainHarnessEvidence(h); await bridge.shutdown(); await h.provider.dispose(); }
 });
 

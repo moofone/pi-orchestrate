@@ -13,8 +13,8 @@ for n in 1 2 3; do
 rtk pnpm run check
 ```
 
-The E2E command must report `16/16` three times. `pnpm run check` must report `722/722` (including the E2E file). Do not add `--test-concurrency=1`; the default E2E run is the race gate.
+The E2E command must report `19/19` three times. `pnpm run check` must report `725/725` (including the E2E file). Do not add `--test-concurrency=1`; the default E2E run is the race gate.
 
-`U8_EVIDENCE_ROOT` makes every disposable repository, workspace, provider run, PID/interval log, state snapshot, and failure artifact named and retained. The collector tests cover legacy `scope: ["."]`, exact-file and trailing-directory scopes, and absolute/traversal/out-of-scope/foreign evidence. AE9 runs the real selectable legacy preset through review → TDD → QA → delivery.
+`U8_EVIDENCE_ROOT` makes every disposable repository, workspace, provider run, PID/interval log, state snapshot, and failure artifact named and retained. New gate artifacts include AE5 revision/approval ledgers, AE6 old-instance reply and controller restart ledgers, AE7 controller lifecycle, AE8 public pause, and AE8 duplicate/reordered notification ledgers. The collector tests cover legacy `scope: ["."]`, exact-file and trailing-directory scopes, and absolute/traversal/out-of-scope/foreign evidence. AE9 runs the real selectable legacy preset through review → TDD → QA → delivery.
 
 If a run fails, preserve the evidence root and inspect `index.jsonl`, each run's `evidence-index.json`, `provider/children.jsonl`, `provider/rpc-events.jsonl`, `provider/git-commands.jsonl`, and `state/`. Never clean the fixture directories while diagnosing a failure.

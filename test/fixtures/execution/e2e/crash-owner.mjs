@@ -73,7 +73,10 @@ if (args.length < 8) {
   const runGit = (cwd, argv) => new Promise(resolve => {
     const helper = argv[0] === "wt", executable = helper ? "/Users/greg/.local/bin/ghl-wt" : "git", actual = helper ? argv.slice(1) : argv;
     execFile(executable, actual, { cwd, encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_AUTHOR_NAME: "Crash owner", GIT_AUTHOR_EMAIL: "crash-owner@example.test", GIT_COMMITTER_NAME: "Crash owner", GIT_COMMITTER_EMAIL: "crash-owner@example.test" } }, (error, stdout, stderr) => {
-      appendJson("git-commands.jsonl", { cwd, argv, code: error ? (typeof error.code === "number" ? error.code : -1) : 0, at: Date.now() }); resolve({ code: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout: String(stdout), stderr: String(stderr) });
+      const code = error ? (typeof error.code === "number" ? error.code : -1) : 0;
+      appendJson("git-commands.jsonl", { cwd, argv, code, at: Date.now() });
+      if (["wt", "add", "commit", "cherry-pick", "merge", "reset", "checkout", "update-ref"].includes(argv[0])) appendJson("git-mutations.jsonl", { cwd, argv, code, at: Date.now() });
+      resolve({ code, stdout: String(stdout), stderr: String(stderr) });
     });
   });
   const source = { path: planPath, bytes: readFileSync(planPath, "utf8"), digest: sourceDigest(readFileSync(planPath, "utf8")) };
@@ -94,7 +97,7 @@ if (args.length < 8) {
     status() { const value = controllerState(); return value.view ? [value.view] : []; },
   };
   const delivery = scenario === "controller" ? {
-    handoff: async request => { const value = controllerState(); value.view ??= { pr: request.pr.repo + "#" + request.pr.number, owner: { kind: request.ownerKind ?? "execution", id: request.ownerId, generation: request.generation }, worktree: request.workspace.path, head: request.head, state: "waiting_review", pendingCount: 0 }; value.acknowledgement ??= { requestId: request.id, controllerId: "crash-controller", obligationId: digest([request.pr, value.view.owner, value.view.worktree, request.head]), generation: request.generation, acceptedAt: Date.now() }; value.acknowledgement.requestId = request.id; writeJson("controller-state.json", value); if (!resume) { if (mode === "controller") await checkpoint("controller-persist-before-local-ack", { requestId: request.id, lockExists: existsSync(lockPath) }); } return { kind: "accepted", acknowledgement: value.acknowledgement }; },
+    handoff: async request => { const value = controllerState(); appendJson("controller-calls.jsonl", { action: "handoff", requestId: request.id, head: request.head, worktree: request.workspace.path, at: Date.now() }); value.view ??= { pr: request.pr.repo + "#" + request.pr.number, owner: { kind: request.ownerKind ?? "execution", id: request.ownerId, generation: request.generation }, worktree: request.workspace.path, head: request.head, state: "waiting_review", pendingCount: 0 }; value.acknowledgement ??= { requestId: request.id, controllerId: "crash-controller", obligationId: digest([request.pr, value.view.owner, value.view.worktree, request.head]), generation: request.generation, acceptedAt: Date.now() }; value.acknowledgement.requestId = request.id; writeJson("controller-state.json", value); if (!resume) { if (mode === "controller") await checkpoint("controller-persist-before-local-ack", { requestId: request.id, lockExists: existsSync(lockPath) }); } return { kind: "accepted", acknowledgement: value.acknowledgement }; },
     observe: async request => { const value = controllerState(); return value.acknowledgement ? { kind: "accepted", acknowledgement: value.acknowledgement } : { kind: "unknown", reason: "Controller acknowledgement unavailable" }; },
   } : undefined;
   const checks = scenario === "integration" ? {
