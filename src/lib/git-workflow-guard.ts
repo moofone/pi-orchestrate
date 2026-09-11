@@ -172,8 +172,11 @@ type LexFrame = { segments: ShellSegment[]; next: number };
  * bare subshells are lexed recursively, so a git/gh command hidden inside one
  * stays visible to the classifier instead of dissolving into an opaque token
  * (round-1 P1: a substitution could run a worktree add or a pr merge with no
- * guard verdict). Unterminated substitutions and quoting return undefined so
- * callers fail closed. `closer` bounds a nested frame: ")" must be closed by
+ * guard verdict). Inside double quotes both $(...) and backticks still
+ * execute, so they recurse there too (round-2 P1: `git worktree add …`
+ * inside double quotes was appended to the token and never classified).
+ * Unterminated substitutions and quoting return undefined so callers fail
+ * closed. `closer` bounds a nested frame: ")" must be closed by
  * the matching paren, "`" stops exactly at the closing backtick (which must
  * therefore never be re-lexed as an opener). */
 function lexShellCommands(src: string, start: number, closer: ")" | "`" | undefined, bound: number): LexFrame | undefined {
@@ -195,6 +198,16 @@ function lexShellCommands(src: string, start: number, closer: ")" | "`" | undefi
 				if (!nested) return undefined;
 				spliceNested(nested);
 				i = nested.next - 1;
+			} else if (quote === '"' && char === "`") {
+				// legacy backtick substitution executes inside double quotes too;
+				// recurse exactly like $(), and an unterminated backtick fails
+				// closed (round-2 P1)
+				const end = src.indexOf("`", i + 1);
+				if (end === -1) return undefined;
+				const nested = lexShellCommands(src, i + 1, "`", end);
+				if (!nested) return undefined;
+				spliceNested(nested);
+				i = end;
 			} else token += char;
 			continue;
 		}
@@ -500,12 +513,27 @@ export function classifyForRole(
 		const blocked = writerBlock(command);
 		if (blocked) return blocked;
 	}
-	if (reservedParent && (isWorktreeMutation(command) || isLifecycleMutation(command))) {
-		return {
-			block: true,
-			reason:
-				"a fixer holds this worktree; the parent must not mutate it. The controller publishes after the child settles.",
-		};
+	if (reservedParent) {
+		// Both mutation fences below parse the command, so a lexer failure made
+		// them return false and the command fell through to the workflow
+		// classifier, which only fails closed on text it recognises as a
+		// workflow executable. An unparseable command cannot be proven
+		// read-only, so it is rejected whenever a reserved workspace is
+		// involved (round-2 P1).
+		if (gitInvocations(stripComments(command)) === undefined) {
+			return {
+				block: true,
+				reason:
+					"Unsupported shell syntax; a reserved workspace is never cleared for a command this guard cannot parse. Split the command into supported, bounded invocations.",
+			};
+		}
+		if (isWorktreeMutation(command) || isLifecycleMutation(command)) {
+			return {
+				block: true,
+				reason:
+					"a fixer holds this worktree; the parent must not mutate it. The controller publishes after the child settles.",
+			};
+		}
 	}
 	return classifyGitWorkflowCommand(command);
 }

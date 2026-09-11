@@ -777,6 +777,113 @@ test("registered guard fails closed when identity or reservation lookup throws",
 	}
 });
 
+/* ---------------------------------------------------------------- *
+ * Round-2 P1 (grok) — inside double quotes a backtick was appended to
+ * the current token instead of lexed, but bash still executes it as
+ * command substitution: echo "`git worktree add …`" ran a raw worktree
+ * add (and the `gh pr merge` / ghl-pr-land spellings ran lifecycle
+ * mutations) while gitInvocations/hasGhSequence never saw a git/gh
+ * token, so classifyGitWorkflowCommand fell through to allow. Backticks
+ * inside double quotes must be lexed recursively exactly like $(...),
+ * and an unterminated backtick must fail closed. Classify-only; these
+ * commands are never executed.
+ * ---------------------------------------------------------------- */
+
+test("blocks backtick substitutions hidden inside double quotes", () => {
+	assert.match(blocked('echo "`git worktree add ../ice-wt/sub -b sub`"'), /git wt/);
+	assert.match(blocked('echo "`gh pr merge 13 --admin`"'), /git pr-await 13/);
+	assert.match(blocked('echo "`git status'), /Unsupported shell syntax/);
+	// the writer guard sees the nested push behind the quotes
+	const writer = classifyForRole('git commit -m "`git push --force origin main`"', { writer: true });
+	assert.equal(writer.block, true, "a writer child must not run a double-quoted backtick push");
+	assert.match(String((writer as { reason?: string }).reason ?? ""), /writer child/);
+	// the reserved-parent fence sees a lifecycle binary behind the quotes
+	const reserved = classifyForRole('echo "`/opt/ghl/bin/ghl-pr-land 13`"', { writer: false, writerReserved: true });
+	assert.equal(reserved.block, true, "a reserved parent must not land through double-quoted backticks");
+	assert.match(String((reserved as { reason?: string }).reason ?? ""), /must not mutate/);
+	// benign double-quoted substitutions stay allowed
+	allowed('echo "`date`"');
+	allowed('git commit -m "rev `git rev-parse --short HEAD`"');
+});
+
+/* ---------------------------------------------------------------- *
+ * Round-2 P1 (codex) — isWorktreeMutation/isLifecycleMutation return
+ * false when the lexer cannot parse the command, so the reserved-parent
+ * fence was skipped and an unparseable mutation (valid shell syntax
+ * this lexer does not model — here a heredoc whose body opens a quote,
+ * hiding the git token behind an unanchored quote character) fell
+ * through to classifyGitWorkflowCommand, which only fails closed on
+ * text it recognises as a workflow executable. An unparseable command
+ * must be rejected whenever a reserved workspace is involved;
+ * parseable read-only commands stay allowed. Classify-only; never run.
+ * ---------------------------------------------------------------- */
+
+test("unparseable commands are rejected for a reserved parent (classifyForRole)", () => {
+	const unparseable = "cd /reserved && 'git' commit -m ok <<EOF\n\"unterminated\nEOF";
+	assert.equal(
+		classifyGitWorkflowCommand(unparseable).block,
+		false,
+		"precondition: the general classifier alone lets this unparseable mutation through",
+	);
+	for (const opts of [{ writer: false, writerReserved: true }, { writer: false, executionRole: "parent" as const }]) {
+		const verdict = classifyForRole(unparseable, opts);
+		assert.equal(verdict.block, true, "an unparseable command must fail closed against a reserved workspace");
+		assert.match(String((verdict as { reason?: string }).reason ?? ""), /Unsupported shell syntax/);
+	}
+	// parseable read-only commands stay allowed for a reserved parent
+	assert.equal(classifyForRole("git status", { writer: false, writerReserved: true }).block, false);
+	assert.equal(classifyForRole("git log -1", { writer: false, executionRole: "parent" }).block, false);
+});
+
+test("registered guard rejects an unparseable command in a reserved workspace", async () => {
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-unparseable-home-")));
+	const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });
+	const ownerSession = join(home, "owner.jsonl");
+	writeFileSync(ownerSession, JSON.stringify({ type: "session", id: "owner-header-1" }) + "\n");
+	const executionRoot = join(home, "orchestrator", "plan-driven-v1", "execution");
+	const registeredStateDir = join(executionRoot, "repo"); mkdirSync(registeredStateDir, { recursive: true });
+	writeFileSync(join(registeredStateDir, "coordinator.json"), JSON.stringify({
+		reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
+		attempts: [{ id: "attempt-1", ownerSessionFile: ownerSession, workspace: { id: "workspace-1", path: workspace }, run: { runId: "run-1", ownerSessionFile: ownerSession } }],
+		deliveries: [],
+	}));
+	const previous: Record<string, string | undefined> = {
+		HOME: process.env.HOME,
+		PI_EXECUTION_STATE_ROOT: process.env.PI_EXECUTION_STATE_ROOT,
+		PI_SUBAGENT_RUN_ID: process.env.PI_SUBAGENT_RUN_ID,
+		PI_SUBAGENT_PARENT_SESSION: process.env.PI_SUBAGENT_PARENT_SESSION,
+		PI_SUBAGENT_CHILD_AGENT: process.env.PI_SUBAGENT_CHILD_AGENT,
+		ORCHESTRATE_ROLE: process.env.ORCHESTRATE_ROLE,
+		[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]: process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV],
+	};
+	try {
+		let handler: ((event: any) => Promise<any>) | undefined;
+		guardExtension({ on(name: string, fn: any) { if (name === "tool_call") handler = fn; } } as unknown as ExtensionAPI);
+		assert.ok(handler);
+		process.env.HOME = home;
+		process.env.PI_EXECUTION_STATE_ROOT = executionRoot;
+		delete process.env.PI_SUBAGENT_RUN_ID; delete process.env.PI_SUBAGENT_PARENT_SESSION;
+		delete process.env.PI_SUBAGENT_CHILD_AGENT;
+		delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]; delete process.env.ORCHESTRATE_ROLE;
+		// controls: the plain mutation is fenced by role, read-only stays allowed
+		const plain = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m ok" } });
+		assert.equal(plain?.block ?? false, true, "control: a reserved parent may not commit in the workspace");
+		const read = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status" } });
+		assert.equal(read?.block ?? false, false, "control: parseable read-only commands stay allowed");
+		// the unparseable spelling (lexer fails on the heredoc body quote; the
+		// workflow-executable regex misses the quoted 'git') must fail closed.
+		const unparseable = "'git' commit -m ok <<EOF\n\"unterminated\nEOF";
+		const fenced = await handler!({ toolName: "bash", cwd: workspace, input: { command: unparseable } });
+		assert.equal(fenced?.block ?? false, true, "an unparseable command in a reserved workspace fails closed");
+		assert.match(String((fenced as { reason?: string }).reason ?? ""), /Unsupported shell syntax/);
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
 test("mutationTargetDirs includes --work-tree and --git-dir", () => {
   assert.ok(
     mutationTargetDirs(
