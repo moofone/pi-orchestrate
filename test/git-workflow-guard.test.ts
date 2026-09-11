@@ -136,6 +136,66 @@ test("writer restrictions see workflow commands hidden inside substitutions", ()
 	assert.equal(classifyForRole('git commit -m "built $(date)"', { writer: true }).block, false);
 });
 
+/* ---------------------------------------------------------------- *
+ * Round-2 P1 (codex) — `git worktree` parses its own options before
+ * the subcommand (`git worktree -q add`, `git worktree --force
+ * remove`), so the action is not always args[0]. The general
+ * classifier, the writer guard, and the reserved-parent fence all
+ * allowed a raw worktree create/remove that led with an option.
+ * ---------------------------------------------------------------- */
+
+test("blocks worktree mutations whose action follows pre-subcommand options", () => {
+	assert.match(blocked("git worktree -q add ../ice-wt/sub -b sub"), /git wt/);
+	assert.match(blocked("git worktree --force remove /Users/greg/Dev/git/ice-wt/foo"), /git wt-rm/);
+	assert.match(blocked("git worktree -v --force prune"), /git wt-rm/);
+	assert.match(blocked("git worktree --path-format absolute add ../ice-wt/sub -b sub"), /git wt/);
+	assert.match(blocked("git worktree --path-format=relative prune"), /git wt-rm/);
+	// the plain forms stay blocked
+	assert.match(blocked("git worktree add ../ice-wt/sub -b sub"), /git wt/);
+	assert.match(blocked("git worktree prune"), /git wt-rm/);
+	// read-only worktree invocations with pre-subcommand options stay allowed
+	allowed("git worktree -q list");
+	allowed("git worktree -v --path-format absolute list");
+});
+
+test("writer and reserved-parent guards parse worktree actions that follow options", () => {
+	for (const command of [
+		"git worktree -q add ../later -b later",
+		"git worktree --force remove ../later",
+		"echo $(git worktree -q add ../later -b later)",
+	]) {
+		const verdict = classifyForRole(command, { writer: true });
+		assert.equal(verdict.block, true, `a writer child must not run: ${command}`);
+		assert.match(
+			String((verdict as { reason?: string }).reason ?? ""),
+			/never creates or removes a worktree/,
+			`the block must come from the writer path: ${command}`,
+		);
+	}
+	assert.equal(
+		classifyForRole("git worktree -v list", { writer: true }).block,
+		false,
+		"read-only worktree listing stays allowed for a writer",
+	);
+	for (const command of ["git worktree -q add ../later -b later", "git worktree --force remove ../later"]) {
+		assert.equal(
+			classifyForRole(command, { writer: false, writerReserved: true }).block,
+			true,
+			`a reserved parent must not run: ${command}`,
+		);
+		assert.equal(
+			classifyForRole(command, { writer: false, executionRole: "parent" }).block,
+			true,
+			`an execution-reserved parent must not run: ${command}`,
+		);
+	}
+	assert.equal(
+		classifyForRole("git worktree -q list", { writer: false, writerReserved: true }).block,
+		false,
+		"read-only worktree listing stays allowed for a reserved parent",
+	);
+});
+
 test("blocks a prohibited worktree operation after a read-only worktree segment", () => {
 	const command = "git worktree list && git worktree add ../ice-wt/later -b later";
 	assert.match(blocked(command), /git wt/);
@@ -464,6 +524,81 @@ test("registered guard accepts only runtime-bound attempt, run, and session-head
     }
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+/* ---------------------------------------------------------------- *
+ * Round-2 P1 (grok) — the registered guard fail-opens when identity
+ * or reservation lookup throws: the catch reset only writerReserved,
+ * so executionRole stayed unset (or stayed "worker" from a partial
+ * assignment) and classifyForRole fell back to ordinary git rules —
+ * a git commit inside a reserved worker workspace was allowed
+ * exactly when the fence was unverifiable. Lookup failure must fail
+ * closed as a reserved parent.
+ * ---------------------------------------------------------------- */
+
+test("registered guard fails closed when identity or reservation lookup throws", async () => {
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-lookup-home-")));
+	const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });
+	const ownerSession = join(home, "owner.jsonl");
+	writeFileSync(ownerSession, JSON.stringify({ type: "session", id: "owner-header-1" }) + "\n");
+	const executionRoot = join(home, "orchestrator", "plan-driven-v1", "execution");
+	const stateDir = join(executionRoot, "repo"); mkdirSync(stateDir, { recursive: true });
+	writeFileSync(join(stateDir, "coordinator.json"), JSON.stringify({
+		reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
+		attempts: [{ id: "attempt-1", ownerSessionFile: ownerSession, workspace: { id: "workspace-1", path: workspace }, run: { runId: "run-1", ownerSessionFile: ownerSession } }],
+		deliveries: [],
+	}));
+	// Regular files where directory creation/reads must happen: mkdirSync in
+	// createReviewStore and readdirSync over PI_EXECUTION_STATE_ROOT both throw.
+	const latchStateFile = join(home, "latch-state-file"); writeFileSync(latchStateFile, "not a directory\n");
+	const executionStateFile = join(home, "execution-state-file"); writeFileSync(executionStateFile, "not a directory\n");
+	const previous: Record<string, string | undefined> = {
+		HOME: process.env.HOME,
+		PI_EXECUTION_STATE_ROOT: process.env.PI_EXECUTION_STATE_ROOT,
+		GHL_LATCH_STATE_DIR: process.env.GHL_LATCH_STATE_DIR,
+		PI_SUBAGENT_RUN_ID: process.env.PI_SUBAGENT_RUN_ID,
+		PI_SUBAGENT_PARENT_SESSION: process.env.PI_SUBAGENT_PARENT_SESSION,
+		PI_SUBAGENT_CHILD_AGENT: process.env.PI_SUBAGENT_CHILD_AGENT,
+		ORCHESTRATE_ROLE: process.env.ORCHESTRATE_ROLE,
+		[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]: process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV],
+	};
+	try {
+		let handler: ((event: any) => Promise<any>) | undefined;
+		guardExtension({ on(name: string, fn: any) { if (name === "tool_call") handler = fn; } } as unknown as ExtensionAPI);
+		assert.ok(handler);
+		process.env.HOME = home;
+		process.env.PI_EXECUTION_STATE_ROOT = executionRoot;
+		delete process.env.GHL_LATCH_STATE_DIR;
+		process.env.PI_SUBAGENT_CHILD_AGENT = "tdd-worker";
+		process.env.PI_SUBAGENT_RUN_ID = "run-1";
+		process.env.PI_SUBAGENT_PARENT_SESSION = "owner-header-1";
+		delete process.env.ORCHESTRATE_ROLE;
+		process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header-1" } });
+		// Positive control: with healthy lookups a verified worker may commit in
+		// its own reserved workspace, and read-only commands always stay allowed.
+		const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m own" } });
+		assert.equal(own?.block ?? false, false, "control: a verified worker may commit when lookups succeed");
+		// Break createReviewStore: GHL_LATCH_STATE_DIR is a regular file, so the
+		// store's mkdirSync throws after executionRole was already resolved.
+		process.env.GHL_LATCH_STATE_DIR = latchStateFile;
+		const storeFailure = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m store-failed" } });
+		assert.equal(storeFailure?.block ?? false, true, "a review-store failure must fail closed instead of allowing the commit");
+		const storeRead = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status" } });
+		assert.equal(storeRead?.block ?? false, false, "read-only commands stay allowed when the store lookup fails closed");
+		// Break the durable-state scan itself: a non-directory
+		// PI_EXECUTION_STATE_ROOT makes readdirSync throw before any role resolves.
+		delete process.env.GHL_LATCH_STATE_DIR;
+		process.env.PI_EXECUTION_STATE_ROOT = executionStateFile;
+		const scanFailure = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m scan-failed" } });
+		assert.equal(scanFailure?.block ?? false, true, "a durable-state scan failure must fail closed instead of allowing the commit");
+		const scanRead = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git log -1" } });
+		assert.equal(scanRead?.block ?? false, false, "read-only commands stay allowed when the scan fails closed");
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+		rmSync(home, { recursive: true, force: true });
+	}
 });
 
 test("mutationTargetDirs includes --work-tree and --git-dir", () => {

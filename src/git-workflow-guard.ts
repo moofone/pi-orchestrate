@@ -68,7 +68,12 @@ export default function (pi: ExtensionAPI) {
 			const store = createReviewStore(stateDir());
 			writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
 		} catch {
+			// Lookup failure must not degrade to ordinary git rules: that would
+			// allow a commit inside a reserved worker workspace exactly when the
+			// fence is unverifiable. Fail closed as a reserved parent — mutations
+			// are fenced, read-only commands still pass.
 			writerReserved = false;
+			executionRole = "parent";
 		}
 		// A writer label without exact execution proof is treated as an
 		// untrusted caller for reserved workspaces. Keep label-based publication

@@ -294,6 +294,31 @@ function gitInvocations(command: string): { segments: ShellSegment[]; git: GitIn
 	return { segments, git };
 }
 
+const WORKTREE_MUTATION_ACTIONS = new Set(["add", "remove", "prune", "move"]);
+/** Pre-subcommand `git worktree` options that consume a space-separated value. */
+const WORKTREE_VALUE_OPTIONS = new Set(["--path-format"]);
+
+/** `git worktree` parses its own options before the subcommand (`git worktree
+ * -q add`, `git worktree --force remove`), so the action is not always
+ * args[0]. Return the action: the first positional argument, skipping option
+ * tokens (and the space-separated value of a known value option); everything
+ * after `--` is positional. */
+function worktreeAction(args: readonly string[]): string | undefined {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (arg === "--") return args[i + 1];
+		if (WORKTREE_VALUE_OPTIONS.has(arg)) { i++; continue; }
+		if (arg.startsWith("-")) continue;
+		return arg;
+	}
+	return undefined;
+}
+
+/** A raw `git worktree add/remove/prune/move` under any option spelling. */
+function isRawWorktreeMutation(invocation: GitInvocation): boolean {
+	return invocation.verb === "worktree" && WORKTREE_MUTATION_ACTIONS.has(worktreeAction(invocation.args) ?? "");
+}
+
 const GH_GLOBAL_VALUE_OPTIONS = new Set(["--repo", "--hostname", "--git-protocol", "--jq", "--template", "--limit", "--state", "--json"]);
 
 function hasGhSequence(segments: ShellSegment[], sequence: string[]): boolean {
@@ -329,9 +354,9 @@ export function classifyGitWorkflowCommand(command: string): GuardVerdict {
 	const git = parsed?.git ?? [];
 	const hasPrPoll = git.some(invocation => invocation.verb === "pr-poll") || hasToken(segments, "ghl-pr-poll");
 	if (hasPrPoll) return { block: true, reason: `git pr-poll is retired. Use ${awaitHint(text)} once, then stop. The latch wakes this session.` };
-	const worktree = git.find(invocation => invocation.verb === "worktree" && ["add", "remove", "prune", "move"].includes(invocation.args[0] ?? ""));
+	const worktree = git.find(isRawWorktreeMutation);
 	if (worktree) {
-		return { block: true, reason: worktree.args[0] === "add" ? `raw git worktree add is blocked. Use ${RUST.wt} (ghl-wt).` : `raw git worktree remove/prune is blocked. Use ${RUST.rm} (ghl-wt-rm).` };
+		return { block: true, reason: worktreeAction(worktree.args) === "add" ? `raw git worktree add is blocked. Use ${RUST.wt} (ghl-wt).` : `raw git worktree remove/prune is blocked. Use ${RUST.rm} (ghl-wt-rm).` };
 	}
 	if (hasGhSequence(segments, ["pr", "merge"])) return { block: true, reason: `gh pr merge is blocked (including --admin). The waiter lands. Use ${awaitHint(text)} once, then stop.` };
 	const hasView = hasGhSequence(segments, ["pr", "view"]) || hasGhSequence(segments, ["pr", "checks"]) || hasGhSequence(segments, ["pr", "status"]) || hasGhSequence(segments, ["run", "watch"])
@@ -377,7 +402,7 @@ function writerBlock(command: string): GuardVerdict | undefined {
 	const parsed = gitInvocations(stripComments(command)), git = parsed?.git ?? [], segments = parsed?.segments ?? [];
 	if (git.some(invocation => invocation.verb === "pr-await") || segments.some(segment => segment.includes("ghl-pr-await"))) return { block: true, reason: "a writer child never waits on the review. Settle with your handoff; code runs git pr-await once, from the parent." };
 	if (git.some(invocation => invocation.verb === "pr-land") || segments.some(segment => segment.includes("ghl-pr-land")) || hasGhSequence(segments, ["pr", "merge"])) return { block: true, reason: "a writer child never lands the PR. Code lands it when the waiter says so." };
-	const rawWorktree = git.some(invocation => invocation.verb === "worktree" && ["add", "remove", "prune", "move"].includes(invocation.args[0] ?? ""));
+	const rawWorktree = git.some(isRawWorktreeMutation);
 	if (rawWorktree || git.some(invocation => invocation.verb === "wt" || invocation.verb === "wt-rm") || segments.some(segment => segment.includes("ghl-wt") || segment.includes("ghl-wt-rm"))) return { block: true, reason: "a writer child never creates or removes a worktree. You were given one; work in it." };
 	if (["create", "comment", "edit", "close", "reopen", "ready"].some(action => hasGhSequence(segments, ["pr", action]))) return { block: true, reason: "a writer child never speaks on the PR. Put it in your handoff; code opens the PR and posts on it." };
 	if (git.some(invocation => invocation.verb === "push")) return { block: true, reason: "a writer child commits; code pushes. Commit your work and settle — the push is one per round, from the parent." };
