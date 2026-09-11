@@ -2622,10 +2622,13 @@ export function applySpawnPolicy(params: Record<string, unknown>): {
   return worst;
 }
 
-/** Parent-model `subagent` tool path — mutate input on pin, `{block}` on reject. */
+/**
+ * Orchestrate-only children on the parent `subagent` tool path.
+ * `tdd-worker` and `fixer` are shared with solo sessions (ad-hoc TDD, and
+ * git-workflow `read_comments_and_fix`). `/orchestrate` still launches them
+ * over RPC; `applySpawnPolicy` still pins their model/caps.
+ */
 const PARENT_FORBIDDEN_AGENTS = new Set([
-  "tdd-worker",
-  "fixer",
   "feature-qa",
   "qa-opus",
   "plan-reviewer",
