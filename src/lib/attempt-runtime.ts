@@ -76,6 +76,11 @@ export function createAttemptRuntime(options: AttemptRuntimeOptions): AttemptRun
   const reply = await rpc("ping"); ping = record(reply.data); const caps = record(ping.capabilities), methods = Array.isArray(ping.methods) ? ping.methods : [];
   const available = reply.success === true && ping.version === 1 && caps.asyncSpawn === true && ["spawn", "status"].every(m => methods.includes(m));
   capabilities = { available, capacity: available ? options.capacity : 0, durableOperationLookup: available && methods.includes("lookup") && record(caps.durableSpawn).version === 1 && record(caps.durableSpawn).lookup === true,
+   // Same-run control is stop-only by the public RPC v1 contract: it defines no
+   // pause method, and its resume re-engages a run with a required message (never
+   // a same-run un-pause). Coordinator pause/resume are durable intents
+   // (scheduler.applyControl) and never reach runtime.control, so nothing else
+   // may be advertised here.
    controls: caps.stop === true && methods.includes("stop") ? ["stop"] : [], profiles: [...new Set([...nativeKeys, ...(options.profileEncoder?.keys ?? [])])],
    ...(options.remainingBudget !== undefined ? { remainingBudget: options.remainingBudget } : {}), ...(options.callerTools ? { callerTools: options.callerTools } : {}), ...(options.callerAgents ? { callerAgents: options.callerAgents } : {}), ...(!available ? { reason: "Detached event RPC unavailable" } : {}) };
   return structuredClone(capabilities);

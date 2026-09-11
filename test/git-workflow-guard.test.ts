@@ -590,6 +590,65 @@ test("registered guard keeps a parent and forged attempt identity out of a reser
   }
 });
 
+test("registered guard denies push for a writer label without execution proof and on failed lookups", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-writer-reserved-home-")));
+  const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });
+  const ownerSession = join(home, "owner.jsonl");
+  writeFileSync(ownerSession, JSON.stringify({ type: "session", id: "owner-header-1" }) + "\n");
+  const executionRoot = join(home, "orchestrator", "plan-driven-v1", "execution");
+  const stateDir = join(executionRoot, "repo"); mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, "coordinator.json"), JSON.stringify({
+    reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
+    attempts: [{ id: "attempt-1", ownerSessionFile: ownerSession, workspace: { id: "workspace-1", path: workspace }, run: { runId: "run-1", ownerSessionFile: ownerSession } }],
+    deliveries: [],
+  }));
+  const previous = {
+    HOME: process.env.HOME,
+    STATE: process.env.PI_EXECUTION_STATE_ROOT,
+    AGENT: process.env.PI_SUBAGENT_CHILD_AGENT,
+    RUN: process.env.PI_SUBAGENT_RUN_ID,
+    PARENT: process.env.PI_SUBAGENT_PARENT_SESSION,
+    BINDINGS: process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV],
+    ROLE: process.env.ORCHESTRATE_ROLE,
+  };
+  process.env.HOME = home; process.env.PI_EXECUTION_STATE_ROOT = executionRoot;
+  process.env.PI_SUBAGENT_CHILD_AGENT = "tdd-worker";
+  delete process.env.PI_SUBAGENT_RUN_ID; delete process.env.PI_SUBAGENT_PARENT_SESSION;
+  delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]; delete process.env.ORCHESTRATE_ROLE;
+  try {
+    let handler: ((event: any) => Promise<any>) | undefined;
+    guardExtension({ on(name: string, fn: any) { if (name === "tool_call") handler = fn; } } as unknown as ExtensionAPI);
+    assert.ok(handler);
+    // Writer label, reserved workspace, no runtime-bound execution proof: the
+    // hook falls back to the reserved-parent role, and that fence must keep
+    // denying publication (push) exactly as it denies commits.
+    const push = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git push origin HEAD" } });
+    assert.equal(push?.block ?? false, true, "an unverified writer must not publish from a reserved workspace");
+    const commit = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m x" } });
+    assert.equal(commit?.block ?? false, true, "commits stay fenced for an unverified reserved caller");
+    const view = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status" } });
+    assert.equal(view?.block ?? false, false, "read-only commands still pass");
+    // A failed identity lookup fails closed to the same publication fence.
+    const unreadable = join(home, "state-root-file");
+    writeFileSync(unreadable, "{}");
+    process.env.PI_EXECUTION_STATE_ROOT = unreadable;
+    const failedPush = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git push origin HEAD" } });
+    assert.equal(failedPush?.block ?? false, true, "a failed reservation lookup must not open the publication path");
+    const failedCommit = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m x" } });
+    assert.equal(failedCommit?.block ?? false, true);
+    const failedView = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status" } });
+    assert.equal(failedView?.block ?? false, false);
+  } finally {
+    if (previous.HOME === undefined) delete process.env.HOME; else process.env.HOME = previous.HOME;
+    if (previous.STATE === undefined) delete process.env.PI_EXECUTION_STATE_ROOT; else process.env.PI_EXECUTION_STATE_ROOT = previous.STATE;
+    if (previous.AGENT === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT; else process.env.PI_SUBAGENT_CHILD_AGENT = previous.AGENT;
+    if (previous.RUN === undefined) delete process.env.PI_SUBAGENT_RUN_ID; else process.env.PI_SUBAGENT_RUN_ID = previous.RUN;
+    if (previous.PARENT === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION; else process.env.PI_SUBAGENT_PARENT_SESSION = previous.PARENT;
+    if (previous.BINDINGS === undefined) delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]; else process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = previous.BINDINGS;
+    if (previous.ROLE === undefined) delete process.env.ORCHESTRATE_ROLE; else process.env.ORCHESTRATE_ROLE = previous.ROLE;
+  }
+});
+
 test("registered guard accepts only runtime-bound attempt, run, and session-header identity", async () => {
   const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-runtime-binding-home-")));
   const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });

@@ -11,12 +11,13 @@ class Bus implements RuntimeEventBus {
 }
 const run = { runId: "run-1", artifactDir: "/fixture/run-1", ownerSessionFile: "/fixture/session.jsonl" };
 function status(state = "complete") { return { lifecycleArtifactVersion: 3, runId: run.runId, sessionId: "owner", mode: "single", state, startedAt: 1, ...(state === "running" ? {} : { endedAt: 2 }), steps: [{ status: state }], processTerminal: { version: 1, runId: run.runId, runnerProcessInstanceId: "process", state: "observed", observedAt: 2, instances: [{ kind: "runner", processInstanceId: "process", closeObservedAt: 2, exitCode: 0, signal: null }] } }; }
-function setup(config: { durable?: boolean; lost?: boolean; error?: string; state?: string; missing?: boolean; capacity?: number; budget?: number; lookupKnown?: boolean } = {}) {
+function setup(config: { durable?: boolean; lost?: boolean; error?: string; state?: string; missing?: boolean; capacity?: number; budget?: number; lookupKnown?: boolean; stop?: boolean; resume?: boolean } = {}) {
  const events = new Bus(), calls: { method: string; params: Record<string, unknown> }[] = [];
  events.on("subagents:rpc:v1:request", raw => {
   const request = raw as { requestId: string; method: string; params: Record<string, unknown> }; calls.push(request);
   let data: unknown;
-  if (request.method === "ping") data = { version: 1, methods: ["spawn", "status", "stop", ...(config.durable ? ["lookup"] : [])], capabilities: { asyncSpawn: true, stop: true, ...(config.durable ? { durableSpawn: { version: 1, lookup: true } } : {}) }, session: { sessionFile: run.ownerSessionFile, sessionId: "owner" } };
+  const stop = config.stop !== false;
+  if (request.method === "ping") data = { version: 1, methods: ["spawn", "status", ...(stop ? ["stop"] : []), ...(config.resume ? ["resume"] : []), ...(config.durable ? ["lookup"] : [])], capabilities: { asyncSpawn: true, ...(stop ? { stop: true } : {}), ...(config.resume ? { resume: true } : {}), ...(config.durable ? { durableSpawn: { version: 1, lookup: true } } : {}) }, session: { sessionFile: run.ownerSessionFile, sessionId: "owner" } };
   if (request.method === "spawn") {
    events.emit("subagent:async-complete", { runId: run.runId });
    if (config.lost) return;
@@ -85,6 +86,22 @@ test("attempt-runtime exact version, owner, run and terminal evidence are requir
  for (const patch of [{ lifecycleArtifactVersion: 99 }, { sessionId: "foreign" }, { runId: "wrong" }, { processTerminal: { state: "pending" } }, { steps: [] }, { state: "stopping" }]) assert.equal(decodeRuntimeStatus(JSON.stringify({ ...status(), ...patch }), run, "owner", 10).kind, "unknown");
  assert.equal(decodeRuntimeStatus("garbage", run, "owner", 10).kind, "unknown");
  assert.equal(decodeRuntimeStatus(JSON.stringify(status("failed")), run, "owner", 10).kind, "known-terminal");
+});
+
+test("probe advertises only the same-run control contract the runtime defines (stop)", async () => {
+ // The real pi-subagents ping advertises capability resume: true and a resume
+ // method, but no pause method; RPC resume re-engages a run with a required
+ // message and is not a same-run un-pause. Coordinator pause/resume are
+ // durable intents, so neither may be invented as a runtime control here.
+ const real = setup({ resume: true });
+ assert.deepEqual((await real.runtime.probe()).controls, ["stop"]);
+ assert.equal((await real.runtime.control(run, "pause", run.ownerSessionFile)).kind, "unsupported");
+ assert.equal((await real.runtime.control(run, "resume", run.ownerSessionFile)).kind, "unsupported");
+ assert.ok(!real.calls.some(call => call.method === "pause" || call.method === "resume"), "no control RPC may be invented");
+ real.runtime.dispose();
+ const unadvertised = setup({ stop: false });
+ assert.deepEqual((await unadvertised.runtime.probe()).controls, []);
+ unadvertised.runtime.dispose();
 });
 
 test("attempt-runtime missing artifacts and unsupported lifecycle versions remain fenced", async () => {

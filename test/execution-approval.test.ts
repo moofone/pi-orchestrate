@@ -106,3 +106,27 @@ test("source change and cross-repository/base preview token are refused without 
   assert.equal(h.bridge.store.read().authorizations.length, 0);
  } finally { await h.bridge.shutdown(); }
 });
+
+test("a consumed approval token has zero effects and needs an explicit fresh preview", async () => {
+ const h = fixture();
+ try {
+  const first = await h.bridge.run(h.path);
+  assert.equal(first.kind, "approval-required");
+  if (first.kind !== "approval-required") return;
+  const started = await h.bridge.run(h.path, approval(first.preview));
+  assert.equal(started.kind, "started");
+  if (started.kind !== "started") return;
+  const consumed = h.bridge.store.read();
+  const reuse = await h.bridge.run(h.path, approval(first.preview));
+  assert.equal(reuse.kind, "refused", "a consumed approval cannot re-authorize anything");
+  assert.equal(h.count(), 1, "reuse must not trigger a fresh interpretation");
+  assert.deepEqual(h.bridge.store.read(), consumed, "reuse must leave execution state untouched");
+  const fresh = await h.bridge.run(h.path);
+  assert.equal(fresh.kind, "approval-required");
+  if (fresh.kind !== "approval-required") return;
+  assert.notEqual(fresh.preview.token, first.preview.token, "continuation requires a new displayed preview");
+  assert.equal(h.count(), 2);
+  const revised = await h.bridge.run(h.path, approval(fresh.preview));
+  assert.equal(revised.kind, "started", "the fresh preview's own first exact approval stays valid");
+ } finally { await h.bridge.shutdown(); }
+});
