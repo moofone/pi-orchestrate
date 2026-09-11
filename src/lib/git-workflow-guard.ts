@@ -285,8 +285,8 @@ export function classifyGitWorkflowCommand(command: string): GuardVerdict {
 	const git = parsed?.git ?? [];
 	const hasPrPoll = git.some(invocation => invocation.verb === "pr-poll") || hasToken(segments, "ghl-pr-poll");
 	if (hasPrPoll) return { block: true, reason: `git pr-poll is retired. Use ${awaitHint(text)} once, then stop. The latch wakes this session.` };
-	const worktree = git.find(invocation => invocation.verb === "worktree");
-	if (worktree && ["add", "remove", "prune", "move"].includes(worktree.args[0] ?? "")) {
+	const worktree = git.find(invocation => invocation.verb === "worktree" && ["add", "remove", "prune", "move"].includes(invocation.args[0] ?? ""));
+	if (worktree) {
 		return { block: true, reason: worktree.args[0] === "add" ? `raw git worktree add is blocked. Use ${RUST.wt} (ghl-wt).` : `raw git worktree remove/prune is blocked. Use ${RUST.rm} (ghl-wt-rm).` };
 	}
 	if (hasGhSequence(segments, ["pr", "merge"])) return { block: true, reason: `gh pr merge is blocked (including --admin). The waiter lands. Use ${awaitHint(text)} once, then stop.` };

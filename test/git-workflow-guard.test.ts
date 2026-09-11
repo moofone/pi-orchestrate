@@ -85,6 +85,12 @@ test("blocks raw worktree add/remove, gh pr merge, retired pr-poll", () => {
 	assert.match(blocked("ghl-pr-poll 2166"), /retired/);
 });
 
+test("blocks a prohibited worktree operation after a read-only worktree segment", () => {
+	const command = "git worktree list && git worktree add ../ice-wt/later -b later";
+	assert.match(blocked(command), /git wt/);
+	assert.equal(classifyForRole(command, { writer: false }).block, true);
+});
+
 test("extractPrNumber", () => {
 	assert.equal(extractPrNumber("gh pr view 2166 --json state"), "2166");
 	assert.equal(extractPrNumber("git pr-await 479"), "479");
@@ -316,7 +322,7 @@ test("registered guard keeps a parent and forged attempt identity out of a reser
     process.env.PI_SUBAGENT_PARENT_SESSION = join(home, "owner.jsonl");
     const mixed = await handler!({ toolName: "bash", cwd: workspace, input: { command: `cd ${workspace} && git commit -m own && cd ${home} && git push` } });
     assert.equal(mixed?.block ?? false, true, "every mutation target must be independently authorized");
-    for (const command of ["gh pr create --title x --body y", "git wt branch", "git pr-await 1", "git pr-land 1", "git push"]) {
+    for (const command of ["gh pr create --title x --body y", "git wt branch", "git pr-await 1", "git pr-land 1", "git push", "git worktree list && git worktree add ../later -b later"]) {
       const worker = await handler!({ toolName: "bash", cwd: workspace, input: { command } });
       assert.equal(worker?.block ?? false, true, `verified execution worker must be blocked from ${command}`);
     }
