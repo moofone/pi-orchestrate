@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import guardExtension from "../src/git-workflow-guard.ts";
+import { EXECUTION_IDENTITY_BINDING_NAMESPACE, PI_SUBAGENT_EXTENSION_BINDINGS_ENV } from "../src/lib/execution-identity.ts";
 
 import {
 	classifyForRole,
@@ -108,6 +109,22 @@ test("repeat lone gh pr view after VIEW_REPEAT_LIMIT", () => {
  * that, so an obedient fixer forked a second waiter with its own state file
  * from inside a child session. Nothing in the child role stopped it.
  * ---------------------------------------------------------------- */
+
+test("writer restrictions parse git global options on every command segment", () => {
+  for (const command of [
+    "git -C /reserved push",
+    "git --no-pager -C /reserved pr-await 1",
+    "git --git-dir=/reserved/.git wt branch",
+    "git status && git -C /reserved push",
+  ]) {
+    const verdict = classifyForRole(command, { writer: true });
+    assert.equal(verdict.block, true, `global options/segments must not bypass writer guard: ${command}`);
+  }
+  assert.equal(isWorktreeMutation("git --no-pager -C /reserved add ."), true);
+  assert.ok(mutationTargetDirs("git --no-pager -C /reserved commit -m x", "/elsewhere").includes("/reserved"));
+  assert.equal(classifyGitWorkflowCommand("git --no-pager pr-await 1").block, false);
+  assert.match(blocked("git --no-pager pr-poll 1"), /git pr-await 1/);
+});
 
 test("P2 F7: a writer child may not wait, land, worktree, push, or touch the PR", () => {
   const blocked = [
@@ -311,6 +328,59 @@ test("registered guard keeps a parent and forged attempt identity out of a reser
     if (priorParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION; else process.env.PI_SUBAGENT_PARENT_SESSION = priorParent;
     if (priorAgent === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT; else process.env.PI_SUBAGENT_CHILD_AGENT = priorAgent;
     if (priorRole === undefined) delete process.env.ORCHESTRATE_ROLE; else process.env.ORCHESTRATE_ROLE = priorRole;
+  }
+});
+
+test("registered guard accepts only runtime-bound attempt, run, and session-header identity", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-runtime-binding-home-")));
+  const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });
+  const ownerSession = join(home, "owner.jsonl");
+  writeFileSync(ownerSession, JSON.stringify({ type: "session", id: "owner-header" }) + "\n");
+  const executionRoot = join(home, "orchestrator", "plan-driven-v1", "execution");
+  const stateDir = join(executionRoot, "repo"); mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, "coordinator.json"), JSON.stringify({
+    reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
+    attempts: [{ id: "attempt-1", ownerSessionFile: ownerSession, workspace: { id: "workspace-1", path: workspace }, run: { runId: "runtime-run-1", ownerSessionFile: ownerSession } }],
+    deliveries: [],
+  }));
+  const previous = {
+    HOME: process.env.HOME,
+    PI_EXECUTION_STATE_ROOT: process.env.PI_EXECUTION_STATE_ROOT,
+    PI_SUBAGENT_EXTENSION_BINDINGS: process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV],
+    PI_SUBAGENT_RUN_ID: process.env.PI_SUBAGENT_RUN_ID,
+    PI_SUBAGENT_PARENT_SESSION: process.env.PI_SUBAGENT_PARENT_SESSION,
+    PI_SUBAGENT_CHILD_AGENT: process.env.PI_SUBAGENT_CHILD_AGENT,
+    ORCHESTRATE_ROLE: process.env.ORCHESTRATE_ROLE,
+  };
+  process.env.HOME = home; process.env.PI_EXECUTION_STATE_ROOT = executionRoot;
+  process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header" } });
+  process.env.PI_SUBAGENT_RUN_ID = "runtime-run-1"; process.env.PI_SUBAGENT_PARENT_SESSION = "owner-header";
+  process.env.PI_SUBAGENT_CHILD_AGENT = "tdd-worker"; delete process.env.ORCHESTRATE_ROLE;
+  try {
+    let handler: ((event: any) => Promise<any>) | undefined;
+    guardExtension({ on(name: string, fn: any) { if (name === "tool_call") handler = fn; } } as unknown as ExtensionAPI);
+    assert.ok(handler);
+    const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: `git -C ${workspace} commit -m own` } });
+    assert.equal(own?.block ?? false, false, "the actual runtime identity may mutate its assigned workspace");
+    delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
+    const missingBinding = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m missing" } });
+    assert.equal(missingBinding?.block ?? false, true);
+    process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header" } });
+    process.env.PI_SUBAGENT_RUN_ID = "runtime-foreign";
+    const foreignRun = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m foreign" } });
+    assert.equal(foreignRun?.block ?? false, true, "a spoofed runtime run id is not worker proof");
+    delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]; process.env.PI_SUBAGENT_RUN_ID = "runtime-run-1";
+    const labelOnly = await handler!({ toolName: "bash", cwd: home, input: { command: `git -C ${join(home, "foreign")} commit -m label` } });
+    assert.equal(labelOnly?.block ?? false, false, "an unreserved target is not an execution ownership claim");
+    const reservedLabelOnly = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m label" } });
+    assert.equal(reservedLabelOnly?.block ?? false, true, "writer labels cannot authorize a reserved target");
+  } finally {
+    if (previous.HOME === undefined) delete process.env.HOME; else process.env.HOME = previous.HOME;
+    if (previous.PI_EXECUTION_STATE_ROOT === undefined) delete process.env.PI_EXECUTION_STATE_ROOT; else process.env.PI_EXECUTION_STATE_ROOT = previous.PI_EXECUTION_STATE_ROOT;
+    for (const [key, value] of [[PI_SUBAGENT_EXTENSION_BINDINGS_ENV, previous.PI_SUBAGENT_EXTENSION_BINDINGS], ["PI_SUBAGENT_RUN_ID", previous.PI_SUBAGENT_RUN_ID], ["PI_SUBAGENT_PARENT_SESSION", previous.PI_SUBAGENT_PARENT_SESSION], ["PI_SUBAGENT_CHILD_AGENT", previous.PI_SUBAGENT_CHILD_AGENT], ["ORCHESTRATE_ROLE", previous.ORCHESTRATE_ROLE]] as const) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

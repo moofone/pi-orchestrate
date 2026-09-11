@@ -10,11 +10,17 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { canonicalizePath } from "./pr-review-store.ts";
+import { readExecutionIdentityBinding } from "./execution-identity.ts";
 
 export type GuardVerdict = { block: false } | { block: true; reason: string };
 export type ExecutionGuardRole = "worker" | "parent" | "controller";
 export type ExecutionReservation = { role: "worker"; attemptId: string; workspacePath: string; workspaceId?: string };
-type DurableAttempt = { id: string; ownerSessionFile?: string; run?: { runId?: string; operationId?: string } };
+type DurableAttempt = {
+  id: string;
+  ownerSessionFile?: string;
+  workspace?: { id?: string; path?: string };
+  run?: { runId?: string; ownerSessionFile?: string; operationId?: string };
+};
 type DurableExecutionState = { reservations?: { attemptId?: string; workspacePath: string; workspaceId?: string; slots?: number }[]; attempts?: DurableAttempt[]; deliveries?: { phase?: string; handoff?: { workspace?: { path?: string } } }[] };
 
 /**
@@ -59,17 +65,41 @@ export function durableExecutionReservation(cwd: string, attemptId?: string): Ex
 /** Runtime-bound worker proof. An attempt ID is only a selector; the child must
  * also carry the runtime run ID and its authoritative parent session linkage,
  * both matching the persisted attempt that owns the reservation. */
+function sessionHeaderId(sessionFile: string): string | undefined {
+  try {
+    const firstLine = readFileSync(sessionFile, "utf8").split(/\r?\n/, 1)[0];
+    const header = JSON.parse(firstLine ?? "") as { type?: unknown; id?: unknown };
+    return header.type === "session" && typeof header.id === "string" && header.id.length > 0 ? header.id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Verify the caller against the supported child-runtime binding.  The
+ * attempt/workspace values are selectors carried in a namespaced public
+ * extension binding; the runtime-generated run id and parent session header
+ * id are independently supplied by pi-subagents and must match durable
+ * evidence. Legacy env selectors are deliberately ignored.
+ */
 export function verifiedDurableExecutionReservation(cwd: string, env: Record<string, string | undefined> = process.env): ExecutionReservation | undefined {
+  const binding = readExecutionIdentityBinding(env);
   const runId = env.PI_SUBAGENT_RUN_ID?.trim();
-  const attemptId = env.PI_EXECUTION_ATTEMPT_ID?.trim() || runId;
-  const sessionFile = (env.PI_EXECUTION_SESSION_FILE ?? env.PI_SUBAGENT_PARENT_SESSION)?.trim();
-  if (!attemptId || !runId || !sessionFile) return undefined;
-  const caller = canonicalizePath(sessionFile);
+  const parentSessionId = env.PI_SUBAGENT_PARENT_SESSION?.trim();
+  if (!binding || !runId || !parentSessionId) return undefined;
   for (const state of durableExecutionStates()) {
-    const attempt = state.attempts?.find(item => item.id === attemptId);
-    if (!attempt || canonicalizePath(attempt.ownerSessionFile ?? "") !== caller || (attempt.run?.runId !== runId && attempt.id !== runId && attempt.run?.operationId !== runId)) continue;
-    const found = executionWriterReservation({ cwd, reservations: Array.isArray(state.reservations) ? state.reservations : [], attemptId });
-    if (found) return found;
+    const attempt = state.attempts?.find(item => item.id === binding.attemptId);
+    if (!attempt || !attempt.ownerSessionFile || !attempt.run || !attempt.run.ownerSessionFile
+      || attempt.run.runId !== runId
+      || canonicalizePath(attempt.run.ownerSessionFile) !== canonicalizePath(attempt.ownerSessionFile)
+      || sessionHeaderId(attempt.ownerSessionFile) !== parentSessionId
+      || binding.ownerSessionId !== parentSessionId
+      || !attempt.workspace
+      || attempt.workspace.id !== binding.workspaceId
+      || typeof attempt.workspace.path !== "string"
+      || canonicalizePath(attempt.workspace.path) !== canonicalizePath(binding.workspacePath)) continue;
+    const found = executionWriterReservation({ cwd, reservations: Array.isArray(state.reservations) ? state.reservations : [], attemptId: binding.attemptId });
+    if (found && found.workspaceId === binding.workspaceId && found.workspacePath === canonicalizePath(binding.workspacePath)) return found;
   }
   return undefined;
 }
@@ -93,6 +123,24 @@ const RUST = {
 const PR_NUM = String.raw`(?:#)?(\d+)`;
 
 export function extractPrNumber(command: string): string | undefined {
+	const parsed = gitInvocations(stripComments(command));
+	for (const invocation of parsed?.git ?? []) {
+		if (["pr-await", "pr-land", "pr-poll"].includes(invocation.verb ?? "")) {
+			const match = invocation.args.find(value => /^#?\d+$/.test(value));
+			if (match) return match.replace(/^#/, "");
+		}
+	}
+	for (const segment of parsed?.segments ?? []) for (let index = 0; index < segment.length; index++) {
+		if (["ghl-pr-await", "ghl-pr-land", "ghl-pr-poll"].includes(segment[index]!)) {
+			const match = segment.slice(index + 1).find(value => /^#?\d+$/.test(value));
+			if (match) return match.replace(/^#/, "");
+		}
+		if (segment[index] === "gh") {
+			for (let next = index + 1; next < segment.length - 1; next++) {
+				if (["view", "checks", "status", "watch", "merge"].includes(segment[next]!) && /^#?\d+$/.test(segment[next + 1]!)) return segment[next + 1]!.replace(/^#/, "");
+			}
+		}
+	}
 	const patterns = [
 		new RegExp(String.raw`\bgh\s+pr\s+(?:view|checks|status|watch|merge)\s+${PR_NUM}`),
 		new RegExp(String.raw`\bgit\s+pr-(?:await|land|poll)\s+${PR_NUM}`),
@@ -114,66 +162,140 @@ function stripComments(command: string): string {
 	return command.replace(/(^|\n)[ \t]*#.*/g, "$1");
 }
 
+type ShellSegment = string[];
+
+/** Minimal shell lexer for guard decisions. It deliberately does not execute
+ * shell syntax; quotes are decoded, separators become segment boundaries, and
+ * malformed quoting is reported so callers can fail closed. */
+function shellSegments(command: string): ShellSegment[] | undefined {
+	const segments: ShellSegment[] = [];
+	let segment: string[] = [], token = "", quote: "'" | '"' | undefined;
+	let escaped = false, substitutionDepth = 0, comment = false;
+	const flushToken = () => { if (token) { segment.push(token); token = ""; } };
+	const flushSegment = () => { flushToken(); if (segment.length) segments.push(segment); segment = []; };
+	for (let i = 0; i < command.length; i++) {
+		const char = command[i]!;
+		if (comment) { if (char === "\n") { comment = false; flushSegment(); } continue; }
+		if (escaped) { token += char; escaped = false; continue; }
+		if (quote) {
+			if (char === quote) quote = undefined;
+			else token += char;
+			continue;
+		}
+		if (char === "\\") { escaped = true; continue; }
+		if (char === "'" || char === '"') { quote = char; continue; }
+		if (char === "#" && !token) { comment = true; continue; }
+		if (char === "$" && command[i + 1] === "(") { token += "$("; substitutionDepth++; i++; continue; }
+		if (substitutionDepth > 0) {
+			token += char;
+			if (char === "(") substitutionDepth++;
+			else if (char === ")") substitutionDepth--;
+			continue;
+		}
+		if (char === "\n" || char === ";" || char === "|" || char === "&") {
+			flushSegment();
+			if ((char === "|" || char === "&") && command[i + 1] === char) i++;
+			continue;
+		}
+		if (/\s/.test(char)) { flushToken(); continue; }
+		token += char;
+	}
+	if (quote || escaped || substitutionDepth !== 0) return undefined;
+	flushSegment();
+	return segments;
+}
+
+function gitCommandToken(token: string): boolean {
+	return token === "git" || token.endsWith("/git");
+}
+
+const GIT_GLOBAL_VALUE_OPTIONS = new Set([
+	"--exec-path", "--work-tree", "--git-dir", "--namespace", "--config-env", "--super-prefix", "--attr-source", "--list-cmds",
+]);
+
+type GitInvocation = { tokens: string[]; index: number; verb?: string; args: string[]; paths: string[] };
+
+function parseGitInvocation(segment: ShellSegment, index: number): GitInvocation {
+	const paths: string[] = [], tokens = segment.slice(index + 1);
+	let i = 0;
+	const valueOption = (name: string, value: string | undefined) => {
+		if (value === undefined) return;
+		if (name === "-C" || name === "--work-tree" || name === "--git-dir") paths.push(value);
+	};
+	while (i < tokens.length) {
+		const current = tokens[i]!;
+		if (current === "--") return { tokens: segment, index, verb: tokens[i + 1], args: tokens.slice(i + 2), paths };
+		if (current.startsWith("--")) {
+			const equal = current.indexOf("=");
+			const name = equal === -1 ? current : current.slice(0, equal);
+			if (equal !== -1) valueOption(name, current.slice(equal + 1));
+			else if (GIT_GLOBAL_VALUE_OPTIONS.has(name)) valueOption(name, tokens[++i]);
+			i++;
+			continue;
+		}
+		if (current === "-C" || current === "-c") { valueOption(current, tokens[++i]); i++; continue; }
+		if (current.startsWith("-C") && current.length > 2) { valueOption("-C", current.slice(2)); i++; continue; }
+		if (current.startsWith("-c") && current.length > 2) { i++; continue; }
+		if (current.startsWith("-")) { i++; continue; }
+		return { tokens: segment, index, verb: current, args: tokens.slice(i + 1), paths };
+	}
+	return { tokens: segment, index, args: [], paths };
+}
+
+function gitInvocations(command: string): { segments: ShellSegment[]; git: GitInvocation[] } | undefined {
+	const segments = shellSegments(command);
+	if (!segments) return undefined;
+	const git: GitInvocation[] = [];
+	for (const segment of segments) for (let index = 0; index < segment.length; index++) {
+		if (gitCommandToken(segment[index]!)) git.push(parseGitInvocation(segment, index));
+	}
+	return { segments, git };
+}
+
+const GH_GLOBAL_VALUE_OPTIONS = new Set(["--repo", "--hostname", "--git-protocol", "--jq", "--template", "--limit", "--state", "--json"]);
+
+function hasGhSequence(segments: ShellSegment[], sequence: string[]): boolean {
+	return segments.some(segment => segment.some((token, index) => {
+		if (token !== "gh") return false;
+		let cursor = index + 1, matched = 0;
+		while (cursor < segment.length && matched < sequence.length) {
+			const current = segment[cursor]!;
+			if (current.startsWith("--")) {
+				if (!current.includes("=") && GH_GLOBAL_VALUE_OPTIONS.has(current)) cursor++;
+				cursor++;
+				continue;
+			}
+			if (current !== sequence[matched]) return false;
+			matched++; cursor++;
+		}
+		return matched === sequence.length;
+	}));
+}
+
+function hasToken(segments: ShellSegment[], token: string): boolean {
+	return segments.some(segment => segment.includes(token));
+}
+
 export function classifyGitWorkflowCommand(command: string): GuardVerdict {
-	const text = stripComments(command);
-
-	// Allowed rust entrypoints (git aliases → ghl-*). Do not inspect further:
-	// `git pr-await 2166` is the thing we are herding the model toward.
-	if (
-		/\bgit\s+wt\b/.test(text) ||
-		/\bgit\s+wt-rm\b/.test(text) ||
-		/\bgit\s+pr-await\b/.test(text) ||
-		/\bgit\s+pr-land\b/.test(text) ||
-		/\bghl-wt(?:-rm)?\b/.test(text) ||
-		/\bghl-pr-await\b/.test(text) ||
-		/\bghl-pr-land\b/.test(text)
-	) {
-		return { block: false };
+	const text = stripComments(command), parsed = gitInvocations(text);
+	// A malformed shell command containing a workflow executable cannot be
+	// safely classified. Blocking is safer than allowing an unparsed segment.
+	if (!parsed && /(?:^|[\s;&|])(git|gh|ghl-)[^\s;&|]*/.test(text)) return { block: true, reason: "Unsupported shell syntax; split the command into a supported, bounded invocation." };
+	const segments = parsed?.segments ?? [];
+	const git = parsed?.git ?? [];
+	const hasPrPoll = git.some(invocation => invocation.verb === "pr-poll") || hasToken(segments, "ghl-pr-poll");
+	if (hasPrPoll) return { block: true, reason: `git pr-poll is retired. Use ${awaitHint(text)} once, then stop. The latch wakes this session.` };
+	const worktree = git.find(invocation => invocation.verb === "worktree");
+	if (worktree && ["add", "remove", "prune", "move"].includes(worktree.args[0] ?? "")) {
+		return { block: true, reason: worktree.args[0] === "add" ? `raw git worktree add is blocked. Use ${RUST.wt} (ghl-wt).` : `raw git worktree remove/prune is blocked. Use ${RUST.rm} (ghl-wt-rm).` };
 	}
-
-	if (/\bgit\s+pr-poll\b|\bghl-pr-poll\b/.test(text)) {
-		return {
-			block: true,
-			reason: `git pr-poll is retired. Use ${awaitHint(text)} once, then stop. The latch wakes this session.`,
-		};
-	}
-
-	if (/\bgit\s+worktree\s+(add|remove|prune|move)\b/.test(text)) {
-		const add = /\bworktree\s+add\b/.test(text);
-		return {
-			block: true,
-			reason: add
-				? `raw git worktree add is blocked. Use ${RUST.wt} (ghl-wt).`
-				: `raw git worktree remove/prune is blocked. Use ${RUST.rm} (ghl-wt-rm).`,
-		};
-	}
-
-	if (/\bgh\s+pr\s+merge\b/.test(text)) {
-		return {
-			block: true,
-			reason: `gh pr merge is blocked (including --admin). The waiter lands. Use ${awaitHint(text)} once, then stop.`,
-		};
-	}
-
-	const hasView =
-		/\bgh\s+pr\s+(?:view|checks|status)\b/.test(text) ||
-		/\bgh\s+run\s+watch\b/.test(text);
-	const hasFetch = /\bgit\s+fetch\b/.test(text);
+	if (hasGhSequence(segments, ["pr", "merge"])) return { block: true, reason: `gh pr merge is blocked (including --admin). The waiter lands. Use ${awaitHint(text)} once, then stop.` };
+	const hasView = hasGhSequence(segments, ["pr", "view"]) || hasGhSequence(segments, ["pr", "checks"]) || hasGhSequence(segments, ["pr", "status"]) || hasGhSequence(segments, ["run", "watch"])
+		|| /\bgh\s+pr\s+(?:view|checks|status)\b/.test(text) || /\bgh\s+run\s+watch\b/.test(text);
+	const hasFetch = git.some(invocation => invocation.verb === "fetch") || /\bgit\s+fetch\b/.test(text);
 	const hasSleep = /\bsleep\s+\d/.test(text) || /\btimeout\s+\d/.test(text);
-	const hasLoop =
-		/\bfor\s+\w+\s+in\b/.test(text) ||
-		/\bwhile\s+/.test(text) ||
-		/\buntil\s+/.test(text);
-
-	if (hasView && (hasFetch || hasSleep || hasLoop)) {
-		return {
-			block: true,
-			reason:
-				`PR wait/poll via bash is blocked (git fetch + gh pr view, sleep loops, for/while). ` +
-				`Use ${awaitHint(text)} once → next=yield → stop talking. Do not drain-poll.`,
-		};
-	}
-
+	const hasLoop = /\bfor\s+\w+\s+in\b/.test(text) || /\bwhile\s+/.test(text) || /\buntil\s+/.test(text);
+	if (hasView && (hasFetch || hasSleep || hasLoop)) return { block: true, reason: `PR wait/poll via bash is blocked (git fetch + gh pr view, sleep loops, for/while). Use ${awaitHint(text)} once → next=yield → stop talking. Do not drain-poll.` };
 	return { block: false };
 }
 
@@ -207,32 +329,16 @@ export function isWriterRole(env: Record<string, string | undefined> = process.e
 	return WRITER_AGENTS.has(String(env.PI_SUBAGENT_CHILD_AGENT ?? "").trim());
 }
 
-const WRITER_BLOCKS: { re: RegExp; reason: string }[] = [
-	{
-		re: /\bgit\s+pr-await\b|\bghl-pr-await\b/,
-		reason:
-			"a writer child never waits on the review. Settle with your handoff; code runs git pr-await once, from the parent.",
-	},
-	{
-		re: /\bgit\s+pr-land\b|\bghl-pr-land\b|\bgh\s+pr\s+merge\b/,
-		reason: "a writer child never lands the PR. Code lands it when the waiter says so.",
-	},
-	{
-		re: /\bgit\s+wt(?:-rm)?\b|\bghl-wt(?:-rm)?\b|\bgit\s+worktree\s+(?:add|remove|prune|move)\b/,
-		reason:
-			"a writer child never creates or removes a worktree. You were given one; work in it.",
-	},
-	{
-		re: /\bgh\s+pr\s+(?:create|comment|edit|close|reopen|ready)\b/,
-		reason:
-			"a writer child never speaks on the PR. Put it in your handoff; code opens the PR and posts on it.",
-	},
-	{
-		re: /\bgit\s+push\b/,
-		reason:
-			"a writer child commits; code pushes. Commit your work and settle — the push is one per round, from the parent.",
-	},
-];
+function writerBlock(command: string): GuardVerdict | undefined {
+	const parsed = gitInvocations(stripComments(command)), git = parsed?.git ?? [], segments = parsed?.segments ?? [];
+	if (git.some(invocation => invocation.verb === "pr-await") || segments.some(segment => segment.includes("ghl-pr-await"))) return { block: true, reason: "a writer child never waits on the review. Settle with your handoff; code runs git pr-await once, from the parent." };
+	if (git.some(invocation => invocation.verb === "pr-land") || segments.some(segment => segment.includes("ghl-pr-land")) || hasGhSequence(segments, ["pr", "merge"])) return { block: true, reason: "a writer child never lands the PR. Code lands it when the waiter says so." };
+	const rawWorktree = git.some(invocation => invocation.verb === "worktree" && ["add", "remove", "prune", "move"].includes(invocation.args[0] ?? ""));
+	if (rawWorktree || git.some(invocation => invocation.verb === "wt" || invocation.verb === "wt-rm") || segments.some(segment => segment.includes("ghl-wt") || segment.includes("ghl-wt-rm"))) return { block: true, reason: "a writer child never creates or removes a worktree. You were given one; work in it." };
+	if (["create", "comment", "edit", "close", "reopen", "ready"].some(action => hasGhSequence(segments, ["pr", action]))) return { block: true, reason: "a writer child never speaks on the PR. Put it in your handoff; code opens the PR and posts on it." };
+	if (git.some(invocation => invocation.verb === "push")) return { block: true, reason: "a writer child commits; code pushes. Commit your work and settle — the push is one per round, from the parent." };
+	return undefined;
+}
 
 /**
  * The guard for one command, given the role of the session running it.
@@ -243,65 +349,18 @@ const WRITER_BLOCKS: { re: RegExp; reason: string }[] = [
 const PARENT_MUTATION_VERB =
 	/^(add|commit|push|checkout|restore|reset|rebase|merge|cherry-pick|rm|mv|clean|switch)$/;
 
-function gitVerb(command: string): string | undefined {
-	const m = stripComments(command).match(/\bgit\b([\s\S]*)/);
-	if (!m) return undefined;
-	const tokens = m[1]!.trim().split(/\s+/).filter(Boolean);
-	for (let i = 0; i < tokens.length; i++) {
-		const t = tokens[i]!;
-		if (t === "--") return tokens[i + 1];
-		if (t.startsWith("--")) {
-			if (!t.includes("=") && i + 1 < tokens.length && !tokens[i + 1]!.startsWith("-")) i += 1;
-			continue;
-		}
-		if (t.startsWith("-") && t.length === 2) {
-			if (i + 1 < tokens.length && !tokens[i + 1]!.startsWith("-")) i += 1;
-			continue;
-		}
-		if (t.startsWith("-")) continue;
-		return t;
-	}
-	return undefined;
-}
-
 function isLifecycleMutation(command: string): boolean {
-  const text = stripComments(command);
-  return /\bgit\s+(?:wt(?:-rm)?|pr-await|pr-land)\b|\bghl-(?:wt(?:-rm)?|pr-await|pr-land)\b|\bgh\s+pr\s+(?:create|merge|close|reopen|ready|edit|comment)\b/.test(text);
+	const text = stripComments(command), parsed = gitInvocations(text);
+	if (parsed?.git.some(invocation => ["wt", "wt-rm", "pr-await", "pr-land"].includes(invocation.verb ?? ""))) return true;
+	if (parsed?.segments.some(segment => ["ghl-wt", "ghl-wt-rm", "ghl-pr-await", "ghl-pr-land"].some(name => segment.includes(name)))) return true;
+	return ["create", "merge", "close", "reopen", "ready", "edit", "comment"].some(action => hasGhSequence(parsed?.segments ?? [], ["pr", action]));
 }
 
 export function isWorktreeMutation(command: string): boolean {
-	const text = stripComments(command);
-	const parts = text.split(/\s*(?:&&|\|\||;|\n)\s*/);
-	return parts.some((part) => {
-		const verb = gitVerb(part);
-		return Boolean(verb && PARENT_MUTATION_VERB.test(verb));
-	});
+	const parsed = gitInvocations(stripComments(command));
+	return !!parsed?.git.some(invocation => PARENT_MUTATION_VERB.test(invocation.verb ?? ""));
 }
 
-function captureDirArgs(prefix: string, text: string): string[] {
-	const out: string[] = [];
-	const re = new RegExp(`${prefix}\\s+(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
-	for (const m of text.matchAll(re)) {
-		const raw = (m[1] ?? m[2] ?? "").trim();
-		if (raw && raw !== "-" && !raw.startsWith("-")) out.push(raw);
-	}
-	return out;
-}
-
-function captureFlagPaths(flag: string, text: string): string[] {
-	const out: string[] = [];
-	const eq = new RegExp(`${flag}=(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
-	for (const m of text.matchAll(eq)) {
-		const raw = (m[1] ?? m[2] ?? "").trim();
-		if (raw) out.push(raw);
-	}
-	const spaced = new RegExp(`${flag}\\s+(?:['"]([^'"]+)['"]|([^'"\\s;|&]+))`, "g");
-	for (const m of text.matchAll(spaced)) {
-		const raw = (m[1] ?? m[2] ?? "").trim();
-		if (raw && !raw.startsWith("-")) out.push(raw);
-	}
-	return out;
-}
 
 function resolveMutationDir(dir: string, fallbackCwd?: string): string {
 	const trimmed = dir.replace(/\/+$/, "").replace(/\/\.git$/, "");
@@ -313,17 +372,21 @@ function resolveMutationDir(dir: string, fallbackCwd?: string): string {
 
 /** Worktrees a bash command would mutate: `cd DIR && git …`, `git -C DIR`, fallback cwd. */
 export function mutationTargetDirs(command: string, fallbackCwd?: string): string[] {
-	const text = stripComments(command);
+	const parsed = gitInvocations(stripComments(command));
 	const dirs: string[] = [];
-	const raws = [
-		...captureDirArgs("\\bcd", text),
-		...captureDirArgs("\\bgit\\s+-C", text),
-		...captureFlagPaths("--work-tree", text),
-		...captureFlagPaths("--git-dir", text),
-	];
-	for (const raw of raws) {
-		const resolved = resolveMutationDir(raw, fallbackCwd);
-		if (resolved) dirs.push(resolved);
+	if (parsed) {
+		for (const segment of parsed.segments) for (let index = 0; index < segment.length; index++) {
+			if (segment[index] !== "cd") continue;
+			const raw = segment[index + 1];
+			if (raw && raw !== "-" && !raw.startsWith("-")) {
+				const resolved = resolveMutationDir(raw, fallbackCwd);
+				if (resolved) dirs.push(resolved);
+			}
+		}
+		for (const invocation of parsed.git) for (const raw of invocation.paths) {
+			const resolved = resolveMutationDir(raw, fallbackCwd);
+			if (resolved) dirs.push(resolved);
+		}
 	}
 	if (fallbackCwd) dirs.push(canonicalizePath(resolve(fallbackCwd.replace(/\/+$/, "")).replace(/\/+$/, "")));
 	return [...new Set(dirs)];
@@ -336,10 +399,8 @@ export function classifyForRole(
 	const worker = opts.writer || opts.executionRole === "worker";
 	const reservedParent = !worker && (opts.writerReserved || opts.executionRole === "parent");
 	if (worker) {
-		const text = stripComments(command);
-		for (const rule of WRITER_BLOCKS) {
-			if (rule.re.test(text)) return { block: true, reason: rule.reason };
-		}
+		const blocked = writerBlock(command);
+		if (blocked) return blocked;
 	}
 	if (reservedParent && (isWorktreeMutation(command) || isLifecycleMutation(command))) {
 		return {

@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { digest, taskRevisionDigest, validateTerminalOutput, type AttemptRuntime, type ExecutionProfile, type LaunchOutcome, type LaunchRequest, type Observation, type RunRef, type RuntimeCapabilities } from "./execution-contract.ts";
 import { resolveExecutionProfile } from "./execution-policy.ts";
+import { createExecutionIdentityBinding } from "./execution-identity.ts";
 
 /** Structurally compatible with ExtensionAPI.events. No private runtime imports. */
 export type RuntimeEventBus = { on(name: string, listener: (data: unknown) => void): () => void; emit(name: string, data: unknown): void };
@@ -101,6 +102,8 @@ export function createAttemptRuntime(options: AttemptRuntimeOptions): AttemptRun
    const caps = await probe();
    if (!caps.available) return reject("Detached runtime unavailable", "capability");
    if (!await ownerMatches(attempt.ownerSessionFile)) return reject("Launch owner is not the active runtime session", "policy");
+   const ownerSessionId = await sessionId(attempt.ownerSessionFile);
+   if (!ownerSessionId) return reject("Launch owner session header identity is unavailable", "policy");
    if (attempt.run || !["preparing", "launching"].includes(attempt.phase)) return unknown("Attempt may already have launched; reconcile instead");
    if (!isAbsolute(attempt.workspace.path) || resolve(attempt.workspace.path) !== attempt.workspace.path || request.authorization.repoId !== attempt.workspace.repoId || request.authorization.manifestId !== attempt.manifestId || request.authorization.revision !== attempt.manifestRevision || request.authorization.baseCommit !== attempt.baseCommit || attempt.workspace.baseCommit !== attempt.baseCommit || request.task.id !== attempt.taskId || taskRevisionDigest(request.task) !== attempt.taskDigest) return reject("Launch workspace/task authorization mismatch", "policy");
    const policy = resolveExecutionProfile({ explicit: profile, capabilities: caps });
@@ -114,22 +117,29 @@ export function createAttemptRuntime(options: AttemptRuntimeOptions): AttemptRun
     ? { type: "object", additionalProperties: false, required: ["kind", "commit"], properties: { kind: { const: "commits" }, commit: { type: "string", pattern: "^[a-f0-9]{40}([a-f0-9]{24})?$" } } }
     : { type: "object", additionalProperties: false, required: ["kind", "path", "digest"], properties: { kind: { const: "artifact" }, path: { type: "string" }, digest: { type: "string", pattern: "^[a-f0-9]{64}$" } } };
    const taskText = `${request.task.text}\n\nFinish with structured_output: ${request.task.mode === "mutation" ? 'exact output identity {"kind":"commits","commit":"<full final commit SHA>"}; commit only in-scope changes in this workspace' : '{"kind":"artifact","path":"<canonical absolute artifact path inside this run artifact directory>","digest":"<SHA256 of exact artifact bytes>"}; do not change Git HEAD'}. No push, PR creation, or new worktree.`;
+   const executionBinding = createExecutionIdentityBinding({
+    attemptId: attempt.id,
+    workspaceId: attempt.workspace.id,
+    workspacePath: attempt.workspace.path,
+    ownerSessionId,
+   });
    const params: RecordData = {
     outputSchema, agent: profile.agent, task: taskText, cwd: attempt.workspace.path, async: true, worktree: false,
-    // Public pi-subagents runtime binding: the child receives these durable
-    // selectors, while the guard still verifies them against persisted owner,
-    // reservation, and workspace evidence.
-    runId: attempt.id, parentSessionId: attempt.ownerSessionFile,
+    // Do not pass the attempt id as `runId`: in the public API that field is a
+    // management selector, not the child's runtime identity. The child receives its generated run id and parent
+    // session header id from pi-subagents; this namespaced binding selects the
+    // durable attempt/workspace that those runtime facts must match.
+    parentSessionId: ownerSessionId, extensionBindings: executionBinding,
    };
    for (const key of ["model", "context", "timeoutMs"] as const) if (profile[key] !== undefined) params[key] = profile[key];
    if (profile.thinking) params.model = `${profile.model}:${profile.thinking}`;
    if (options.profileEncoder) {
     const encoded = options.profileEncoder.encode(profile);
-    if (["action", "workflowScript", "workflowScriptPath", "tasks", "chain", "parallel", "concurrency", "config", "resume", "operationId"].some(key => key in encoded)) return reject("Profile encoder cannot change single-attempt execution shape", "policy");
+    if (["action", "workflowScript", "workflowScriptPath", "tasks", "chain", "parallel", "concurrency", "config", "resume", "operationId", "runId", "parentSessionId", "extensionBindings"].some(key => key in encoded)) return reject("Profile encoder cannot change single-attempt execution shape or identity", "policy");
     Object.assign(params, encoded);
    }
    // Never allow an injected profile mapping to alter launch identity/isolation.
-   Object.assign(params, { outputSchema, agent: profile.agent, task: taskText, cwd: attempt.workspace.path, async: true, worktree: false });
+   Object.assign(params, { outputSchema, agent: profile.agent, task: taskText, cwd: attempt.workspace.path, async: true, worktree: false, parentSessionId: ownerSessionId, extensionBindings: executionBinding });
    if (attempt.operationId && caps.durableOperationLookup) params.operationId = attempt.operationId;
    const reply = await rpc("spawn", params);
    if (reply.success !== true) {

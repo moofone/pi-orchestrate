@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createAttemptRuntime, decodeRuntimeStatus, type RuntimeEventBus } from "../src/lib/attempt-runtime.ts";
+import { EXECUTION_IDENTITY_BINDING_NAMESPACE } from "../src/lib/execution-identity.ts";
 import { fakeAttempt, fakeAuthorization, fakeManifest } from "./fixtures/execution/fakes.ts";
 import { digest, type LaunchRequest } from "../src/lib/execution-contract.ts";
 class Bus implements RuntimeEventBus {
@@ -39,6 +40,16 @@ test("attempt-runtime catches completion-before-ack, uses single detached child,
  assert.equal(launches[0]!.params.cwd, request.attempt.workspace.path);
  assert.equal(launches[0]!.params.worktree, false);
  assert.equal(launches[0]!.params.context, "fork");
+ assert.equal(launches[0]!.params.runId, undefined, "the runtime, not the attempt adapter, generates the child run id");
+ assert.equal(launches[0]!.params.parentSessionId, "owner");
+ assert.deepEqual(launches[0]!.params.extensionBindings, {
+  [EXECUTION_IDENTITY_BINDING_NAMESPACE]: {
+   attemptId: request.attempt.id,
+   workspaceId: request.attempt.workspace.id,
+   workspacePath: request.attempt.workspace.path,
+   ownerSessionId: "owner",
+  },
+ });
  assert.ok(launches[0]!.params.outputSchema);
  assert.match(String(launches[0]!.params.task), /structured_output/);
  events.emit("subagent:async-complete", { runId: "foreign" }); events.emit("subagent:async-complete", { runId: run.runId });

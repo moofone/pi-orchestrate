@@ -57,17 +57,24 @@ export default function (pi: ExtensionAPI) {
 			// Caller identity is established independently of the mutation predicate;
 			// targeting a reserved path is never worker proof.
 			const targets = mutationTargetDirs(command, fallback);
-			const verified = !writer ? targets.map(dir => verifiedDurableExecutionReservation(dir)) : [];
-			const executionWorker = !writer && verified.length > 0 && verified.every(Boolean) && new Set(verified.map(item => item?.attemptId)).size === 1 ? verified[0] : undefined;
+			// Labels select the writer policy only. They never authorize a durable
+			// execution workspace; every target must carry the exact runtime-bound
+			// attempt/session/run evidence.
+			const verified = targets.map(dir => verifiedDurableExecutionReservation(dir));
+			const executionWorker = verified.length > 0 && verified.every(Boolean) && new Set(verified.map(item => item?.attemptId)).size === 1 ? verified[0] : undefined;
 			const reserved = targets.some(dir => durableExecutionReservation(dir) || durableExecutionWorkspaceFence(dir));
-			if (writer || executionWorker) executionRole = "worker";
+			if (executionWorker) executionRole = "worker";
 			else if (reserved || verified.some(Boolean)) executionRole = "parent";
 			const store = createReviewStore(stateDir());
 			writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
 		} catch {
 			writerReserved = false;
 		}
-		const first = classifyForRole(command, { writer, writerReserved: writerReserved || executionRole === "parent", ...(executionRole ? { executionRole } : {}) });
+		// A writer label without exact execution proof is treated as an
+		// untrusted caller for reserved workspaces. Keep label-based publication
+		// restrictions for ordinary/unreserved writer sessions.
+		const reservedWithoutExecutionProof = writer && executionRole === "parent";
+		const first = classifyForRole(command, { writer: reservedWithoutExecutionProof ? false : writer, writerReserved: writerReserved || executionRole === "parent", ...(executionRole ? { executionRole } : {}) });
 		if (first.block) return first;
 
 		const key = viewRepeatKey(command);
