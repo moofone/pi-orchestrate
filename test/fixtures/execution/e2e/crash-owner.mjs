@@ -21,6 +21,7 @@ if (args.length < 8) {
   const scenario = resume ? mode.slice("resume-".length) : mode;
   const sessionId = JSON.parse(readFileSync(sessionFile, "utf8").split("\n")[0]).id;
   const repo = { commonDir, id: digest(commonDir) };
+  const lockPath = join(stateRoot, "plan-driven-v1", "execution", repo.id, "transaction.lock");
   mkdirSync(providerRoot, { recursive: true }); mkdirSync(join(providerRoot, "runs"), { recursive: true });
   const eventListeners = new Map();
   const processes = new Map();
@@ -29,9 +30,12 @@ if (args.length < 8) {
   const writeJson = (name, value) => writeFileSync(join(providerRoot, name), JSON.stringify(value));
   const waitFor = async path => { while (!existsSync(path)) await new Promise(resolve => setTimeout(resolve, 5)); };
   const checkpoint = async (name, details = {}) => {
-    writeJson(`checkpoint-${name}.json`, { name, pid: process.pid, at: Date.now(), ...details });
+    writeJson(`checkpoint-${name}.json`, { name, pid: process.pid, at: Date.now(), lockExists: existsSync(lockPath), ...details });
     process.stdout.write(`CHECKPOINT ${name}\n`);
-    await waitFor(join(providerRoot, `release-${name}`));
+    // Stop exactly after the synchronous checkpoint write. The parent verifies
+    // this process is stopped and SIGKILLs it, so no later event-loop turn can
+    // begin an unrelated store transaction before the intended crash boundary.
+    process.kill(process.pid, "SIGSTOP");
   };
   const reply = (request, success, data, error) => emit(`subagents:rpc:v1:reply:${request.requestId}`, { version: 1, requestId: request.requestId, method: request.method, success, ...(success ? { data } : { error }) });
   const emit = (name, data) => { for (const listener of eventListeners.get(name) ?? []) listener(data); if (name === "subagents:rpc:v1:request") void rpc(data); };
@@ -46,7 +50,7 @@ if (args.length < 8) {
     appendJson("rpc-events.jsonl", { event: "spawn", runId, pid: process.pid, at: Date.now() });
     const artifactDir = join(providerRoot, "runs", runId), configPath = join(providerRoot, `${runId}.json`);
     const taskId = /TASK_ID:\s*([A-Za-z0-9._-]+)/.exec(String(params.task ?? ""))?.[1] ?? "recovery";
-    mkdirSync(artifactDir, { recursive: true }); writeFileSync(configPath, JSON.stringify({ mode: "worker", runId, sessionId, artifactDir, eventsPath: join(providerRoot, "children.jsonl"), taskId, agent: params.agent }));
+    mkdirSync(artifactDir, { recursive: true }); writeFileSync(configPath, JSON.stringify({ mode: "worker", runId, sessionId, artifactDir, eventsPath: join(providerRoot, "children.jsonl"), taskId, agent: params.agent, ...(scenario === "accepted" ? { barrier: join(providerRoot, "accepted-barrier") } : {}) }));
     if (scenario === "launch") { await checkpoint("launch-intent-before-rpc", { runId, taskId }); }
     const childPath = new URL("./fake-child.mjs", import.meta.url).pathname;
     const child = spawn(process.execPath, [childPath, configPath], { cwd: String(params.cwd), env: { ...process.env, NODE_NO_WARNINGS: "1" }, stdio: ["ignore", "ignore", "pipe"] });
@@ -62,7 +66,8 @@ if (args.length < 8) {
       };
       if (scenario === "terminal") void checkpoint("terminal-before-receipt", { runId, taskId }).then(finish); else finish();
     });
-    if (scenario !== "launch") reply(request, true, { details: { mode: "single", runId, asyncDir: artifactDir } });
+    if (scenario === "accepted") await checkpoint("accepted-before-ack", { runId, taskId, childPid: child.pid });
+    if (scenario !== "launch" && scenario !== "accepted") reply(request, true, { details: { mode: "single", runId, asyncDir: artifactDir } });
   };
   const events = { on(name, listener) { const listeners = eventListeners.get(name) ?? new Set(); listeners.add(listener); eventListeners.set(name, listeners); return () => listeners.delete(listener); }, emit };
   const runGit = (cwd, argv) => new Promise(resolve => {
@@ -82,7 +87,6 @@ if (args.length < 8) {
     tasks: [{ id: taskId, featureId, deliveryGroupId: groupId, text: "TASK_ID: recovery\nRun the crash-boundary worker.", mode: "mutation", dependencies: [], scope: ["src/"], profile: { agent: "child-worker" }, checks: [], provenance: ["text", "mode", "scope", "profile", "deliveryGroupId", "dependencies"].map(field => ({ field, origin: "inferred", reason: "crash boundary fixture" })) }],
     constraints: { capacity: 1, parallelGroups: [], provenance: [{ field: "capacity", origin: "inferred", reason: "crash boundary fixture" }] }, provenance: ["scope", "features", "deliveryGroups"].map(field => ({ field, origin: "inferred", reason: "crash boundary fixture" })),
   };
-  const lockPath = join(stateRoot, "plan-driven-v1", "execution", repo.id, "transaction.lock");
   const controllerPath = join(providerRoot, "controller-state.json");
   const controllerState = () => existsSync(controllerPath) ? JSON.parse(readFileSync(controllerPath, "utf8")) : {};
   const controller = {

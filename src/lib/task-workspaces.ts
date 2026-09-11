@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, posix, relative, resolve } from "node:path";
 import {
 	digest, receiptDigest, taskRevisionDigest, validateCheckEvidence,
 	type CheckExecutor, type IntegrationIntent, type RepoIdentity, type ResultReceipt,
@@ -35,6 +35,10 @@ function canonical(path: string): string {
 	return resolve(realpathSync(dirname(path)), path.slice(dirname(path).length + 1));
 }
 function within(root: string, path: string): boolean { const rel = relative(root, path); return !!rel && !rel.startsWith("..") && !isAbsolute(rel); }
+/** A root scope accepts only Git's canonical workspace-relative path spelling. */
+function validRootChangedPath(path: string): boolean {
+	return !!path && !isAbsolute(path) && !path.includes("\\") && !path.split("/").includes("..") && !/[\x00-\x1f]/.test(path) && posix.normalize(path) === path;
+}
 async function gitRead(git: WorkspaceGit, cwd: string, argv: string[]): Promise<string> {
 	const result = await git(cwd, argv); requireThat(result.exitCode === 0, `Git ${argv[0]} failed: ${result.stderr}`); return argv.includes("-z") ? result.stdout : result.stdout.trim();
 }
@@ -215,7 +219,7 @@ export async function collectTaskResult(options: ResultCollectionOptions): Promi
 			requireThat(task.mode === "mutation" && sha(o.output.commit) && inspection.head === o.output.commit, "Missing exact output commit");
 			const actual = await range(o.git, a.workspace.path, o.preparedHead, o.output.commit);
 			requireThat(actual.commits.length > 0, "No result commits");
-			for (const path of actual.paths) requireThat(!isAbsolute(path) && !path.split("/").includes("..") && task.scope.some(scope => scope && !isAbsolute(scope) && !scope.split("/").includes("..") && (path === scope || (scope.endsWith("/") && path.startsWith(scope)))), `Out of scope: ${path}`);
+			for (const path of actual.paths) requireThat(!isAbsolute(path) && !path.split("/").includes("..") && task.scope.some(scope => scope && !isAbsolute(scope) && !scope.split("/").includes("..") && (scope === "." ? validRootChangedPath(path) : path === scope || (scope.endsWith("/") && path.startsWith(scope)))), `Out of scope: ${path}`);
 			output = { kind: "commits", from: o.preparedHead, to: o.output.commit, ...actual };
 		} else {
 			requireThat(task.mode === "read-only" && inspection.head === o.preparedHead, "Read-only task changed Git head");

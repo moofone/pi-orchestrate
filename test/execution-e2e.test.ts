@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,6 +10,9 @@ import { createControllerDeliveryAdapter } from "../src/lib/execution-delivery.t
 import { digest, type DeliveryGroup, type ExecutionManifest, type RepoIdentity } from "../src/lib/execution-contract.ts";
 import type { RuntimeEventBus } from "../src/lib/attempt-runtime.ts";
 import { PR_REVIEW_RECONCILED_EVENT } from "../src/lib/pr-review-events.ts";
+
+const evidenceBase = process.env.U8_EVIDENCE_ROOT ? (mkdirSync(process.env.U8_EVIDENCE_ROOT, { recursive: true }), realpathSync(process.env.U8_EVIDENCE_ROOT)) : undefined;
+let evidenceRun = 0;
 
 const childPath = realpathSync(new URL("./fixtures/execution/e2e/fake-child.mjs", import.meta.url).pathname);
 const crashOwnerPath = realpathSync(new URL("./fixtures/execution/e2e/crash-owner.mjs", import.meta.url).pathname);
@@ -159,7 +162,7 @@ function git(cwd: string, args: string[], input?: string): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", input, env: { ...process.env, GIT_AUTHOR_NAME: "E2E", GIT_AUTHOR_EMAIL: "e2e@example.test", GIT_COMMITTER_NAME: "E2E", GIT_COMMITTER_EMAIL: "e2e@example.test" } });
 }
 function makeRepo() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "execution-e2e-"))), repoPath = join(root, "repo"), remote = join(root, "remote.git");
+  const root = evidenceBase ? (() => { const stem = `run-${process.pid}-${evidenceRun++}`; let path = join(evidenceBase, stem); if (existsSync(path)) path = join(evidenceBase, `${stem}-${Date.now()}`); mkdirSync(path, { recursive: true }); return realpathSync(path); })() : realpathSync(mkdtempSync(join(tmpdir(), "execution-e2e-"))), repoPath = join(root, "repo"), remote = join(root, "remote.git");
   mkdirSync(repoPath); mkdirSync(remote); git(remote, ["init", "--bare"]); git(repoPath, ["init", "--initial-branch=main"]);
   mkdirSync(join(repoPath, "src")); mkdirSync(join(repoPath, "test"));
   writeFileSync(join(repoPath, "test/check.mjs"), 'import { test } from "node:test"; test("check fixture passes", () => {});\n');
@@ -190,6 +193,29 @@ function makeHarness(scenario: string, capacity = 6) {
 }
 
 type Harness = ReturnType<typeof makeHarness>;
+function stateCounts(state: ReturnType<Harness["bridge"]["store"]["read"]>) {
+  return {
+    attempts: state.attempts.length, attemptPhases: Object.fromEntries([...new Set(state.attempts.map(a => a.phase))].sort().map(phase => [phase, state.attempts.filter(a => a.phase === phase).length])),
+    reservations: state.reservations.length, results: state.results.length, integrations: state.integrations.length, integrationReceipts: state.integrationReceipts.length,
+    deliveries: state.deliveries.length, deliveryPhases: Object.fromEntries([...new Set(state.deliveries.map(d => d.phase))].sort().map(phase => [phase, state.deliveries.filter(d => d.phase === phase).length])),
+  };
+}
+function writeCrashSnapshot(h: Harness, name: string, phase: "before" | "after", state: ReturnType<Harness["bridge"]["store"]["read"]>): void {
+  writeFileSync(join(h.provider.root, `snapshot-${name}-${phase}.json`), JSON.stringify({ name, phase, at: Date.now(), counts: stateCounts(state), state }, null, 2));
+}
+function retainHarnessEvidence(h: Harness): void {
+  const state = h.bridge.store.read(), events = h.provider.events(), starts = events.filter(e => e.event === "start" && e.mode === "worker"), ends = events.filter(e => e.event === "end" && e.mode === "worker");
+  const evidence = {
+    scenario: h.provider.scenario, root: h.root, providerRoot: h.provider.root, stateRoot: h.stateRoot, ownedRoot: h.ownedRoot,
+    workspacePaths: [...new Set(state.attempts.map(a => a.workspace.path))], workerPids: starts.map(e => e.pid),
+    overlapIntervals: starts.map(start => ({ runId: start.runId, taskId: start.taskId, pid: start.pid, start: start.at, end: ends.find(end => end.runId === start.runId)?.at ?? null })),
+    combinedChecks: state.integrationReceipts.flatMap(receipt => receipt.checks.map(check => ({ intentId: receipt.intentId, checkId: check.checkId, invocationId: check.invocationId, status: check.status, startedAt: check.startedAt, finishedAt: check.finishedAt }))),
+    stateCounts: stateCounts(state), crashSnapshots: readdirSync(h.provider.root).filter(name => name.startsWith("snapshot-")).sort().map(name => join(h.provider.root, name)),
+    artifacts: [join(h.provider.root, "children.jsonl"), join(h.provider.root, "rpc-events.jsonl"), join(h.provider.root, "git-commands.jsonl"), join(h.provider.root, "controller-state.json")].filter(existsSync),
+  };
+  writeFileSync(join(h.root, "evidence-index.json"), JSON.stringify(evidence, null, 2));
+  if (evidenceBase) appendFileSync(join(evidenceBase, "index.jsonl"), `${JSON.stringify(evidence)}\n`);
+}
 async function approved(h: Harness, capacity = 6, publication = false): Promise<ExecutionManifest> {
   const first = await h.bridge.run(h.planPath); assert.equal(first.kind, "approval-required", JSON.stringify(first)); if (first.kind !== "approval-required") throw new Error("approval fixture");
   const second = await h.bridge.run(h.planPath, { token: first.preview.token, capacity, publication, ...(first.preview.boundary.publicationRepository ? { publicationRepository: first.preview.boundary.publicationRepository } : {}), approvedBy: h.sessionFile, approvedAt: Date.now() });
@@ -202,10 +228,11 @@ async function eventually<T>(read: () => T, predicate: (value: T) => boolean, la
 }
 function taskId(manifest: ExecutionManifest, logical: string): string { return manifest.tasks.find(task => task.text.includes(`TASK_ID: ${logical}`))!.id; }
 function release(h: Harness) { mkdirSync(join(h.provider.root, "barrier"), { recursive: true }); writeFileSync(join(h.provider.root, "barrier", "release"), "release\n"); }
-async function close(h: Harness) { await h.bridge.shutdown(); await h.provider.dispose(); }
+async function close(h: Harness) { retainHarnessEvidence(h); await h.bridge.shutdown(); await h.provider.dispose(); }
 function crashOwnerArgs(h: Harness, mode: string): string[] { return ["--experimental-strip-types", crashOwnerPath, h.stateRoot, h.repo.commonDir, h.sessionFile, h.repoPath, h.ownedRoot, h.planPath, h.provider.root, mode]; }
 function startCrashOwner(h: Harness, mode: string): ChildProcess { const child = spawn(process.execPath, crashOwnerArgs(h, mode), { stdio: ["ignore", "pipe", "pipe"] }); child.stdout?.on("data", value => appendFileSync(join(h.provider.root, "owner-stdout.log"), String(value))); child.stderr?.on("data", value => appendFileSync(join(h.provider.root, "owner-stderr.log"), String(value))); return child; }
 async function waitForExit(child: ChildProcess): Promise<void> { if (child.exitCode !== null) return; await new Promise<void>((resolve, reject) => { child.once("close", () => resolve()); child.once("error", reject); }); }
+async function waitForStopped(child: ChildProcess, label: string): Promise<void> { await eventually(() => { try { return execFileSync("ps", ["-o", "state=", "-p", String(child.pid)], { encoding: "utf8" }).trim(); } catch { return ""; } }, state => /^T/.test(state), label); }
 async function killOwner(child: ChildProcess): Promise<void> { if (child.exitCode === null) child.kill("SIGKILL"); await waitForExit(child); }
 async function stopOwner(h: Harness, child: ChildProcess): Promise<void> { writeFileSync(join(h.provider.root, "stop"), "stop\n"); await waitForExit(child); }
 
@@ -308,40 +335,51 @@ test("U8 AE6 same-PID reload and true exited-owner startup reconcile one real ru
     replacement = createExecutionBridge({ ...((h as any).bridge ? {} : {}), pi: h.pi, events: h.provider, repo: h.repo, referencePath: h.repoPath, stateRoot: h.stateRoot, sessionFile: h.sessionFile, processStart: `e2e-reload:${process.pid}`, capacity: 6, ownedRoot: h.ownedRoot, interpretationTransport: createExecutionInterpreter({ events: h.provider, cwd: h.repoPath, sessionFile: h.sessionFile }) });
     await replacement.start({ resumePriorOwner: true }); const active = replacement.store.read(); assert.equal(active.reservations.length, 1); assert.equal(h.provider.spawnParams.filter(p => String(p.task).includes("TASK_ID: recovery")).length, 1, "the crash-owner must not replay a launch");
     release(h); await eventually(() => replacement!.store.read(), state => state.attempts.some(a => a.taskId === taskId(manifest, "recovery") && a.phase === "succeeded"), "reconciled recovery terminal");
-  } finally { release(h); if (replacement) await replacement.shutdown(); else await h.bridge.shutdown(); if (crash && crash.exitCode === null) crash.kill("SIGKILL"); await h.provider.dispose(); }
+  } finally { release(h); retainHarnessEvidence(h); if (replacement) await replacement.shutdown(); else await h.bridge.shutdown(); if (crash && crash.exitCode === null) crash.kill("SIGKILL"); await h.provider.dispose(); }
 });
 
 test("U8 AE6 real owner death before spawn RPC retains unknown reservation without replay", async () => {
   const h = makeHarness("recovery"); let owner: ChildProcess | undefined; let replacement: ChildProcess | undefined;
   try {
-    owner = startCrashOwner(h, "launch"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-launch-intent-before-rpc.json")), value => value, "launch-intent checkpoint");
-    const before = h.bridge.store.read(); assert.equal(before.attempts.length, 1); assert.equal(before.attempts[0]!.phase, "launching"); assert.equal(before.reservations.length, 1); assert.equal(before.results.length, 0); await killOwner(owner); owner = undefined;
+    owner = startCrashOwner(h, "launch"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-launch-intent-before-rpc.json")), value => value, "launch-intent checkpoint"); await waitForStopped(owner, "launch owner stopped at exact checkpoint");
+    const before = h.bridge.store.read(); writeCrashSnapshot(h, "launch-intent-before-rpc", "before", before); assert.equal(before.attempts.length, 1); assert.equal(before.attempts[0]!.phase, "launching"); assert.equal(before.reservations.length, 1); assert.equal(before.results.length, 0); await killOwner(owner); owner = undefined;
     replacement = startCrashOwner(h, "resume-launch"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.attempts[0]?.phase === "recovery-needed", "unknown launch remains fenced");
-    const after = h.bridge.store.read(); assert.equal(after.reservations.length, 1); assert.equal(after.results.length, 0); assert.equal(readFileSync(join(h.provider.root, "rpc-events.jsonl"), "utf8").split("\n").filter(Boolean).length, 1); assert.equal(after.attempts[0]!.id, before.attempts[0]!.id);
+    const after = h.bridge.store.read(); writeCrashSnapshot(h, "launch-intent-before-rpc", "after", after); assert.equal(after.reservations.length, 1); assert.equal(after.results.length, 0); assert.equal(readFileSync(join(h.provider.root, "rpc-events.jsonl"), "utf8").split("\n").filter(Boolean).length, 1); assert.equal(after.attempts[0]!.id, before.attempts[0]!.id);
   } finally { if (replacement) await stopOwner(h, replacement); if (owner) await killOwner(owner); await close(h); }
+});
+
+test("U8 AE6 real owner death after accepted launch before RPC acknowledgement keeps live child unknown and does not relaunch", async () => {
+  const h = makeHarness("recovery"); let owner: ChildProcess | undefined; let replacement: ChildProcess | undefined;
+  try {
+    owner = startCrashOwner(h, "accepted"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-accepted-before-ack.json")), value => value, "accepted-before-ack checkpoint"); await waitForStopped(owner, "accepted owner stopped at exact checkpoint");
+    const checkpoint = JSON.parse(readFileSync(join(h.provider.root, "checkpoint-accepted-before-ack.json"), "utf8")); assert.ok(Number.isInteger(checkpoint.childPid) && checkpoint.childPid > 0); assert.doesNotThrow(() => process.kill(checkpoint.childPid, 0), "accepted child remains live behind its barrier");
+    const before = h.bridge.store.read(); writeCrashSnapshot(h, "accepted-before-ack", "before", before); assert.equal(before.attempts.length, 1); assert.equal(before.attempts[0]!.phase, "launching"); assert.equal(before.reservations.length, 1); assert.equal(before.results.length, 0); await killOwner(owner); owner = undefined;
+    replacement = startCrashOwner(h, "resume-accepted"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.attempts[0]?.phase === "recovery-needed", "accepted launch remains unknown");
+    const after = h.bridge.store.read(); writeCrashSnapshot(h, "accepted-before-ack", "after", after); assert.equal(after.reservations.length, 1); assert.equal(after.results.length, 0); assert.equal(readFileSync(join(h.provider.root, "rpc-events.jsonl"), "utf8").split("\n").filter(Boolean).length, 1); assert.equal(after.attempts[0]!.id, before.attempts[0]!.id); mkdirSync(join(h.provider.root, "accepted-barrier"), { recursive: true }); writeFileSync(join(h.provider.root, "accepted-barrier", "release"), "release\\n"); await eventually(() => h.provider.events(), events => events.some(e => e.event === "end" && e.taskId === "recovery"), "accepted child terminal after fenced recovery");
+  } finally { mkdirSync(join(h.provider.root, "accepted-barrier"), { recursive: true }); writeFileSync(join(h.provider.root, "accepted-barrier", "release"), "release\\n"); if (replacement) await stopOwner(h, replacement); if (owner) await killOwner(owner); await close(h); }
 });
 
 test("U8 AE6 real owner death after terminal evidence recovers one exact receipt and fences late callback", async () => {
   const h = makeHarness("recovery"); let owner: ChildProcess | undefined; let replacement: ChildProcess | undefined;
   try {
-    owner = startCrashOwner(h, "terminal"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-terminal-before-receipt.json")), value => value, "terminal-before-receipt checkpoint"); const before = h.bridge.store.read(); assert.equal(before.results.length, 0); assert.equal(before.attempts.length, 1); await killOwner(owner); owner = undefined;
-    replacement = startCrashOwner(h, "resume-terminal"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.results.length === 1 && state.attempts[0]?.phase === "succeeded", "terminal recovery receipt"); const recovered = h.bridge.store.read(); const receiptDigest = recovered.results[0]!.digest; writeFileSync(join(h.provider.root, "late-old-callback"), "late\n"); await new Promise(resolve => setTimeout(resolve, 100)); assert.equal(h.bridge.store.read().results.length, 1); assert.equal(h.bridge.store.read().results[0]!.digest, receiptDigest); assert.equal(readFileSync(join(h.provider.root, "rpc-events.jsonl"), "utf8").split("\n").filter(Boolean).length, 1);
+    owner = startCrashOwner(h, "terminal"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-terminal-before-receipt.json")), value => value, "terminal-before-receipt checkpoint"); await waitForStopped(owner, "terminal owner stopped at exact checkpoint"); const before = h.bridge.store.read(); writeCrashSnapshot(h, "terminal-before-receipt", "before", before); assert.equal(before.results.length, 0); assert.equal(before.attempts.length, 1); await killOwner(owner); owner = undefined;
+    replacement = startCrashOwner(h, "resume-terminal"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.results.length === 1 && state.attempts[0]?.phase === "succeeded", "terminal recovery receipt"); const recovered = h.bridge.store.read(); writeCrashSnapshot(h, "terminal-before-receipt", "after", recovered); const receiptDigest = recovered.results[0]!.digest; writeFileSync(join(h.provider.root, "late-old-callback"), "late\n"); await new Promise(resolve => setTimeout(resolve, 100)); assert.equal(h.bridge.store.read().results.length, 1); assert.equal(h.bridge.store.read().results[0]!.digest, receiptDigest); assert.equal(readFileSync(join(h.provider.root, "rpc-events.jsonl"), "utf8").split("\n").filter(Boolean).length, 1);
   } finally { if (replacement) await stopOwner(h, replacement); if (owner) await killOwner(owner); await close(h); }
 });
 
 test("U8 AE6 real owner death after Git mutation keeps completed journal and never re-cherry-picks", async () => {
   const h = makeHarness("recovery"); let owner: ChildProcess | undefined; let replacement: ChildProcess | undefined;
   try {
-    owner = startCrashOwner(h, "integration"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-git-mutation-before-integration-receipt.json")), value => value, "Git mutation before integration receipt checkpoint"); const before = h.bridge.store.read(); assert.equal(before.integrations.length, 1); assert.equal(before.integrations[0]!.phase, "validating"); assert.equal(before.integrationReceipts.length, 0); const cherryPicksBefore = readFileSync(join(h.provider.root, "git-commands.jsonl"), "utf8").split("\n").filter(line => line.includes('"cherry-pick"')).length; assert.equal(cherryPicksBefore, 1); await killOwner(owner); owner = undefined;
-    replacement = startCrashOwner(h, "resume-integration"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.integrationReceipts.length === 1 && state.deliveries[0]?.phase === "ready", "integration receipt recovery"); const after = h.bridge.store.read(); assert.equal(after.integrationReceipts.length, 1); const cherryPicksAfter = readFileSync(join(h.provider.root, "git-commands.jsonl"), "utf8").split("\n").filter(line => line.includes('"cherry-pick"')).length; assert.equal(cherryPicksAfter, cherryPicksBefore); assert.equal(after.integrations.filter(i => i.phase === "complete").length, 1);
+    owner = startCrashOwner(h, "integration"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-git-mutation-before-integration-receipt.json")), value => value, "Git mutation before integration receipt checkpoint"); await waitForStopped(owner, "integration owner stopped at exact checkpoint"); const before = h.bridge.store.read(); writeCrashSnapshot(h, "git-mutation-before-integration-receipt", "before", before); assert.equal(before.integrations.length, 1); assert.equal(before.integrations[0]!.phase, "validating"); assert.equal(before.integrationReceipts.length, 0); const cherryPicksBefore = readFileSync(join(h.provider.root, "git-commands.jsonl"), "utf8").split("\n").filter(line => line.includes('"cherry-pick"')).length; assert.equal(cherryPicksBefore, 1); await killOwner(owner); owner = undefined;
+    replacement = startCrashOwner(h, "resume-integration"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.integrationReceipts.length === 1 && state.deliveries[0]?.phase === "ready", "integration receipt recovery"); const after = h.bridge.store.read(); writeCrashSnapshot(h, "git-mutation-before-integration-receipt", "after", after); assert.equal(after.integrationReceipts.length, 1); const cherryPicksAfter = readFileSync(join(h.provider.root, "git-commands.jsonl"), "utf8").split("\n").filter(line => line.includes('"cherry-pick"')).length; assert.equal(cherryPicksAfter, cherryPicksBefore); assert.equal(after.integrations.filter(i => i.phase === "complete").length, 1);
   } finally { if (replacement) await stopOwner(h, replacement); if (owner) await killOwner(owner); await close(h); }
 });
 
 test("U8 AE6 real owner death after controller persistence keeps pending fence and reconciles one transfer", async () => {
   const h = makeHarness("recovery"); let owner: ChildProcess | undefined; let replacement: ChildProcess | undefined;
   try {
-    owner = startCrashOwner(h, "controller"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-controller-persist-before-local-ack.json")), value => value, "controller persistence before local acknowledgement checkpoint"); const before = h.bridge.store.read(); assert.equal(before.deliveries[0]?.phase, "handoff-pending"); assert.equal(before.deliveries[0]?.acknowledgement, undefined); await killOwner(owner); owner = undefined;
-    replacement = startCrashOwner(h, "resume-controller"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.deliveries[0]?.phase === "controller-owned", "persisted controller acknowledgement"); const after = h.bridge.store.read(); assert.equal(after.deliveries.length, 1); assert.ok(after.deliveries[0]!.acknowledgement); assert.equal(readFileSync(join(h.provider.root, "controller-state.json"), "utf8").split("requestId").length - 1, 1);
+    owner = startCrashOwner(h, "controller"); await eventually(() => existsSync(join(h.provider.root, "checkpoint-controller-persist-before-local-ack.json")), value => value, "controller persistence before local acknowledgement checkpoint"); await waitForStopped(owner, "controller owner stopped at exact checkpoint"); const before = h.bridge.store.read(); writeCrashSnapshot(h, "controller-persist-before-local-ack", "before", before); assert.equal(before.deliveries[0]?.phase, "handoff-pending"); assert.equal(before.deliveries[0]?.acknowledgement, undefined); await killOwner(owner); owner = undefined;
+    replacement = startCrashOwner(h, "resume-controller"); await eventually(() => existsSync(join(h.provider.root, "resume-ready.json")), value => value, "replacement owner startup"); await eventually(() => h.bridge.store.read(), state => state.deliveries[0]?.phase === "controller-owned", "persisted controller acknowledgement"); const after = h.bridge.store.read(); writeCrashSnapshot(h, "controller-persist-before-local-ack", "after", after); assert.equal(after.deliveries.length, 1); assert.ok(after.deliveries[0]!.acknowledgement); assert.equal(readFileSync(join(h.provider.root, "controller-state.json"), "utf8").split("requestId").length - 1, 1);
   } finally { if (replacement) await stopOwner(h, replacement); if (owner) await killOwner(owner); await close(h); }
 });
 
@@ -389,7 +427,7 @@ test("U8 AE8 approved shared nondefault PR grouping creates one fenced obligatio
     const startsBeforeMerge = h.provider.events().filter(e => e.event === "start" && e.mode === "worker").length;
     writeControllerState({ ...readControllerState(), view: { ...readControllerState().view!, state: "merged" } }); h.provider.emit(PR_REVIEW_RECONCILED_EVENT, { pr: request.pr }); await eventually(() => bridge.store.read(), state => state.deliveries[0]!.phase === "merged", "verified merge after controller reconciliation");
     const actualRun = h.provider.events().find(e => e.event === "end" && e.taskId === "b1")!; h.provider.emit("subagent:async-complete", { runId: actualRun.runId, sessionId, mode: "single", success: true }); h.provider.emit("subagent:async-complete", { runId: actualRun.runId, sessionId, mode: "single", success: true }); await bridge.scheduler.reconcile(); assert.equal(handoffs, 1); assert.equal(h.provider.events().filter(e => e.event === "start" && e.mode === "worker").length, startsBeforeMerge); assert.equal(bridge.store.read().deliveries.length, 1);
-  } finally { release(h); await bridge.shutdown(); await h.provider.dispose(); }
+  } finally { release(h); retainHarnessEvidence(h); await bridge.shutdown(); await h.provider.dispose(); }
 });
 
 test("U8 AE9 selectable legacy preset executes review-TDD-QA roles in order and reaches delivery gate", async () => {

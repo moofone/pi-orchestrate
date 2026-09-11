@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { collectTaskResult, TaskWorkspaces, type ResultCollectionOptions, type WorkspaceGit, type WorkspaceJournal } from "../src/lib/task-workspaces.ts";
 import { digest, receiptDigest, taskRevisionDigest, type ResultReceipt, type WorkspaceRef } from "../src/lib/execution-contract.ts";
 import { fakeAttempt, fakeCheck, FakeCheckExecutor, fakeManifest } from "./fixtures/execution/fakes.ts";
@@ -116,7 +116,7 @@ test("in-progress Git operation is surfaced and composition refuses mutation", a
 	assert.equal((await f.adapter.compose({ intent: { id: "integration", deliveryGroupId: "d", workspace, inputDigests: [], createdAt: 1, beforeCommit: f.base, phase: "planned" }, receipts: [] })).kind, "refused");
 });
 
-async function resultFixture(readOnly = false, withPrerequisite = false) {
+async function resultFixture(readOnly = false, withPrerequisite = false, resultPath = "src/result") {
 	const f = fixture(), prerequisite = withPrerequisite ? artifactReceipt(f) : undefined;
 	const workspace = f.workspaces[0]!;
 	workspace.prerequisiteDigests = prerequisite ? [prerequisite.digest] : [];
@@ -126,10 +126,38 @@ async function resultFixture(readOnly = false, withPrerequisite = false) {
 	attempt.prerequisiteDigests = workspace.prerequisiteDigests;
 	attempt.run = { runId: "run", artifactDir: f.root, ownerSessionFile: attempt.ownerSessionFile };
 	attempt.terminal = { kind: "terminal", outcome: "succeeded", run: attempt.run, evidenceDigest: digest("terminal"), observedAt: 2 };
-	const head = readOnly ? f.base : commit(workspace.path, "src/result", "result");
+	if (!readOnly) mkdirSync(join(workspace.path, dirname(resultPath)), { recursive: true });
+	const head = readOnly ? f.base : commit(workspace.path, resultPath, "result");
 	const options: ResultCollectionOptions = { attempt, task, workspaces: f.adapter, git: f.git, checks: new FakeCheckExecutor(), preparedHead: f.base, output: { kind: "commits", commit: head }, artifactRoot: f.root, ownsAttempt: async () => true, verifyTerminalOutput: async () => true, verifyPreparedBase: async (_a, base) => base === f.base, now: () => 10 };
 	return { ...f, options, head, prerequisite };
 }
+
+test("legacy root scope accepts nested changed files beneath the workspace root", async () => {
+	const f = await resultFixture(); f.options.task.scope = ["."]; f.options.attempt.taskDigest = taskRevisionDigest(f.options.task);
+	const result = await collectTaskResult(f.options);
+	assert.equal(result.kind, "validated");
+});
+
+test("explicit file and directory scopes retain exact and trailing-directory semantics", async () => {
+	const exact = await resultFixture(); exact.options.task.scope = ["src/result"]; exact.options.attempt.taskDigest = taskRevisionDigest(exact.options.task);
+	assert.equal((await collectTaskResult(exact.options)).kind, "validated");
+	const nestedExact = await resultFixture(false, false, "src/result-dir/child"); nestedExact.options.task.scope = ["src/result-dir"]; nestedExact.options.attempt.taskDigest = taskRevisionDigest(nestedExact.options.task);
+	assert.equal((await collectTaskResult(nestedExact.options)).kind, "refused");
+	const nestedDirectory = await resultFixture(false, false, "src/result-dir/child"); nestedDirectory.options.task.scope = ["src/result-dir/"]; nestedDirectory.options.attempt.taskDigest = taskRevisionDigest(nestedDirectory.options.task);
+	assert.equal((await collectTaskResult(nestedDirectory.options)).kind, "validated");
+});
+
+test("result collector rejects out-of-scope, traversal, absolute, and foreign evidence", async () => {
+	const outOfScope = await resultFixture(); outOfScope.options.task.scope = ["other/"]; outOfScope.options.attempt.taskDigest = taskRevisionDigest(outOfScope.options.task);
+	assert.equal((await collectTaskResult(outOfScope.options)).kind, "refused");
+	for (const changedPath of ["../escape", "/foreign/absolute.txt"]) {
+		const f = await resultFixture(); f.options.git = async (cwd, argv) => argv[0] === "diff-tree" ? { exitCode: 0, stdout: `${changedPath}\\0`, stderr: "" } : f.git(cwd, argv);
+		assert.equal((await collectTaskResult(f.options)).kind, "refused", changedPath);
+	}
+	const foreignRoot = realpathSync(mkdtempSync(join(tmpdir(), "u4-foreign-"))); run(foreignRoot, ["init", "--initial-branch=main"]); const foreignCommit = commit(foreignRoot, "src/foreign", "foreign");
+	const foreign = await resultFixture(); foreign.options.output = { kind: "commits", commit: foreignCommit };
+	assert.equal((await collectTaskResult(foreign.options)).kind, "refused");
+});
 
 test("immutable result capture is deterministic and rejects arbitrary HEAD, wrong base and scope", async () => {
 	const f = await resultFixture(), result = await collectTaskResult(f.options);
