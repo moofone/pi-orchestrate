@@ -180,7 +180,7 @@ export function createExecutionDelivery(options: ExecutionDeliveryOptions): Exec
 			mutate(draft => { const i = draft.integrations.find(i => i.id === id)!; i.afterCommit = head; i.phase = "validating"; });
 			const evidence: CheckEvidence[] = [];
 			for (const spec of group.checks) {
-				const startedAt = now(), invocationId = `${id}:${spec.id}:${startedAt}`;
+				const startedAt = now(), invocationId = digest([id, spec.id, startedAt]);
 				try {
 					const result = await checks.execute(spec, { workspace: target, invocationId, startedAt }); evidence.push(result);
 					validateCheckEvidence(result);
