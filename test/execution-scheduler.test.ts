@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { ExecutionScheduler } from "../src/lib/execution-scheduler.ts";
 import { createExecutionStore, createCoordinatorOwner } from "../src/lib/execution-store.ts";
 import { digest, receiptDigest, type ExecutionManifest, type LaunchRequest, type LaunchOutcome, type ResultReceipt, type TaskAttempt } from "../src/lib/execution-contract.ts";
@@ -10,6 +11,18 @@ import { fakeManifest, fakeAuthorization, FakeAttemptRuntime, FakeWorkspaceAdapt
 
 function barrier<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 async function until(predicate: () => boolean) { for (let n = 0; n < 200; n++) { if (predicate()) return; await new Promise(r => setTimeout(r, 5)); } assert.fail("condition did not settle"); }
+function appendIntentFromProcess(h: ReturnType<typeof harness>, intent: { id: string; authorizationId: string; kind: "pause" | "resume"; targetId: string }): void {
+	const storeModule = resolve(process.cwd(), "src/lib/execution-store.ts");
+	const contractModule = resolve(process.cwd(), "src/lib/execution-contract.ts");
+	const script = `
+		const { createExecutionStore } = await import(${JSON.stringify(storeModule)});
+		const { digest } = await import(${JSON.stringify(contractModule)});
+		const root = process.argv[1], commonDir = process.argv[2], sessionFile = process.argv[3], body = JSON.parse(process.argv[4]);
+		const store = createExecutionStore({ stateRoot: root, repo: { commonDir, id: digest(commonDir) } });
+		store.appendIntent({ ...body, sessionFile });
+	`;
+	execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script, h.options.store.dir.replace(/\/execution\/[^/]+$/, ""), h.manifest.repo.commonDir, h.options.owner.sessionFile, JSON.stringify(intent)], { stdio: "pipe" });
+}
 class Runtime extends FakeAttemptRuntime {
 	gates = new Map<string, ReturnType<typeof barrier<LaunchOutcome>>>();
 	intervals = new Map<string, { start: number; end?: number }>();
@@ -144,6 +157,32 @@ test("unknown, stale and mismatched intents cannot block a later authorized inte
 	await h.scheduler.reconcile(); assert.ok(h.store.read().intents.every(i => i.consumedAt !== undefined));
 	assert.equal(h.store.read().tasks[0]!.intent, "pause"); assert.equal(h.store.read().capacity, 0); assert.match(h.scheduler.progress().error!, /mismatch.*Mismatched intent target/);
 	await h.scheduler.shutdown();
+});
+
+test("stable-directory wake consumes repeated cross-process intents after startup events drain", async () => {
+	const h = harness(); await begin(h); await until(() => h.runtime.launches.length === 1);
+	const attempt = h.runtime.launches[0]!.attempt; h.runtime.running(attempt.id); await until(() => h.store.read().attempts[0]!.phase === "running");
+	await h.scheduler.control({ targetId: attempt.taskId, action: "pause" }); await until(() => h.store.read().tasks[0]!.intent === "pause");
+	// Let acquisition/recovery/admission and their atomic renames settle before
+	// submitting from another Node process. This specifically exercises a watcher
+	// that remains attached to the stable directory, not the replaced inode.
+	await new Promise(resolve => setTimeout(resolve, 100));
+	appendIntentFromProcess(h, { id: "stale-before-valid", authorizationId: "missing-authorization", kind: "resume", targetId: attempt.taskId });
+	await until(() => h.store.read().intents.some(i => i.id === "stale-before-valid" && i.consumedAt !== undefined));
+	appendIntentFromProcess(h, { id: "valid-after-stale", authorizationId: fakeAuthorization(h.manifest).id, kind: "resume", targetId: attempt.taskId });
+	await until(() => h.store.read().intents.some(i => i.id === "valid-after-stale" && i.consumedAt !== undefined && h.store.read().tasks[0]!.intent === "none"));
+	assert.equal(h.store.read().tasks[0]!.intent, "none");
+	await h.scheduler.shutdown();
+});
+
+test("shutdown closes the durable watcher before relinquishing and cannot consume later writes", async () => {
+	const h = harness(); await h.scheduler.start();
+	assert.ok((h.scheduler as unknown as { stateWatcher?: unknown }).stateWatcher);
+	await h.scheduler.shutdown();
+	assert.equal((h.scheduler as unknown as { stateWatcher?: unknown }).stateWatcher, undefined);
+	appendIntentFromProcess(h, { id: "after-shutdown", authorizationId: "missing-authorization", kind: "resume", targetId: "task-1" });
+	await new Promise(resolve => setTimeout(resolve, 50));
+	assert.equal(h.store.read().intents.find(i => i.id === "after-shutdown")?.consumedAt, undefined);
 });
 
 test("cross-session admission requires the full persisted approval and rejects changed contract", async () => {

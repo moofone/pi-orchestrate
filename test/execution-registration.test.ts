@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { existsSync, mkdtempSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { digest } from "../src/lib/execution-contract.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,6 +70,31 @@ function harness(early = true, approve = false) {
   shutdown: () => handlers.get("session_shutdown")!({}, ctx),
  };
 }
+function seedCrashedOwner(h: ReturnType<typeof harness>): number {
+ const storeModule = new URL("../src/lib/execution-store.ts", import.meta.url).pathname;
+ const contractModule = new URL("../src/lib/execution-contract.ts", import.meta.url).pathname;
+ const fakesModule = new URL("./fixtures/execution/fakes.ts", import.meta.url).pathname;
+ const script = `
+  const { createExecutionStore, createCoordinatorOwner } = await import(${JSON.stringify(storeModule)});
+  const { digest } = await import(${JSON.stringify(contractModule)});
+  const { fakeManifest, fakeAuthorization, fakeAttempt, fakeReservation, admitFakeManifest } = await import(${JSON.stringify(fakesModule)});
+  const root = process.argv[1], commonDir = process.argv[2], sessionFile = process.argv[3];
+  const repo = { commonDir, id: digest(commonDir) }, store = createExecutionStore({ stateRoot: root, repo });
+  const manifest = fakeManifest(); manifest.repo = repo;
+  const owner = store.acquire(createCoordinatorOwner(sessionFile, "crashed-process"));
+  store.markReconciled(owner);
+  store.transact(owner, state => {
+   state.capacity = 1; admitFakeManifest(state, manifest);
+   const attempt = fakeAttempt(manifest); attempt.ownerSessionFile = sessionFile; attempt.operationId = attempt.id;
+   attempt.workspace = { ...attempt.workspace, path: root + "/workspace" }; attempt.phase = "preparing";
+   state.attempts.push(attempt); state.reservations.push({ ...fakeReservation(attempt), workspaceId: attempt.workspace.id, workspacePath: attempt.workspace.path });
+   state.tasks[0].attemptIds = [attempt.id]; state.tasks[0].phase = "preparing";
+  });
+  console.log(process.pid);
+ `;
+ const output = execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", script, join(home, "orchestrator", "plan-driven-v1"), join(h.root, ".git"), h.sessionFile], { encoding: "utf8" });
+ return Number(output.trim());
+}
 for (const early of [true, false]) test(`registered command accepts structured-only interpretation (early=${early}) without profile pins or coordinator lease`, async () => {
  const h = harness(early);
  try {
@@ -82,6 +108,23 @@ for (const early of [true, false]) test(`registered command accepts structured-o
   assert.match(h.notifications.at(-1)!, /epoch=0/);
  } finally { await h.shutdown(); }
 });
+test("registered lifecycle recovers first-crash active work for the same canonical session", async () => {
+ const h = harness(true, true); const crashedPid = seedCrashedOwner(h);
+ const statePath = join(home, "orchestrator", "plan-driven-v1", "execution", digest(join(h.root, ".git")), "coordinator.json");
+ const crashed = JSON.parse(readFileSync(statePath, "utf8"));
+ assert.equal(crashed.lastOwner, undefined, "the crash fixture must not prepopulate clean-relinquishment history");
+ assert.equal(crashed.owner?.pid, crashedPid);
+ await h.handlers.get("session_start")!({}, h.ctx);
+ await new Promise(resolve => setTimeout(resolve, 100));
+ const state = JSON.parse(await (await import("node:fs/promises")).readFile(statePath, "utf8"));
+ assert.equal(state.owner?.sessionFile, realpathSync(h.sessionFile), "the first-crash owner session must reacquire durable active work");
+ assert.notEqual(state.owner?.pid, crashedPid, "startup must replace the terminated owner lease");
+ assert.ok(state.owner?.epoch > 1, "startup must advance the crash-recovery epoch");
+ assert.equal(state.attempts[0]?.phase, "recovery-needed", "the real bridge scheduler must recover the persisted preparation");
+ assert.ok(state.reconciledEpoch === state.owner?.epoch, "startup must complete phase-A reconciliation");
+ await h.shutdown();
+});
+
 test("registered lifecycle resumes prior owning session after clean shutdown without another command", async () => {
  const h = harness(true, true);
  await h.command(`run "${h.plan}"`);

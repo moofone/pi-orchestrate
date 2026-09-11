@@ -130,6 +130,11 @@ export function createExecutionStore(options: ExecutionStoreOptions): ExecutionS
 			if (!sameOwner(next.owner, owner) || next.epoch !== previous.epoch || next.sequence !== previous.sequence) throw new Error("Transaction cannot change lease/sequence");
 			validateStateChange(previous, next);
 			if (previous.reconciledEpoch !== owner.epoch && (next.reservations.some(r => !previous.reservations.some(old => old.id === r.id)) || next.attempts.some(a => !previous.attempts.some(old => old.id === a.id) || (["preparing", "launching"].includes(a.phase) && previous.attempts.find(old => old.id === a.id)?.phase !== a.phase)) || next.integrations.some(i => !previous.integrations.some(old => old.id === i.id)))) throw new Error("Reconcile epoch before admission");
+			// Reconciliation frequently observes an already-settled state. Avoid
+			// replacing the document for a semantic no-op: directory notifications
+			// are durable wakeups, and writing one for every wake would self-trigger
+			// an admission/recovery loop.
+			if (digest(previous) === digest(next)) return previous;
 			next.sequence++; write(next); return next;
 		});
 	}

@@ -624,7 +624,15 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       if (startOptions.resumePriorOwner) {
         const state = store.read();
         const session = realpathSync(options.sessionFile);
-        if (!state.lastOwner || state.lastOwner.sessionFile !== session || !activeDurableWork(state)) return;
+        // Clean shutdown leaves lastOwner; a process crash leaves the current
+        // owner in place and never gets a chance to record lastOwner. Select
+        // the current owner first so a foreign live/dead lease is never
+        // bypassed by a stale historical owner. Store.acquire remains the
+        // authority for PID liveness and lease contention.
+        const recordedOwner = state.owner ?? state.lastOwner;
+        let recordedSession = "";
+        try { recordedSession = realpathSync(recordedOwner?.sessionFile ?? ""); } catch { /* malformed/missing session is not resumable */ }
+        if (!recordedOwner || recordedSession !== session || !activeDurableWork(state)) return;
       }
       starting = (async () => {
         await scheduler.start();

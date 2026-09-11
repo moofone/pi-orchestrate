@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
+import { basename } from "node:path";
 import {
 	deliveryFenced, digest, occupiesCapacity, taskRevisionDigest, transitionAttempt, validateAuthorization, workspaceExcludedByDelivery,
 	type AttemptRuntime, type CheckExecutor, type CoordinatorOwner, type CoordinatorState,
@@ -34,6 +35,7 @@ export class ExecutionScheduler {
 	private stateWatcher?: FSWatcher;
 	private loop?: Promise<void>;
 	private dirty = false;
+	private observedSequence = -1;
 	private jobs = new Map<string, Promise<void>>();
 	private validationJobs = new Map<string, Promise<void>>();
 	// A failed receipt is retried only by explicit resume or a new coordinator,
@@ -55,27 +57,50 @@ export class ExecutionScheduler {
 	subscribe(listener: (state: CoordinatorState) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
 	private now(): number { return (this.options.now ?? Date.now)(); }
 	private live(owner: CoordinatorOwner): boolean { const current = this.observe().owner; return !this.stopped && current?.instanceId === owner.instanceId && current.epoch === owner.epoch; }
+	private noteState(state: CoordinatorState): void { this.observedSequence = Math.max(this.observedSequence, state.sequence); }
 	private change(update: (state: CoordinatorState) => void): void {
 		if (!this.owner || !this.live(this.owner)) throw new Error("Scheduler is not the active coordinator");
 		const state = this.options.store.transact(this.owner, update);
+		this.noteState(state);
 		for (const listener of this.listeners) { try { listener(structuredClone(state)); } catch { /* Observers do not control admission. */ } }
 	}
 	private wake(): void { if (!this.stopped) void this.reconcile().catch(error => { this.lastError = String(error); }); }
+	private watchFailure(error: unknown): void {
+		if (this.stopped) return;
+		this.lastError = `Durable execution wakeup unavailable: ${String(error)}`;
+		const watcher = this.stateWatcher; this.stateWatcher = undefined;
+		try { watcher?.close(); } catch { /* A failed watcher is already conservatively disabled. */ }
+	}
 	async start(): Promise<void> {
 		if (this.owner || this.stopped) throw new Error("Scheduler already started or shut down");
 		this.owner = this.options.store.acquire(this.options.owner);
+		this.noteState(this.observe());
 		this.options.onOwnerAcquired?.(structuredClone(this.owner));
 		this.unsubscribe = this.options.runtime.subscribe(() => { this.deferred.clear(); this.wake(); });
-		// Intents are durable cross-process wakeups. The owner watches the state
-		// document and rechecks exact evidence; this is notification, not polling.
+		// Intents are durable cross-process wakeups. The owner watches the stable
+		// containing directory because the store atomically replaces the state
+		// document on every write. Notifications only wake reconciliation; exact
+		// authoritative state is reread by consumeIntents/recover. No polling is
+		// installed when the platform cannot provide this notification.
 		try {
-			this.stateWatcher = watch(this.options.store.statePath, { persistent: false }, () => this.wake());
-			this.stateWatcher.on("error", () => { this.stateWatcher?.close(); this.stateWatcher = undefined; });
-		} catch { this.stateWatcher = undefined; }
+			const stateName = basename(this.options.store.statePath);
+			this.stateWatcher = watch(this.options.store.dir, { persistent: false, encoding: "utf8" }, (_event, filename) => {
+				if (filename && String(filename) !== stateName) return;
+				try {
+					const state = this.observe();
+					// Atomic writes made by this scheduler still produce directory
+					// events. Ignore the sequence already incorporated by the writer;
+					// a later external append necessarily advances it.
+					if (state.sequence <= this.observedSequence && !state.intents.some(intent => intent.consumedAt === undefined)) return;
+					this.wake();
+				} catch (error) { this.watchFailure(error); }
+			});
+			this.stateWatcher.on("error", error => this.watchFailure(error));
+		} catch (error) { this.watchFailure(error); }
 		// No admission until every persisted attempt has been observed or conservatively fenced.
 		await this.recover();
 		if (!this.live(this.owner)) return;
-		this.options.store.markReconciled(this.owner);
+		this.noteState(this.options.store.markReconciled(this.owner));
 		await this.reconcile();
 	}
 	/** Capacity is an explicit repository authorization, never added from a feature request. */
@@ -376,6 +401,14 @@ export class ExecutionScheduler {
 	}
 	private async outcome(id: string, outcome: LaunchOutcome): Promise<void> {
 		let validate = false, deferred = false;
+		const current = this.observe().attempts.find(attempt => attempt.id === id);
+		if (!current || !occupiesCapacity(current) || current.terminal) return;
+		// A directory watcher also reports this scheduler's own atomic renames.
+		// Recovery observations are idempotent: do not rewrite an unchanged
+		// running/terminal/unknown outcome and turn the notification into a loop.
+		if (outcome.kind === "known-running" && current.run && digest(current.run) === digest(outcome.run) && ["running", "stopping"].includes(current.phase)) return;
+		if (outcome.kind === "known-terminal" && current.terminal && digest(current.terminal) === digest(outcome.evidence) && ["validating", "recovery-needed"].includes(current.phase)) return;
+		if (outcome.kind === "unknown" && current.phase === "recovery-needed" && current.reason === outcome.reason) return;
 		this.change(state => {
 			const attempt = state.attempts.find(a => a.id === id)!; if (!occupiesCapacity(attempt) || attempt.terminal) return;
 			if (outcome.kind === "known-running" || outcome.kind === "known-terminal") {
