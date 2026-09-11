@@ -405,7 +405,7 @@ Updated during implementation at the user's request. A unit is checked off only 
 | U5 | Complete | Commits `a7b7892`, `0b69c44`; four original race repros fixed; parent full check passes; independent recheck READY |
 | U6 | Complete | Commits `040475a`, `69c7788`; canonical PR identities and exact pre-handoff composition verified; parent 20 targeted tests/full check pass; independent recheck READY |
 | U7 | Complete | Phase A, C1/C2 and C3 independently READY through `bdc6216`; parent full 703-test check passes; production registration, publication/ownership, cross-process wake and crash/stop recovery regressions verified |
-| U8 | In progress | Prove AE1–AE9 through real commands/adapters, controlled subprocess workers, overlap intervals and durable crash checkpoints; no live publication authorized |
+| U8 | Complete | Independently READY through `4353270`; parent full 725-test check/typecheck/diff check passed. AE1–AE9 verified with real local subprocess/workspace execution, five owner-crash checkpoints, explicit revision approval, targeted pause and controller replay evidence. QA: `qa/execution-u8.md`, `qa/execution-u8-evidence.md`. Live provider/network/publication verification remains unperformed and unauthorized |
 
 ### Active lane ownership
 
