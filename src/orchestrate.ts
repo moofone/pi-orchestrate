@@ -120,6 +120,7 @@ import {
   type Task,
 } from "./lib/plan-tasks.ts";
 import {
+  canonicalPublicationRepository,
   createExecutionBridge,
   executionStatusSummary,
   isUnambiguousPlanPath,
@@ -1058,6 +1059,22 @@ async function originUrl(pi: ExtensionAPI, cwd: string): Promise<string> {
     return out.code === 0 ? out.stdout.trim() : "";
   } catch {
     return "";
+  }
+}
+/** Resolve the effective fetch and push URLs, after Git's insteadOf/pushInsteadOf expansion.
+ * Multiple destinations are ambiguous and cannot be approved for publication. */
+async function publicationRepository(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+  try {
+    const fetch = await pi.exec("git", ["remote", "get-url", "--all", "origin"], { cwd, timeout: 30_000 });
+    const push = await pi.exec("git", ["remote", "get-url", "--all", "--push", "origin"], { cwd, timeout: 30_000 });
+    if (fetch.code !== 0 || push.code !== 0) return undefined;
+    const urls = (value: string) => [...new Set(value.split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
+    const fetchRepos = urls(fetch.stdout).map(url => canonicalPublicationRepository(url.includes("://") || url.startsWith("git@") ? url.replace(/^git@([^:]+):/, "https://$1/").replace(/\/\.git$/, "") : url));
+    const pushRepos = urls(push.stdout).map(url => canonicalPublicationRepository(url.replace(/^git@([^:]+):/, "https://$1/").replace(/\/\.git$/, "")));
+    if (fetchRepos.length !== 1 || pushRepos.length !== 1 || !fetchRepos[0] || !pushRepos[0] || fetchRepos[0] !== pushRepos[0]) return undefined;
+    return fetchRepos[0];
+  } catch {
+    return undefined;
   }
 }
 
@@ -2958,6 +2975,7 @@ async function makeExecutionBridge(
     : undefined;
   const callerTools = Array.isArray(config.executionCallerTools) ? config.executionCallerTools.map(String) : undefined;
   const callerAgents = Array.isArray(config.executionCallerAgents) ? config.executionCallerAgents.map(String) : undefined;
+  const approvedPublicationRepository = await publicationRepository(pi, paths.gitRoot);
   const bridge = createExecutionBridge({
     pi,
     events,
@@ -2969,6 +2987,7 @@ async function makeExecutionBridge(
     capacity,
     preset,
     repositoryName: paths.repo,
+    ...(approvedPublicationRepository ? { repository: approvedPublicationRepository } : {}),
     callerTools,
     callerAgents,
     interpretationTransport: createExecutionInterpreter({ events, cwd: paths.gitRoot, sessionFile, profile: interpretationProfile, callerTools, callerAgents, signal }),
@@ -6488,6 +6507,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
                 token: first.preview.token,
                 capacity: first.preview.boundary.capacity,
                 publication,
+                ...(first.preview.boundary.publicationRepository ? { publicationRepository: first.preview.boundary.publicationRepository } : {}),
                 approvedBy: ctx.sessionManager?.getSessionId?.() || "pi-session",
                 approvedAt: Date.now(),
               };

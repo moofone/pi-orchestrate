@@ -46,6 +46,8 @@ export type ExecutionManifest = {
 export type ExecutionAuthorization = {
 	id: Id; manifestId: Id; revision: number; sourceDigest: Digest; manifestDigest: Digest;
 	repoId: Id; baseCommit: string; scope: string; capacity: number; publication: boolean;
+	/** Canonical host/owner/repository shown at preview and bound to publication approval. */
+	publicationRepository?: string;
 	approvedBy: string; approvedAt: number;
 };
 export type RevisionDecision = { kind: "in-scope" } | { kind: "approval-required"; reasons: string[] };
@@ -114,6 +116,8 @@ export type ExecutionControllerBootstrapPhase = "planned" | "creating" | "unknow
 export type ExecutionControllerBootstrapIntent = {
 	id: Id; operationId: Id; manifestId: Id; manifestRevision: number; manifestDigest: Digest; sourceDigest: Digest;
 	authorizationId: Id; groupId: Id; ownerId: Id; generation: string; repo: RepoIdentity; receiptDigest: Digest;
+	/** Destination captured by the approved preview; absent only on historical observations. */
+	publicationRepository?: string;
 	workspace: WorkspaceRef; branch: string; head: string; phase: ExecutionControllerBootstrapPhase;
 	createdAt: number; updatedAt: number; pr?: { repo: string; number: number }; reason?: string;
 };
@@ -293,6 +297,7 @@ export function validateManifest(value: unknown): asserts value is ExecutionMani
 }
 export function validateAuthorization(manifest: ExecutionManifest, authorization: ExecutionAuthorization): void {
 	validateManifest(manifest); text(authorization.id); text(authorization.approvedBy); integer(authorization.approvedAt); integer(authorization.capacity, 1);
+	if (authorization.publicationRepository !== undefined) { text(authorization.publicationRepository); requireThat(/^[A-Za-z0-9.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(authorization.publicationRepository) && !authorization.publicationRepository.includes(".."), "Invalid publication repository"); }
 	requireThat(authorization.manifestId === manifest.id && authorization.revision === manifest.revision && authorization.sourceDigest === manifest.source.digest && authorization.manifestDigest === digest(manifest), "Approval does not bind manifest revision/source");
 	requireThat(authorization.repoId === manifest.repo.id && authorization.baseCommit === manifest.baseCommit && authorization.scope === manifest.scope, "Authorization boundary mismatch");
 	requireThat(manifest.constraints.capacity <= authorization.capacity && manifest.constraints.parallelGroups.every(g => g.simultaneous <= authorization.capacity && g.simultaneous <= manifest.constraints.capacity), "Explicit concurrency exceeds authorized capacity");
@@ -457,7 +462,7 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 	}
 	const validPrSlug = (value: string): boolean => { const parts = value.split("/"); return parts.length === 3 && parts.every(part => /^[A-Za-z0-9_.-]+$/.test(part)) && !value.includes(".."); };
 	for (const intent of state.controllerBootstrapIntents ?? []) {
-		object(intent); text(intent.id); text(intent.operationId); text(intent.manifestId); integer(intent.manifestRevision, 1); text(intent.manifestDigest); text(intent.sourceDigest); text(intent.authorizationId); text(intent.groupId); text(intent.ownerId); text(intent.generation); repo(intent.repo); text(intent.receiptDigest); validateWorkspace(intent.workspace); text(intent.branch); text(intent.head); integer(intent.createdAt); integer(intent.updatedAt, intent.createdAt);
+		object(intent); text(intent.id); text(intent.operationId); text(intent.manifestId); integer(intent.manifestRevision, 1); text(intent.manifestDigest); text(intent.sourceDigest); text(intent.authorizationId); text(intent.groupId); text(intent.ownerId); text(intent.generation); repo(intent.repo); text(intent.receiptDigest); if (intent.publicationRepository !== undefined) { text(intent.publicationRepository); requireThat(/^[A-Za-z0-9.-]+\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(intent.publicationRepository) && !intent.publicationRepository.includes(".."), "Invalid bootstrap publication repository"); } validateWorkspace(intent.workspace); text(intent.branch); text(intent.head); integer(intent.createdAt); integer(intent.updatedAt, intent.createdAt);
 		requireThat(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(intent.head) && intent.repo.id === state.repo.id && intent.workspace.repoId === state.repo.id && intent.branch === intent.workspace.branch && intent.workspace.baseCommit === state.manifests.find(m => m.id === intent.manifestId && m.revision === intent.manifestRevision)?.baseCommit, "Controller bootstrap repository/workspace mismatch");
 		requireThat(["planned", "creating", "unknown", "complete"].includes(intent.phase), "Invalid controller bootstrap phase");
 		const manifest = state.manifests.find(m => m.id === intent.manifestId && m.revision === intent.manifestRevision);
@@ -466,7 +471,7 @@ export function validateCoordinatorState(value: unknown): asserts value is Coord
 		const receipt = state.integrationReceipts.find(r => r.digest === intent.receiptDigest && r.deliveryGroupId === intent.groupId);
 		const integration = receipt && state.integrations.find(i => i.id === receipt.intentId);
 		requireThat(!!manifest && manifest.preset === "plan-driven" && state.activeRevisions[manifest.id] === manifest.revision && !!group && group.policy === "pr" && group.ownerId === intent.ownerId, "Controller bootstrap manifest/group mismatch");
-		requireThat(!!authorization && authorization.manifestId === manifest!.id && authorization.revision === manifest!.revision && authorization.publication && authorization.manifestDigest === intent.manifestDigest && authorization.sourceDigest === intent.sourceDigest, "Controller bootstrap approval mismatch");
+		requireThat(!!authorization && authorization.manifestId === manifest!.id && authorization.revision === manifest!.revision && authorization.publication && authorization.manifestDigest === intent.manifestDigest && authorization.sourceDigest === intent.sourceDigest && authorization.publicationRepository === intent.publicationRepository, "Controller bootstrap approval mismatch");
 		requireThat(intent.manifestDigest === digest(manifest) && intent.sourceDigest === manifest!.source.digest && !!receipt && receipt.afterCommit === intent.head && !!integration && digest(integration.workspace) === digest(intent.workspace), "Controller bootstrap receipt mismatch");
 		if (intent.pr) { object(intent.pr); text(intent.pr.repo); integer(intent.pr.number, 1); requireThat(validPrSlug(intent.pr.repo), "Invalid controller bootstrap PR"); }
 		if (intent.reason !== undefined) text(intent.reason);

@@ -46,7 +46,7 @@ import { TaskWorkspaces, type WorkspaceGit, type WorkspaceJournal, collectTaskRe
 import { ExecutionScheduler, type SchedulerControl } from "./execution-scheduler.ts";
 import { createExecutionDelivery, type DeliveryPrPort, type ExecutionDelivery } from "./execution-delivery.ts";
 import { createControllerDeliveryAdapter, type ControllerDeliveryOptions } from "./execution-delivery.ts";
-import { parsePrKey } from "./pr-review-identity.ts";
+import { parseGithubSlug, parsePrKey } from "./pr-review-identity.ts";
 import { PR_REVIEW_RECONCILED_EVENT, type ExecutionControllerBinding } from "./pr-review-events.ts";
 import { compileLegacyPreset, type LegacyCompileOptions } from "./execution-presets.ts";
 
@@ -91,15 +91,41 @@ type ExecutionPi = { exec(file: string, args: string[], options: { cwd: string; 
 type ControllerBinding = Pick<ExecutionControllerBinding, "controller" | "controllerId" | "resolvePr" | "verifyMerge"> & Partial<Pick<ControllerDeliveryOptions, "prKey" | "acknowledged">>;
 export type ExecutionPrBootstrapRequest = {
   manifest: ExecutionManifest; group: DeliveryGroup; receipt: IntegrationReceipt; workspace: WorkspaceRef;
-  operationId: string; generation: string; branch: string; head: string; repository?: string;
+  operationId: string; generation: string; branch: string; head: string; repository: string;
 };
 export type ExecutionPrBootstrapResult =
   | { kind: "found" | "created"; pr: { repo: string; number: number }; branch: string; head: string }
   | { kind: "not-found" }
   | { kind: "unknown" | "refused"; reason: string };
-/** Remote discovery/creation is the only effectful boundary. The bridge owns
- * authorization, intent durability, exact mapping persistence, and fencing. */
-export type ExecutionPrBootstrapPort = (request: ExecutionPrBootstrapRequest) => Promise<ExecutionPrBootstrapResult>;
+export type ExecutionPrBootstrapDiscovery = Exclude<ExecutionPrBootstrapResult, { kind: "created" }>;
+export type ExecutionPrBootstrapCreation = Extract<ExecutionPrBootstrapResult, { kind: "found" | "created" | "unknown" | "refused" }>;
+/** Discovery is read-only. Creation is the only publication-capable operation;
+ * the bridge owns authorization, intent durability, exact mapping persistence, and fencing. */
+export type ExecutionPrBootstrapPort = {
+  discover(request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapDiscovery>;
+  create(request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapCreation>;
+};
+
+/** Canonical host/owner/repository slug accepted at the publication boundary. */
+export function canonicalPublicationRepository(value: string): string | undefined {
+  let raw = String(value ?? "").trim();
+  if (!raw) return undefined;
+  raw = raw.replace(/^git@([^:]+):/, "https://$1/");
+  if (raw.includes("://")) {
+    try {
+      const url = new URL(raw);
+      if (url.password || url.search || url.hash) return undefined;
+      const parts = url.pathname.split("/").filter(Boolean).map(part => part.replace(/\.git$/i, ""));
+      if (parts.length !== 2) return undefined;
+      raw = `${url.host}/${parts[0]!}/${parts[1]!}`;
+    } catch { return undefined; }
+  }
+  raw = raw.replace(/\.git$/i, "");
+  const parts = raw.split("/");
+  if (parts.length !== 3 || parts.some(part => !part)) return undefined;
+  const parsed = parseGithubSlug(raw);
+  return parsed ? `${parsed.host}/${parsed.owner}/${parsed.repo}` : undefined;
+}
 
 function createGitHubExecutionPrBootstrap(pi: ExecutionPi): ExecutionPrBootstrapPort {
   const run = async (file: string, args: string[], cwd: string, timeout = 60_000) => {
@@ -111,52 +137,72 @@ function createGitHubExecutionPrBootstrap(pi: ExecutionPi): ExecutionPrBootstrap
     try {
       const url = new URL(value); const parts = url.pathname.split("/").filter(Boolean);
       const number = Number(parts[3]);
-      if (parts.length < 4 || parts[1]!.endsWith(".git") || parts[2]!.toLowerCase() !== "pull" || !Number.isSafeInteger(number) || number < 1) return undefined;
-      return { repo: `${url.host}/${parts[0]!}/${parts[1]!}`.toLowerCase(), number };
+      const repo = parts.length === 4 && parts[1]!.toLowerCase().endsWith(".git") === false && parts[2]!.toLowerCase() === "pull" ? canonicalPublicationRepository(`${url.host}/${parts[0]!}/${parts[1]!}`) : undefined;
+      if (!repo || !Number.isSafeInteger(number) || number < 1) return undefined;
+      return { repo, number };
     } catch { return undefined; }
   };
   const parseRemote = (value: string): string | undefined => {
     const normalized = value.trim().replace(/^git@([^:]+):/, "https://$1/");
     try {
       const url = new URL(normalized.includes("://") ? normalized : `https://${normalized}`);
+      if (url.password || url.search || url.hash) return undefined;
       const parts = url.pathname.split("/").filter(Boolean).map(part => part.toLowerCase().endsWith(".git") ? part.slice(0, -4) : part);
-      return parts.length === 2 ? `${url.host}/${parts[0]!}/${parts[1]!}`.toLowerCase() : undefined;
+      return parts.length === 2 ? canonicalPublicationRepository(`${url.host}/${parts[0]!}/${parts[1]!}`) : undefined;
     } catch { return undefined; }
   };
-  const discover = async (request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapResult> => {
-    const remote = await run("git", ["remote", "get-url", "origin"], request.workspace.path, 30_000);
-    const expectedRepo = remote.code === 0 ? parseRemote(String(remote.stdout ?? "")) : undefined;
-    if (!expectedRepo) return { kind: "refused", reason: "Origin repository is unavailable or noncanonical" };
-    const result = await run("gh", ["pr", "list", "--head", request.workspace.branch, "--state", "all", "--limit", "20", "--json", "number,url,headRefName,headRefOid"], request.workspace.path);
+  const uniqueRemote = (value: string): string[] => [...new Set(value.split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
+  const destination = async (request: ExecutionPrBootstrapRequest): Promise<{ repository: string } | { reason: string }> => {
+    const approved = canonicalPublicationRepository(request.repository);
+    if (!approved) return { reason: "Approved publication repository is missing or noncanonical" };
+    const fetch = await run("git", ["remote", "get-url", "--all", "origin"], request.workspace.path, 30_000);
+    const push = await run("git", ["remote", "get-url", "--all", "--push", "origin"], request.workspace.path, 30_000);
+    const fetchUrls = fetch.code === 0 ? uniqueRemote(String(fetch.stdout ?? "")) : [];
+    const pushUrls = push.code === 0 ? uniqueRemote(String(push.stdout ?? "")) : [];
+    const fetchRepos = fetchUrls.map(parseRemote), pushRepos = pushUrls.map(parseRemote);
+    if (fetch.code !== 0 || push.code !== 0 || fetchUrls.length !== 1 || pushUrls.length !== 1 || !fetchRepos[0] || !pushRepos[0]) return { reason: "Effective GitHub repository destination is unavailable, ambiguous, or noncanonical" };
+    const fetchSet = new Set(fetchRepos as string[]), pushSet = new Set(pushRepos as string[]);
+    if (fetchSet.size !== 1 || pushSet.size !== 1 || !fetchSet.has(approved) || !pushSet.has(approved)) return { reason: "Effective fetch/push destination does not match approved publication repository" };
+    return { repository: approved };
+  };
+  const discover = async (request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapDiscovery> => {
+    const checked = await destination(request);
+    if ("reason" in checked) return { kind: "refused", reason: checked.reason };
+    const result = await run("gh", ["pr", "list", "--repo", checked.repository, "--head", request.workspace.branch, "--state", "all", "--limit", "20", "--json", "number,url,headRefName,headRefOid"], request.workspace.path);
     if (result.code !== 0) return { kind: "unknown", reason: String(result.stderr ?? result.stdout ?? "gh pr list failed") };
     let rows: Array<{ number?: unknown; url?: unknown; headRefName?: unknown; headRefOid?: unknown }>;
     try { rows = JSON.parse(String(result.stdout ?? "")) as Array<{ number?: unknown; url?: unknown; headRefName?: unknown; headRefOid?: unknown }>; }
     catch (error) { return { kind: "unknown", reason: `Invalid gh PR discovery response: ${String(error)}` }; }
-    const exact = rows.filter(row => row.headRefName === request.workspace.branch && row.headRefOid === request.receipt.afterCommit).map(row => ({ ...row, pr: parsePr(row.url) })).filter(row => row.pr && row.pr.repo === expectedRepo && Number.isSafeInteger(row.number) && Number(row.number) === row.pr.number);
+    const exact = rows.filter(row => row.headRefName === request.workspace.branch && row.headRefOid === request.receipt.afterCommit).map(row => ({ ...row, pr: parsePr(row.url) })).filter(row => row.pr && row.pr.repo === checked.repository && Number.isSafeInteger(row.number) && Number(row.number) === row.pr.number);
     if (exact.length > 1) return { kind: "unknown", reason: "Multiple PRs match the authorized branch/head" };
     if (exact.length === 1) return { kind: "found", pr: exact[0]!.pr!, branch: request.workspace.branch, head: request.receipt.afterCommit };
     if (rows.some(row => row.headRefName === request.workspace.branch || row.headRefOid === request.receipt.afterCommit)) return { kind: "unknown", reason: "Remote PR branch/head does not match the authorized integration" };
     return { kind: "not-found" };
   };
-  return async request => {
-    const discovered = await discover(request);
-    if (discovered.kind !== "not-found") return discovered;
+  const create = async (request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapCreation> => {
+    const checked = await destination(request);
+    if ("reason" in checked) return { kind: "refused", reason: checked.reason };
     const head = await run("git", ["rev-parse", "HEAD"], request.workspace.path, 30_000);
     const branch = await run("git", ["branch", "--show-current"], request.workspace.path, 30_000);
     const clean = await run("git", ["status", "--porcelain=v1", "--untracked-files=all"], request.workspace.path, 30_000);
     if (head.code !== 0 || String(head.stdout ?? "").trim() !== request.receipt.afterCommit || branch.code !== 0 || String(branch.stdout ?? "").trim() !== request.workspace.branch || clean.code !== 0 || String(clean.stdout ?? "").trim()) return { kind: "refused", reason: "Delivery workspace branch/head/clean state is not authorized" };
+    const beforePush = await destination(request);
+    if ("reason" in beforePush) return { kind: "refused", reason: beforePush.reason };
     const pushed = await run("git", ["push", "-u", "origin", `${request.workspace.branch}:${request.workspace.branch}`], request.workspace.path, 120_000);
     if (pushed.code !== 0) {
       const afterPush = await discover(request);
       return afterPush.kind === "found" ? afterPush : { kind: "unknown", reason: `Push outcome unknown: ${String(pushed.stderr ?? pushed.stdout ?? "")}` };
     }
-    const created = await run("gh", ["pr", "create", "--head", request.workspace.branch, "--title", `Plan delivery ${request.group.id}`, "--body", `operation: ${request.operationId}`], request.workspace.path, 60_000);
+    const beforeCreate = await destination(request);
+    if ("reason" in beforeCreate) return { kind: "refused", reason: beforeCreate.reason };
+    const created = await run("gh", ["pr", "create", "--repo", beforeCreate.repository, "--head", request.workspace.branch, "--title", `Plan delivery ${request.group.id}`, "--body", `operation: ${request.operationId}`], request.workspace.path, 60_000);
     const afterCreate = await discover(request);
     if (afterCreate.kind === "found") return { ...afterCreate, kind: "created" };
     return afterCreate.kind === "not-found"
       ? { kind: "unknown", reason: created.code === 0 ? "PR create acknowledgement did not expose the created PR" : `PR create outcome unknown: ${String(created.stderr ?? created.stdout ?? "")}` }
       : afterCreate;
   };
+  return { discover, create };
 }
 
 export type ExecutionBridgeOptions = {
@@ -184,7 +230,7 @@ export type ExecutionBridgeOptions = {
   resolvePr?: DeliveryPrPort;
   /** Authorized PR bootstrap boundary; omitted preserves local-only/refusal behavior. */
   bootstrapPr?: ExecutionPrBootstrapPort;
-  /** Canonical host/owner/repository slug from the caller's validated origin, when available. */
+  /** Canonical effective fetch/push publication destination captured before preview, when available. */
   repository?: string;
   controller?: ControllerBinding;
   /** Select the new legacy-compatible sequential preset; omitted means plan-driven. */
@@ -197,7 +243,7 @@ export type ExecutionApproval = ApprovalOptions & { token: string };
 export type ExecutionPreview = {
   /** Opaque, one-use identity of the exact displayed interpretation and approval boundary. */
   token: string;
-  boundary: { capacity: number; publication: boolean };
+  boundary: { capacity: number; publication: boolean; publicationRepository?: string };
   path: string;
   sourceDigest: string;
   manifest: ExecutionManifest;
@@ -348,7 +394,9 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     const authorization = manifest && state.authorizations.find(item => item.manifestId === manifest.id && item.revision === manifest.revision);
     if (!manifest || digest(manifest) !== digest(request.manifest) || state.activeRevisions[manifest.id] !== manifest.revision || groupMatches.length !== 1 || digest(groupMatches[0]!.group) !== digest(request.group) || !authorization) return { kind: "refused", reason: "Stale, foreign, or ambiguous execution manifest/group" };
     try { validateAuthorization(manifest, authorization); } catch (error) { return { kind: "refused", reason: `Invalid persisted approval: ${String(error)}` }; }
-    if (!authorization.publication || manifest.repo.id !== options.repo.id || request.workspace.repoId !== options.repo.id || request.workspace.baseCommit !== manifest.baseCommit) return { kind: "refused", reason: "Publication approval or repository boundary is invalid" };
+    const approvedRepository = authorization.publicationRepository && canonicalPublicationRepository(authorization.publicationRepository);
+    const configuredRepository = options.repository && canonicalPublicationRepository(options.repository);
+    if (!authorization.publication || !approvedRepository || !configuredRepository || approvedRepository !== configuredRepository || manifest.repo.id !== options.repo.id || request.workspace.repoId !== options.repo.id || request.workspace.baseCommit !== manifest.baseCommit) return { kind: "refused", reason: "Publication approval or repository boundary is invalid" };
     const delivery = state.deliveries.find(item => item.groupId === request.group.id);
     if (!delivery || delivery.phase !== "ready" || !delivery.integrationDigest || delivery.handoff) return { kind: "refused", reason: "Delivery lifecycle is stale or already fenced" };
     const receipt = state.integrationReceipts.find(item => item.digest === delivery.integrationDigest && item.deliveryGroupId === request.group.id);
@@ -363,7 +411,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     const intentBody: Omit<ExecutionControllerBootstrapIntent, "phase" | "createdAt" | "updatedAt" | "pr" | "reason"> = {
       id: operationId, operationId, manifestId: manifest.id, manifestRevision: manifest.revision, manifestDigest: digest(manifest), sourceDigest: manifest.source.digest,
       authorizationId: authorization.id, groupId: request.group.id, ownerId: request.group.ownerId, generation, repo: options.repo, receiptDigest: receipt.digest,
-      workspace: request.workspace, branch: request.workspace.branch, head: receipt.afterCommit,
+      publicationRepository: approvedRepository, workspace: request.workspace, branch: request.workspace.branch, head: receipt.afterCommit,
     };
     const existingMapping = (state.controllerMappings ?? []).find(item => item.manifestId === manifest.id && item.manifestRevision === manifest.revision && item.groupId === request.group.id);
     if (existingMapping) return { kind: "authorized", pr: existingMapping.pr, generation: existingMapping.generation, ownerId: existingMapping.ownerId, ownerKind: "execution" };
@@ -382,8 +430,8 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
     if (!intent) return { kind: "unknown", reason: "Bootstrap intent was not durably recorded" };
     const persistRemote = (result: Extract<ExecutionPrBootstrapResult, { kind: "found" | "created" }>): Awaited<ReturnType<NonNullable<typeof rawResolvePr>>> => {
       const pr = canonicalPr(result.pr);
-      const expectedRepository = options.repository ? canonicalPr({ repo: options.repository, number: 1 })?.repo : undefined;
-      if (result.branch !== request.workspace.branch || result.head !== receipt.afterCommit || !pr || (expectedRepository && pr.repo !== expectedRepository)) {
+      const expectedRepository = intent.publicationRepository && canonicalPublicationRepository(intent.publicationRepository);
+      if (!expectedRepository || result.branch !== request.workspace.branch || result.head !== receipt.afterCommit || !pr || pr.repo !== expectedRepository) {
         return { kind: "refused", reason: "Remote PR reconciliation does not match authorized branch/head/repository" };
       }
       const mapping: ExecutionControllerMapping = { manifestId: manifest.id, manifestRevision: manifest.revision, groupId: request.group.id, ownerId: request.group.ownerId, generation, pr, workspace: request.workspace, head: receipt.afterCommit, manifestDigest: digest(manifest), sourceDigest: manifest.source.digest, authorizationId: authorization.id, integrationDigest: receipt.digest, operationId };
@@ -400,28 +448,57 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       } catch (error) { return { kind: "unknown", reason: `Bootstrap mapping persistence failed: ${String(error)}` }; }
       return { kind: "authorized", pr, generation, ownerId: request.group.ownerId, ownerKind: "execution" };
     };
-    let discovered: ExecutionPrBootstrapResult;
-    try { discovered = await bootstrapPr({ manifest, group: request.group, receipt, workspace: request.workspace, operationId, generation, branch: request.workspace.branch, head: receipt.afterCommit, ...(options.repository ? { repository: options.repository } : {}) }); }
-    catch (error) { discovered = { kind: "unknown", reason: String(error) }; }
-    if (discovered.kind === "found") return persistRemote(discovered);
-    if (discovered.kind === "unknown" || discovered.kind === "refused") {
-      if (discovered.kind === "unknown") {
-        try { store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (latest && latest.phase !== "complete") { latest.phase = "unknown"; latest.updatedAt = now(); latest.reason = discovered.reason; } }); } catch { /* retain the conservative unknown fence */ }
-      }
-      return discovered;
+    const bootstrapRequest = (): ExecutionPrBootstrapRequest => ({ manifest, group: request.group, receipt, workspace: request.workspace, operationId, generation, branch: request.workspace.branch, head: receipt.afterCommit, repository: intent.publicationRepository! });
+    const bootstrapFence = (current: CoordinatorState, currentIntent: ExecutionControllerBootstrapIntent | undefined): boolean => {
+      if (!currentIntent || currentIntent.operationId !== operationId || currentIntent.manifestId !== manifest.id || currentIntent.manifestRevision !== manifest.revision || currentIntent.manifestDigest !== digest(manifest) || currentIntent.sourceDigest !== manifest.source.digest || currentIntent.authorizationId !== authorization.id || currentIntent.groupId !== request.group.id || currentIntent.ownerId !== request.group.ownerId || currentIntent.generation !== generation || currentIntent.receiptDigest !== receipt.digest || currentIntent.publicationRepository !== intent.publicationRepository) return false;
+      if (!current.owner || digest(current.owner) !== digest(currentOwner) || current.reconciledEpoch !== currentOwner.epoch || current.activeRevisions[manifest.id] !== manifest.revision) return false;
+      const currentDelivery = current.deliveries.find(item => item.groupId === request.group.id);
+      if (!currentDelivery || currentDelivery.phase !== "ready" || currentDelivery.integrationDigest !== receipt.digest || currentDelivery.handoff) return false;
+      const currentManifest = current.manifests.find(item => item.id === manifest.id && item.revision === manifest.revision);
+      const currentGroup = currentManifest?.deliveryGroups.find(item => item.id === request.group.id);
+      const currentAuthorization = current.authorizations.find(item => item.id === authorization.id);
+      if (!currentManifest || digest(currentManifest) !== digest(manifest) || !currentGroup || digest(currentGroup) !== digest(request.group) || !currentAuthorization) return false;
+      try { validateAuthorization(currentManifest, currentAuthorization); } catch { return false; }
+      return currentAuthorization.publicationRepository === intent.publicationRepository;
+    };
+    const persistUnknown = (reason: string): void => {
+      try { store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (latest && latest.phase !== "complete") { latest.phase = "unknown"; latest.updatedAt = now(); latest.reason = reason; } }); } catch { /* retain the conservative unknown fence */ }
+    };
+    const discoverOnly = async (): Promise<ExecutionPrBootstrapDiscovery> => {
+      const latest = store.read();
+      const currentIntent = latest.controllerBootstrapIntents?.find(item => item.operationId === operationId);
+      if (!bootstrapFence(latest, currentIntent) || currentIntent?.phase === "complete") return { kind: "unknown", reason: "Bootstrap owner/authorization/generation fence changed" };
+      try { return await bootstrapPr!.discover(bootstrapRequest()); }
+      catch (error) { return { kind: "unknown", reason: String(error) }; }
+    };
+    if (intent.phase !== "planned") {
+      const retry = await discoverOnly();
+      if (retry.kind === "found") return persistRemote(retry);
+      if (retry.kind === "unknown") { persistUnknown(retry.reason); return retry; }
+      if (retry.kind === "refused") return retry;
+      return { kind: "unknown", reason: "Prior PR bootstrap outcome is unknown; reconcile the deterministic branch before retrying" };
     }
-    if (intent.phase !== "planned") return { kind: "unknown", reason: "Prior PR bootstrap outcome is unknown; reconcile the deterministic branch before retrying" };
+    const initial = await discoverOnly();
+    if (initial.kind === "found") return persistRemote(initial);
+    if (initial.kind === "unknown" || initial.kind === "refused") {
+      if (initial.kind === "unknown") persistUnknown(initial.reason);
+      return initial;
+    }
     try {
-      store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (!latest || latest.phase !== "planned") throw new Error("Bootstrap intent is no longer creatable"); latest.phase = "creating"; latest.updatedAt = now(); delete latest.reason; });
+      store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (!latest || latest.phase !== "planned" || latest.publicationRepository !== intent.publicationRepository) throw new Error("Bootstrap intent is no longer creatable"); latest.phase = "creating"; latest.updatedAt = now(); delete latest.reason; });
     } catch (error) { return { kind: "unknown", reason: String(error) }; }
-    let created: ExecutionPrBootstrapResult;
-    try { created = await bootstrapPr({ manifest, group: request.group, receipt, workspace: request.workspace, operationId, generation, branch: request.workspace.branch, head: receipt.afterCommit, ...(options.repository ? { repository: options.repository } : {}) }); }
+    const beforeCreate = store.read();
+    const createIntent = beforeCreate.controllerBootstrapIntents?.find(item => item.operationId === operationId);
+    if (!createIntent) return { kind: "unknown", reason: "Bootstrap owner/authorization/generation fence changed before publication" };
+    if (!bootstrapFence(beforeCreate, createIntent) || createIntent.phase !== "creating") return { kind: "unknown", reason: "Bootstrap owner/authorization/generation fence changed before publication" };
+    let created: ExecutionPrBootstrapCreation;
+    try { created = await bootstrapPr!.create(bootstrapRequest()); }
     catch (error) { created = { kind: "unknown", reason: String(error) }; }
     if (created.kind === "found" || created.kind === "created") return persistRemote(created);
-    if (created.kind === "unknown") {
-      try { store.transact(currentOwner, draft => { const latest = draft.controllerBootstrapIntents?.find(item => item.operationId === operationId); if (latest && latest.phase !== "complete") { latest.phase = "unknown"; latest.updatedAt = now(); latest.reason = created.reason; } }); } catch { /* preserve unknown */ }
-    }
-    return created.kind === "refused" || created.kind === "unknown" ? created : { kind: "unknown", reason: "PR bootstrap did not produce a reconciled mapping" };
+    if (created.kind === "unknown") persistUnknown(created.reason);
+    if (created.kind === "refused") return created;
+    return { kind: "unknown", reason: "PR bootstrap did not produce a reconciled mapping" };
+
   };
   const resolvePr = rawResolvePr && bootstrapPr ? async (request: Parameters<NonNullable<typeof rawResolvePr>>[0]) => {
     const first = await rawResolvePr(request);
@@ -568,7 +645,9 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
         : await interpretPlan(identity, options.interpretationTransport);
       const capabilities: RuntimeCapabilities = await runtime.probe();
       const capacity = store.read().capacity || options.capacity;
-      const boundary = { capacity, publication: result.manifest.deliveryGroups.some(group => group.policy === "pr") };
+      const publication = result.manifest.deliveryGroups.some(group => group.policy === "pr");
+      const publicationRepository = publication ? canonicalPublicationRepository(options.repository ?? "") : undefined;
+      const boundary = { capacity, publication, ...(publicationRepository ? { publicationRepository } : {}) };
       const token = digest([randomUUID(), path, source.digest, digest(result.manifest), result.manifest.revision, options.repo, base, boundary]);
       const preview = { token, boundary, path, sourceDigest: source.digest, manifest: result.manifest, unresolvedDecisions: result.unresolvedDecisions, conflicts: interpretationConflicts(result.manifest, capacity, capabilities) };
       pendingPreviews.set(path, structuredClone(preview));
@@ -587,7 +666,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
           if (!expected || expected !== actual) return { kind: "refused", reason: "Preview integrity changed; preview again" };
         }
         if (pending) {
-          if (approval!.capacity !== pending.boundary.capacity || (approval!.publication && !pending.boundary.publication)) return { kind: "refused", reason: "Approval exceeds displayed boundary", preview: structuredClone(pending) };
+          if (approval!.capacity !== pending.boundary.capacity || (approval!.publication && !pending.boundary.publication) || approval!.publicationRepository !== pending.boundary.publicationRepository) return { kind: "refused", reason: "Approval exceeds displayed boundary", preview: structuredClone(pending) };
           const source = await importPlanSource(path);
           if (source.digest !== pending.sourceDigest) return { kind: "refused", reason: "Plan changed after preview; import a fresh revision", preview: structuredClone(pending) };
           preview = structuredClone(pending);
@@ -601,6 +680,7 @@ export function createExecutionBridge(options: ExecutionBridgeOptions): Executio
       }
       const pending = pendingPreviews.get(preview.path);
       if (pending && pending.sourceDigest !== preview.sourceDigest) return { kind: "refused", reason: "Plan changed after preview; import a fresh revision", preview };
+      if (preview.boundary.publication && !preview.boundary.publicationRepository) return { kind: "refused", reason: "Publication requires an approved canonical repository destination", preview };
       try {
         const { token: _token, ...approved } = approval;
         const authorization = authorizeInterpretation({ manifest: preview.manifest, unresolvedDecisions: [] }, approved);

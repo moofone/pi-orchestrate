@@ -156,7 +156,7 @@ export function normalizeInterpretation(output: unknown, options: ImportOptions)
 export async function interpretPlan(options: ImportOptions, transport: InterpretationTransport): Promise<InterpretationOutput> {
 	return normalizeInterpretation(await transport({ prompt: interpretationPrompt(options), schema: structuredClone(INTERPRETATION_OUTPUT_SCHEMA), source: structuredClone(options.source), identity: { id: options.id, revision: options.revision, repo: structuredClone(options.repo), baseCommit: options.baseCommit }, ...(options.previous ? { previous: structuredClone(options.previous) } : {}) }), options);
 }
-export type ApprovalOptions = { id?: string; capacity: number; publication: boolean; approvedBy: string; approvedAt: number };
+export type ApprovalOptions = { id?: string; capacity: number; publication: boolean; publicationRepository?: string; approvedBy: string; approvedAt: number };
 export function authorizeInterpretation(result: InterpretationOutput, options: ApprovalOptions): ExecutionAuthorization {
 	validateImportedManifest(result.manifest);
 	requireThat(result.unresolvedDecisions.length === 0, "Resolve interpretation decisions before approval");

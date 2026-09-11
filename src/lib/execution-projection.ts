@@ -8,6 +8,7 @@ export function executionPreviewSummary(preview: ExecutionPreview): string {
  return [
   `Manifest ${m.id} revision ${m.revision} preset=${m.preset}`,
   `source ${m.source.digest}\nmanifest ${digest(m)}\nrepo ${m.repo.id}\nbase ${m.baseCommit}`,
+  `publication ${preview.boundary.publication ? (preview.boundary.publicationRepository ?? "unavailable") : "not authorized by plan"}`,
   `Approval token ${preview.token}`,
   `Repository capacity ${preview.boundary.capacity}; requested shape ${m.constraints.capacity}; publication requires separate confirmation`,
   `Scope: ${m.scope}`,
