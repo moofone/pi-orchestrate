@@ -25,10 +25,10 @@ Each checkpoint file records the real owner PID and `lockExists`; each paired sn
 
 | Gate | Retained artifact | Concrete assertion |
 |---|---|---|
-| AE5 in-scope + explicit dependency | `run-80569-5/provider/gate-ae5-in-scope-and-explicit.json` | revisions 1→2→3; discovered `feature-a`/`src/` task has 1 receipt while alpha has 1 start; beta has 2 starts only after approval and release; dependency provenance is explicit |
+| AE5 in-scope + explicit dependency | `run-84445-5/provider/gate-ae5-in-scope-and-explicit.json` | persisted approved revisions 1 and 2 prove beta has explicit empty dependencies before proposed revision 3; revision 3 changes beta to `[alpha]`, remains approval-fenced, and records before/proposed/after manifest provenance and authorization digests; discovered `feature-a`/`src/` task has 1 receipt while alpha stays gated |
 | AE5 new feature approval | `run-80569-6/provider/gate-ae5-new-feature.json` | feature-c revision 2 has 0 pre-approval starts and 1 post-approval start while alpha remains running/gated |
 | AE6 same-PID stale reply | `run-80569-8/provider/gate-ae6-old-instance-reply.json`, `pending-old-reply.json`, `released-old-reply.json` | old request is released after replacement owner; receipts remain `[]`, reservation identity/count is unchanged, and old authority is rejected |
-| AE7 controller lifecycle + AE8 public pause | `run-80569-15/provider/gate-ae7-controller-lifecycle.json`; `run-80569-16/provider/gate-ae8-public-pause.json` | A is `blocked` while B traverses `handoff-pending` → `controller-owned` → `merged`; public pause records A `running`/`pause` and B `succeeded` with 1 receipt |
+| AE7 controller lifecycle + AE8 public pause | `run-80569-15/provider/gate-ae7-controller-lifecycle.json`; `run-84445-16/provider/gate-ae8-public-pause.json` | A is `blocked` while B traverses `handoff-pending` → `controller-owned` → `merged`; public pause records timestamped pre-pause B `running` with zero receipts, A `running` with `pause`, then B-only release/success with one receipt while A remains `running`/`pause` before A resumes |
 | AE8/controller replay mutation fences | `run-80569-13/provider/gate-ae6-controller-ledgers.json`; `run-80569-17/provider/gate-ae8-ledgers.json` | controller restart: 1 call/3 Git mutations and exact HEAD unchanged; AE8 duplicate/reordered notifications: 1 call/13 Git mutations and exact HEAD unchanged |
 
 
