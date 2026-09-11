@@ -42,8 +42,8 @@ function harness(_repo: RepoIdentity, stateRoot: string, exec: (file: string, ar
 }
 
 async function runDefaultBootstrapCase(input: {
-  fetch?: string; push?: string; expanded?: string; approved?: string; missingOrigin?: boolean; approvePublication?: boolean; changeAfterPreview?: boolean; mutateFence?: "owner" | "lifecycle";
-} = {}): Promise<{ pushes: number; creates: number; state: ReturnType<ReturnType<typeof createExecutionBridge>["store"]["read"]> }> {
+  fetch?: string; push?: string; expanded?: string; approved?: string; missingOrigin?: boolean; approvePublication?: boolean; changeAfterPreview?: boolean; mutateFence?: "owner" | "lifecycle"; retargetAtPush?: boolean;
+} = {}): Promise<{ pushes: number; creates: number; pushArgv?: string[]; pushDestination?: string; state: ReturnType<ReturnType<typeof createExecutionBridge>["store"]["read"]> }> {
   const localRoot = realpathSync(mkdtempSync(join(tmpdir(), "u7-default-case-")));
   process.env.GHL_LATCH_STATE_DIR = join(localRoot, "latch"); mkdirSync(process.env.GHL_LATCH_STATE_DIR, { recursive: true });
   const commonDir = join(localRoot, "repo.git"); mkdirSync(commonDir, { recursive: true });
@@ -63,6 +63,7 @@ async function runDefaultBootstrapCase(input: {
   let bridge: ReturnType<typeof createExecutionBridge> | undefined;
   workspaces.compose = async request => { workspaces.compositions.push(structuredClone(request)); return { kind: "prepared", workspace: request.intent.workspace, head: integratedHead }; };
   let currentFetch = input.fetch ?? `https://${approved}.git`, currentPush = input.push ?? currentFetch, pushes = 0, creates = 0;
+  let pushArgv: string[] | undefined, pushDestination: string | undefined;
   const h = harness(repo, stateRoot, async (file, args) => {
     if (file === "git" && args[0] === "remote" && args[1] === "get-url") {
       if (!fenceMutated && input.mutateFence && bridge) {
@@ -83,7 +84,16 @@ async function runDefaultBootstrapCase(input: {
     if (file === "git" && args[0] === "rev-parse") return { code: 0, stdout: `${integratedHead}\n`, stderr: "" };
     if (file === "git" && args[0] === "branch") return { code: 0, stdout: `${bridge?.store.read().controllerBootstrapIntents?.[0]?.branch ?? "branch"}\n`, stderr: "" };
     if (file === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
-    if (file === "git" && args[0] === "push") { pushes++; return { code: 0, stdout: "", stderr: "" }; }
+    if (file === "git" && args[0] === "push") {
+      pushes++; pushArgv = [...args];
+      // Model git at effect time: a push by remote name re-resolves `origin`
+      // from whatever the configuration says when the effect runs, so a
+      // concurrent change between the destination check and the push lands on
+      // the new target. An explicit URL bypasses remote-name resolution.
+      if (input.retargetAtPush) currentPush = "https://github.com/acme/retargeted.git";
+      pushDestination = args.includes("origin") ? currentPush : args[1]!;
+      return { code: 0, stdout: "", stderr: "" };
+    }
     if (file === "gh" && args[0] === "pr" && args[1] === "create") { creates++; return { code: 0, stdout: "", stderr: "" }; }
     return { code: 1, stdout: "", stderr: `unexpected ${file} ${args.join(" ")}` };
   });
@@ -103,7 +113,7 @@ async function runDefaultBootstrapCase(input: {
       const started = await bridge.run(planPath, { token: preview.preview.token, capacity: 2, publication: input.approvePublication ?? true, publicationRepository: approved, approvedBy: h.sessionFile, approvedAt: 2 });
       if (started.kind === "started") for (let i = 0; i < (input.mutateFence ? 0 : 4); i++) { await new Promise(resolve => setTimeout(resolve, 25)); await bridge.scheduler.reconcile(); }
     }
-    return { pushes, creates, state: bridge.store.read() };
+    return { pushes, creates, pushArgv, pushDestination, state: bridge.store.read() };
   } finally { await bridge.shutdown(); }
 }
 
@@ -285,6 +295,28 @@ test("default publication refuses a pushInsteadOf expansion that retargets a for
   const result = await runDefaultBootstrapCase({ push: "git@ssh.foreign-host.dev:acme/approved.git" });
   assert.equal(result.pushes, 0, "a pushInsteadOf host rewrite must never push to an unapproved host");
   assert.equal(result.creates, 0);
+});
+
+test("default publication pins the validated push destination into the push invocation", async () => {
+  // Round-2 P1: the push went out by remote name (`git push -u origin …`),
+  // so a concurrent change to the remote configuration or URL-rewrite rules
+  // between the destination check and the effect could redirect publication
+  // to a repository the approval never named; the later destination() check
+  // runs only after the push. The push must name the already-validated
+  // explicit URL, so remote-name resolution is not re-run at effect time.
+  const pinned = await runDefaultBootstrapCase({ retargetAtPush: true });
+  assert.equal(pinned.pushes, 1, "precondition: the healthy case publishes exactly once");
+  assert.equal(pinned.pushDestination, "https://github.com/acme/approved.git", "a concurrent remote change between the check and the effect must not redirect the push");
+  assert.equal(pinned.pushArgv?.includes("origin"), false, "the mutable origin name must not be resolved again at effect time");
+  assert.equal(pinned.pushArgv?.[1], "https://github.com/acme/approved.git", "the push must target the validated explicit push URL");
+  // The pinned URL is the validated pushInsteadOf-expanded one, not the fetch URL.
+  const expanded = await runDefaultBootstrapCase({
+    fetch: "git@github.com:acme/approved.git",
+    push: "ssh://git@github.com/acme/approved.git",
+    expanded: "git@github.com:acme/approved.git",
+  });
+  assert.equal(expanded.pushes, 1);
+  assert.equal(expanded.pushArgv?.[1], "ssh://git@github.com/acme/approved.git", "the validated pushInsteadOf-expanded URL is what gets pinned");
 });
 
 test("missing publication approval and destination changes after preview refuse before effects", async () => {

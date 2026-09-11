@@ -152,7 +152,7 @@ function createGitHubExecutionPrBootstrap(pi: ExecutionPi): ExecutionPrBootstrap
     } catch { return undefined; }
   };
   const uniqueRemote = (value: string): string[] => [...new Set(value.split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
-  const destination = async (request: ExecutionPrBootstrapRequest): Promise<{ repository: string } | { reason: string }> => {
+  const destination = async (request: ExecutionPrBootstrapRequest): Promise<{ repository: string; pushUrl: string } | { reason: string }> => {
     const approved = canonicalPublicationRepository(request.repository);
     if (!approved) return { reason: "Approved publication repository is missing or noncanonical" };
     // Rewrite-aware lookups (PR#13 review round 2): the fetch destination is
@@ -173,7 +173,7 @@ function createGitHubExecutionPrBootstrap(pi: ExecutionPi): ExecutionPrBootstrap
     if (fetch.code !== 0 || push.code !== 0 || expanded.code !== 0 || fetchUrls.length !== 1 || pushUrls.length !== 1 || expandedUrls.length !== 1 || !fetchRepos[0] || !pushRepos[0] || !expandedRepos[0]) return { reason: "Effective GitHub repository destination is unavailable, ambiguous, or noncanonical" };
     const fetchSet = new Set(fetchRepos as string[]), pushSet = new Set(pushRepos as string[]), expandedSet = new Set(expandedRepos as string[]);
     if (fetchSet.size !== 1 || pushSet.size !== 1 || expandedSet.size !== 1 || !fetchSet.has(approved) || !pushSet.has(approved) || !expandedSet.has(approved)) return { reason: "Effective fetch/push destination after URL rewrite expansion does not match approved publication repository" };
-    return { repository: approved };
+    return { repository: approved, pushUrl: pushUrls[0]! };
   };
   const discover = async (request: ExecutionPrBootstrapRequest): Promise<ExecutionPrBootstrapDiscovery> => {
     const checked = await destination(request);
@@ -198,7 +198,15 @@ function createGitHubExecutionPrBootstrap(pi: ExecutionPi): ExecutionPrBootstrap
     if (head.code !== 0 || String(head.stdout ?? "").trim() !== request.receipt.afterCommit || branch.code !== 0 || String(branch.stdout ?? "").trim() !== request.workspace.branch || clean.code !== 0 || String(clean.stdout ?? "").trim()) return { kind: "refused", reason: "Delivery workspace branch/head/clean state is not authorized" };
     const beforePush = await destination(request);
     if ("reason" in beforePush) return { kind: "refused", reason: beforePush.reason };
-    const pushed = await run("git", ["push", "-u", "origin", `${request.workspace.branch}:${request.workspace.branch}`], request.workspace.path, 120_000);
+    // Round-2 P1: push the already-validated explicit destination. A push by
+    // remote name re-resolves `origin` (and its rewrite rules) when the effect
+    // runs, so a concurrent remote-configuration or URL-rewrite change between
+    // the check above and this push could redirect publication to a repository
+    // the approval never named; the later destination() check runs only after
+    // the effect. Naming the validated push URL makes the authorization atomic
+    // with the effect (no `-u`: an explicit URL must not become the branch's
+    // durable upstream).
+    const pushed = await run("git", ["push", beforePush.pushUrl, `${request.workspace.branch}:${request.workspace.branch}`], request.workspace.path, 120_000);
     if (pushed.code !== 0) {
       const afterPush = await discover(request);
       return afterPush.kind === "found" ? afterPush : { kind: "unknown", reason: `Push outcome unknown: ${String(pushed.stderr ?? pushed.stdout ?? "")}` };

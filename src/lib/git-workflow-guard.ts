@@ -48,10 +48,23 @@ export function executionWriterReservation(input: {
 function durableExecutionStates(): DurableExecutionState[] {
   const root = process.env.PI_EXECUTION_STATE_ROOT ?? join(homedir(), "orchestrator", "plan-driven-v1", "execution");
   if (!existsSync(root)) return [];
-  const states: { reservations?: { attemptId?: string; workspacePath: string; workspaceId?: string }[]; deliveries?: { phase?: string; handoff?: { workspace?: { path?: string } } }[] }[] = [];
+  const states: DurableExecutionState[] = [];
   for (const repoId of readdirSync(root, { withFileTypes: true })) {
     if (!repoId.isDirectory()) continue;
-    try { states.push(JSON.parse(readFileSync(join(root, repoId.name, "coordinator.json"), "utf8"))); } catch { /* partial or fenced record */ }
+    const stateFile = join(root, repoId.name, "coordinator.json");
+    if (!existsSync(stateFile)) continue; // a missing record proves nothing and fences nothing
+    let parsed: unknown;
+    try { parsed = JSON.parse(readFileSync(stateFile, "utf8")); }
+    catch (error) {
+      // A record that exists but cannot be read or parsed is an unverifiable
+      // execution fence (round-2 P1): skipping it presented "no reservation"
+      // as evidence and let mutations into a workspace whose fence could not
+      // be checked. Fail closed — the guard hook converts this throw into its
+      // reserved-parent path (mutations fenced, read-only allowed).
+      throw new Error(`Unreadable durable execution state (${stateFile}): ${String(error)}`);
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Malformed durable execution state (${stateFile}): not a coordinator state object`);
+    states.push(parsed as DurableExecutionState);
   }
   return states;
 }

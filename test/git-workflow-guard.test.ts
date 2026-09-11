@@ -14,6 +14,8 @@ import {
 	classifyForRole,
 	classifyGitWorkflowCommand,
 	classifyViewRepeat,
+	durableExecutionReservation,
+	durableExecutionWorkspaceFence,
 	extractPrNumber,
 	isWorktreeMutation,
 	isWriterRole,
@@ -769,6 +771,100 @@ test("registered guard fails closed when identity or reservation lookup throws",
 		assert.equal(scanFailure?.block ?? false, true, "a durable-state scan failure must fail closed instead of allowing the commit");
 		const scanRead = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git log -1" } });
 		assert.equal(scanRead?.block ?? false, false, "read-only commands stay allowed when the scan fails closed");
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key]; else process.env[key] = value;
+		}
+		rmSync(home, { recursive: true, force: true });
+	}
+});
+
+/* ---------------------------------------------------------------- *
+ * Round-2 P1 (codex) — durableExecutionStates() silently skipped a
+ * per-repo coordinator.json that exists but cannot be read or parsed,
+ * so "no reservation found" was presented as evidence: executionRole
+ * stayed unset and a mutation inside a workspace whose execution fence
+ * could not be verified fell through to ordinary git rules. A record
+ * that exists but is unreadable or malformed must surface as an
+ * explicit lookup failure — the registered guard then takes its
+ * fail-closed reserved-parent path (mutations fenced, read-only
+ * allowed) — while a missing coordinator.json proves nothing and
+ * stays a harmless skip, and healthy records keep resolving.
+ * Classify-only; never run.
+ * ---------------------------------------------------------------- */
+
+test("registered guard fails closed on a malformed coordinator.json; missing and healthy records stay ordinary", async () => {
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-malformed-home-")));
+	const workspace = join(home, "reserved"); mkdirSync(workspace, { recursive: true });
+	const ownerSession = join(home, "owner.jsonl");
+	writeFileSync(ownerSession, JSON.stringify({ type: "session", id: "owner-header-1" }) + "\n");
+	const executionRoot = join(home, "orchestrator", "plan-driven-v1", "execution");
+	// The ONLY record covering `workspace` is the torn one: skipping it is
+	// exactly the fail-open (the healthy sibling must keep parsing).
+	const brokenDir = join(executionRoot, "broken-repo"); mkdirSync(brokenDir, { recursive: true });
+	const torn = join(brokenDir, "coordinator.json");
+	writeFileSync(torn, JSON.stringify({
+		reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
+	}).slice(0, 40), "utf8"); // truncated mid-record
+	const healthyDir = join(executionRoot, "repo"); mkdirSync(healthyDir, { recursive: true });
+	const healthy = join(healthyDir, "coordinator.json");
+	const healthyState = (reservedPath: string) => JSON.stringify({
+		reservations: [{ attemptId: "attempt-1", workspacePath: reservedPath, workspaceId: "workspace-1" }],
+		attempts: [{ id: "attempt-1", ownerSessionFile: ownerSession, workspace: { id: "workspace-1", path: reservedPath }, run: { runId: "run-1", ownerSessionFile: ownerSession } }],
+		deliveries: [],
+	});
+	writeFileSync(healthy, healthyState(join(home, "foreign")), "utf8");
+	const emptyDir = join(executionRoot, "empty-repo"); mkdirSync(emptyDir, { recursive: true }); // no coordinator.json
+	const previous: Record<string, string | undefined> = {
+		HOME: process.env.HOME,
+		PI_EXECUTION_STATE_ROOT: process.env.PI_EXECUTION_STATE_ROOT,
+		GHL_LATCH_STATE_DIR: process.env.GHL_LATCH_STATE_DIR,
+		PI_SUBAGENT_RUN_ID: process.env.PI_SUBAGENT_RUN_ID,
+		PI_SUBAGENT_PARENT_SESSION: process.env.PI_SUBAGENT_PARENT_SESSION,
+		PI_SUBAGENT_CHILD_AGENT: process.env.PI_SUBAGENT_CHILD_AGENT,
+		ORCHESTRATE_ROLE: process.env.ORCHESTRATE_ROLE,
+		[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]: process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV],
+	};
+	try {
+		process.env.HOME = home;
+		process.env.PI_EXECUTION_STATE_ROOT = executionRoot;
+		delete process.env.GHL_LATCH_STATE_DIR;
+		delete process.env.PI_SUBAGENT_RUN_ID; delete process.env.PI_SUBAGENT_PARENT_SESSION;
+		delete process.env.PI_SUBAGENT_CHILD_AGENT; delete process.env.ORCHESTRATE_ROLE;
+		delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
+		// Direct contract: a record that exists but cannot be read or parsed is an
+		// explicit lookup failure, never a silent skip.
+		assert.throws(() => durableExecutionReservation(workspace), /Unreadable durable execution state/);
+		assert.throws(() => durableExecutionWorkspaceFence(workspace), /Unreadable durable execution state/);
+		// A state file that parses to a non-object is malformed too.
+		writeFileSync(torn, "null", "utf8");
+		assert.throws(() => durableExecutionReservation(workspace), /Malformed durable execution state/);
+		writeFileSync(torn, JSON.stringify({
+			reservations: [{ attemptId: "attempt-1", workspacePath: workspace, workspaceId: "workspace-1" }],
+		}).slice(0, 40), "utf8");
+		let handler: ((event: any) => Promise<any>) | undefined;
+		guardExtension({ on(name: string, fn: any) { if (name === "tool_call") handler = fn; } } as unknown as ExtensionAPI);
+		assert.ok(handler);
+		const fenced = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m x" } });
+		assert.equal(fenced?.block ?? false, true, "an unverifiable execution fence must fail closed instead of allowing the commit");
+		assert.match(String((fenced as { reason?: string }).reason ?? ""), /must not mutate/, "the block must come from the reserved-parent fence");
+		const read = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status" } });
+		assert.equal(read?.block ?? false, false, "read-only commands stay allowed while the record fails closed");
+		// Missing vs malformed: a repo directory without coordinator.json proves
+		// nothing and stays a harmless skip; with the torn record gone, healthy
+		// lookups work again.
+		rmSync(torn);
+		assert.equal(durableExecutionReservation(join(home, "nowhere")), undefined);
+		assert.equal(durableExecutionReservation(join(home, "foreign"))?.attemptId, "attempt-1", "a healthy sibling record must keep resolving");
+		// Registered-path regression: a healthy reservation still authorizes its
+		// exact runtime-bound worker.
+		writeFileSync(healthy, healthyState(workspace), "utf8");
+		process.env.PI_SUBAGENT_CHILD_AGENT = "tdd-worker";
+		process.env.PI_SUBAGENT_RUN_ID = "run-1";
+		process.env.PI_SUBAGENT_PARENT_SESSION = "owner-header-1";
+		process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header-1" } });
+		const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m own" } });
+		assert.equal(own?.block ?? false, false, "a healthy reservation still authorizes its verified worker");
 	} finally {
 		for (const [key, value] of Object.entries(previous)) {
 			if (value === undefined) delete process.env[key]; else process.env[key] = value;
