@@ -27,7 +27,7 @@ The prior failure was real but was not a production composition fix: `/private/v
 
 ## Commands and result
 
-- Candidate commit: `PENDING_HANDOFF_COMMIT` (current starting HEAD was `4be68c1`)
+- Candidate implementation commit: `6b4c150` (current starting HEAD was `4be68c1`)
 - `rtk pnpm exec tsc --noEmit` — passed
 - focused collector red-first run — failed before root-scope implementation; focused collector tests then passed (3/3)
 - `rtk pnpm exec node --experimental-strip-types --test --test-name-pattern='AE9' test/execution-e2e.test.ts` — passed
