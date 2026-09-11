@@ -202,6 +202,71 @@ test("blocks a prohibited worktree operation after a read-only worktree segment"
 	assert.equal(classifyForRole(command, { writer: false }).block, true);
 });
 
+/* ---------------------------------------------------------------- *
+ * Round-2 P1 (grok) — hasGhSequence required the exact token `gh`
+ * (unlike gitCommandToken, which accepts a path ending in /git), and the
+ * ghl-* checks compared whole tokens, so `/usr/bin/gh pr merge`, a quoted
+ * `/usr/bin/ghl-pr-land`, or `$(/opt/ghl/bin/ghl-pr-await …)` executed
+ * with no guard verdict — bypassing the writer publication fence, the
+ * reserved-parent lifecycle fence, and the general merge/poll blocks.
+ * Workflow executables must match by basename, exactly like git.
+ * ---------------------------------------------------------------- */
+
+test("blocks gh and ghl binaries at absolute or quoted paths (general classifier)", () => {
+	assert.match(blocked("/usr/bin/gh pr merge 2166 --admin"), /git pr-await 2166/);
+	assert.match(blocked('"/usr/bin/gh" pr merge 2166 --admin'), /git pr-await 2166/);
+	assert.match(blocked("echo $(/opt/homebrew/bin/gh pr merge 2166)"), /git pr-await 2166/);
+	assert.match(blocked("/usr/local/bin/ghl-pr-poll 2166"), /retired/);
+	assert.match(blocked("echo `'/usr/local/bin/ghl-pr-poll' 2166`"), /retired/);
+	// unparseable commands carrying a path'd workflow binary still fail closed
+	assert.match(blocked("echo $(/usr/bin/gh pr merge 2166"), /Unsupported shell syntax/);
+	assert.match(blocked("echo '/usr/local/bin/ghl-pr-poll 2166"), /Unsupported shell syntax/);
+	// legitimate read-only path'd controls stay allowed
+	allowed("/usr/bin/gh pr view 2166 --json state");
+	allowed("/usr/bin/gh pr list");
+	allowed("/usr/local/bin/ghl-pr-await 2166");
+	allowed("/usr/local/bin/ghl-pr-land 2166");
+});
+
+test("writer and reserved-parent guards catch gh/ghl binaries at absolute or quoted paths", () => {
+	for (const command of [
+		"/usr/bin/gh pr merge 2210 --squash",
+		"/usr/bin/gh pr create --title x --body y",
+		"/usr/bin/gh pr comment 2210 --body 'no'",
+		'"/opt/gh/bin/gh" pr merge 2210',
+		"/opt/ghl/bin/ghl-pr-await 2210",
+		"/opt/ghl/bin/ghl-pr-land 2210",
+		"/opt/ghl/bin/ghl-wt feat/x",
+		"/opt/ghl/bin/ghl-wt-rm feat/x",
+		"echo $(/opt/ghl/bin/ghl-pr-land 2210)",
+		"echo `/usr/bin/gh pr merge 2210`",
+	]) {
+		const verdict = classifyForRole(command, { writer: true });
+		assert.equal(verdict.block, true, `a writer child must not run: ${command}`);
+		assert.match(
+			String((verdict as { reason?: string }).reason ?? ""),
+			/writer child/,
+			`the block must come from the writer path, not an unparsed allow: ${command}`,
+		);
+	}
+	// a writer still may read the PR through an absolute binary
+	assert.equal(classifyForRole("/usr/bin/gh pr view 2210", { writer: true }).block, false);
+	for (const command of [
+		"/usr/bin/ghl-pr-land 2210",
+		"/usr/bin/ghl-pr-await 2210",
+		"/opt/ghl/bin/ghl-wt feat/x",
+		"/usr/bin/gh pr merge 2210",
+		"echo $(/opt/ghl/bin/ghl-pr-land 2210)",
+	]) {
+		for (const opts of [{ writer: false, writerReserved: true }, { writer: false, executionRole: "parent" as const }]) {
+			assert.equal(classifyForRole(command, opts).block, true, `a reserved parent must not run: ${command}`);
+		}
+	}
+	// read-only path'd controls stay allowed for a reserved parent too
+	assert.equal(classifyForRole("/usr/bin/gh pr view 2210", { writer: false, writerReserved: true }).block, false);
+	assert.equal(classifyForRole("/usr/bin/gh pr view 2210", { writer: false, executionRole: "parent" }).block, false);
+});
+
 test("extractPrNumber", () => {
 	assert.equal(extractPrNumber("gh pr view 2166 --json state"), "2166");
 	assert.equal(extractPrNumber("git pr-await 479"), "479");

@@ -69,7 +69,12 @@ export function executionOverlayTodos(state: CoordinatorState): OverlayTodo[] {
   }
   for (const group of manifest.deliveryGroups) {
    const delivery = state.deliveries.find(item => item.groupId === group.id);
-   const status = ["merged", "closed-unmerged"].includes(delivery?.phase ?? "") || (group.policy === "local" && delivery?.phase === "ready") ? "completed" : ["integrating", "handoff-pending", "controller-owned"].includes(delivery?.phase ?? "") ? "in_progress" : "pending";
+   // Merge-dependent work completes only after a verified merge. `merged` is
+   // the sole terminal success; `closed-unmerged` is terminal WITHOUT merge
+   // evidence and must stay visibly unsuccessful (its phase remains in the
+   // row subject). A `local` delivery that validated keeps its established
+   // completion semantics without a merge.
+   const status = delivery?.phase === "merged" || (group.policy === "local" && delivery?.phase === "ready") ? "completed" : ["integrating", "handoff-pending", "controller-owned"].includes(delivery?.phase ?? "") ? "in_progress" : "pending";
    const todo: OverlayTodo = { id: next++, subject: `Execution Delivery ${group.id} — ${delivery?.phase ?? "pending"}`, status, metadata: { kind: "execution-delivery", taskId: group.id } };
    if (status === "in_progress") todo.activeForm = delivery?.reason ? `blocked: ${delivery.reason}` : "reconciling delivery";
    todos.push(todo);

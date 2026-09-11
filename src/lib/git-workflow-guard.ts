@@ -131,11 +131,11 @@ export function extractPrNumber(command: string): string | undefined {
 		}
 	}
 	for (const segment of parsed?.segments ?? []) for (let index = 0; index < segment.length; index++) {
-		if (["ghl-pr-await", "ghl-pr-land", "ghl-pr-poll"].includes(segment[index]!)) {
+		if (ghlCommandToken(segment[index]!, ["ghl-pr-await", "ghl-pr-land", "ghl-pr-poll"])) {
 			const match = segment.slice(index + 1).find(value => /^#?\d+$/.test(value));
 			if (match) return match.replace(/^#/, "");
 		}
-		if (segment[index] === "gh") {
+		if (ghCommandToken(segment[index]!)) {
 			for (let next = index + 1; next < segment.length - 1; next++) {
 				if (["view", "checks", "status", "watch", "merge"].includes(segment[next]!) && /^#?\d+$/.test(segment[next + 1]!)) return segment[next + 1]!.replace(/^#/, "");
 			}
@@ -251,6 +251,22 @@ function gitCommandToken(token: string): boolean {
 	return token === "git" || token.endsWith("/git");
 }
 
+/** `gh` matches by basename too, so `/usr/bin/gh` or a quoted absolute path
+ * cannot slip past hasGhSequence the way plain `gh` cannot (round-2 P1). */
+function ghCommandToken(token: string): boolean {
+	return token === "gh" || token.endsWith("/gh");
+}
+
+function ghlCommandToken(token: string, names: readonly string[]): boolean {
+	return names.some(name => token === name || token.endsWith(`/${name}`));
+}
+
+/** ghl-* lifecycle binaries match by basename: a whole-token equality check
+ * let `/usr/bin/ghl-pr-await` (and friends) bypass every guard. */
+function hasGhlToken(segments: ShellSegment[], ...names: string[]): boolean {
+	return segments.some(segment => segment.some(token => ghlCommandToken(token, names)));
+}
+
 const GIT_GLOBAL_VALUE_OPTIONS = new Set([
 	"--exec-path", "--work-tree", "--git-dir", "--namespace", "--config-env", "--super-prefix", "--attr-source", "--list-cmds",
 ]);
@@ -323,7 +339,7 @@ const GH_GLOBAL_VALUE_OPTIONS = new Set(["--repo", "--hostname", "--git-protocol
 
 function hasGhSequence(segments: ShellSegment[], sequence: string[]): boolean {
 	return segments.some(segment => segment.some((token, index) => {
-		if (token !== "gh") return false;
+		if (!ghCommandToken(token)) return false;
 		let cursor = index + 1, matched = 0;
 		while (cursor < segment.length && matched < sequence.length) {
 			const current = segment[cursor]!;
@@ -339,20 +355,16 @@ function hasGhSequence(segments: ShellSegment[], sequence: string[]): boolean {
 	}));
 }
 
-function hasToken(segments: ShellSegment[], token: string): boolean {
-	return segments.some(segment => segment.includes(token));
-}
-
 export function classifyGitWorkflowCommand(command: string): GuardVerdict {
 	const text = stripComments(command), parsed = gitInvocations(text);
 	// A malformed shell command containing a workflow executable cannot be
 	// safely classified. Blocking is safer than allowing an unparsed segment.
 	// Substitution openers - $(, <(, >(, backtick, subshell ( - can directly
 	// precede a workflow executable, so they count as workflow positions too.
-	if (!parsed && /(?:^|[\s;&|`(<>])(git|gh|ghl-)[^\s;&|]*/.test(text)) return { block: true, reason: "Unsupported shell syntax; split the command into a supported, bounded invocation." };
+	if (!parsed && /(?:^|[\s;&|`(<>])(?:[^\s;&|/]+\/)*(git|gh|ghl-)[^\s;&|]*/.test(text)) return { block: true, reason: "Unsupported shell syntax; split the command into a supported, bounded invocation." };
 	const segments = parsed?.segments ?? [];
 	const git = parsed?.git ?? [];
-	const hasPrPoll = git.some(invocation => invocation.verb === "pr-poll") || hasToken(segments, "ghl-pr-poll");
+	const hasPrPoll = git.some(invocation => invocation.verb === "pr-poll") || hasGhlToken(segments, "ghl-pr-poll");
 	if (hasPrPoll) return { block: true, reason: `git pr-poll is retired. Use ${awaitHint(text)} once, then stop. The latch wakes this session.` };
 	const worktree = git.find(isRawWorktreeMutation);
 	if (worktree) {
@@ -400,10 +412,10 @@ export function isWriterRole(env: Record<string, string | undefined> = process.e
 
 function writerBlock(command: string): GuardVerdict | undefined {
 	const parsed = gitInvocations(stripComments(command)), git = parsed?.git ?? [], segments = parsed?.segments ?? [];
-	if (git.some(invocation => invocation.verb === "pr-await") || segments.some(segment => segment.includes("ghl-pr-await"))) return { block: true, reason: "a writer child never waits on the review. Settle with your handoff; code runs git pr-await once, from the parent." };
-	if (git.some(invocation => invocation.verb === "pr-land") || segments.some(segment => segment.includes("ghl-pr-land")) || hasGhSequence(segments, ["pr", "merge"])) return { block: true, reason: "a writer child never lands the PR. Code lands it when the waiter says so." };
+	if (git.some(invocation => invocation.verb === "pr-await") || hasGhlToken(segments, "ghl-pr-await")) return { block: true, reason: "a writer child never waits on the review. Settle with your handoff; code runs git pr-await once, from the parent." };
+	if (git.some(invocation => invocation.verb === "pr-land") || hasGhlToken(segments, "ghl-pr-land") || hasGhSequence(segments, ["pr", "merge"])) return { block: true, reason: "a writer child never lands the PR. Code lands it when the waiter says so." };
 	const rawWorktree = git.some(isRawWorktreeMutation);
-	if (rawWorktree || git.some(invocation => invocation.verb === "wt" || invocation.verb === "wt-rm") || segments.some(segment => segment.includes("ghl-wt") || segment.includes("ghl-wt-rm"))) return { block: true, reason: "a writer child never creates or removes a worktree. You were given one; work in it." };
+	if (rawWorktree || git.some(invocation => invocation.verb === "wt" || invocation.verb === "wt-rm") || hasGhlToken(segments, "ghl-wt", "ghl-wt-rm")) return { block: true, reason: "a writer child never creates or removes a worktree. You were given one; work in it." };
 	if (["create", "comment", "edit", "close", "reopen", "ready"].some(action => hasGhSequence(segments, ["pr", action]))) return { block: true, reason: "a writer child never speaks on the PR. Put it in your handoff; code opens the PR and posts on it." };
 	if (git.some(invocation => invocation.verb === "push")) return { block: true, reason: "a writer child commits; code pushes. Commit your work and settle — the push is one per round, from the parent." };
 	return undefined;
@@ -421,7 +433,7 @@ const PARENT_MUTATION_VERB =
 function isLifecycleMutation(command: string): boolean {
 	const text = stripComments(command), parsed = gitInvocations(text);
 	if (parsed?.git.some(invocation => ["wt", "wt-rm", "pr-await", "pr-land"].includes(invocation.verb ?? ""))) return true;
-	if (parsed?.segments.some(segment => ["ghl-wt", "ghl-wt-rm", "ghl-pr-await", "ghl-pr-land"].some(name => segment.includes(name)))) return true;
+	if (hasGhlToken(parsed?.segments ?? [], "ghl-wt", "ghl-wt-rm", "ghl-pr-await", "ghl-pr-land")) return true;
 	return ["create", "merge", "close", "reopen", "ready", "edit", "comment"].some(action => hasGhSequence(parsed?.segments ?? [], ["pr", action]));
 }
 
