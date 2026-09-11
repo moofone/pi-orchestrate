@@ -11,8 +11,15 @@ const artifactDir = config.artifactDir;
 const log = event => appendFileSync(eventsPath, `${JSON.stringify({ runId, pid: process.pid, ...event })}\n`);
 const writeJson = (path, value) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, JSON.stringify(value)); renameSync(tmp, path); };
 mkdirSync(artifactDir, { recursive: true });
-log({ event: "start", at: startedAt, cwd: process.cwd(), taskId: config.taskId, mode: config.mode });
+log({ event: "start", at: startedAt, cwd: process.cwd(), taskId: config.taskId, mode: config.mode, agent: config.agent });
 writeJson(join(artifactDir, "status.json"), { lifecycleArtifactVersion: 3, runId, sessionId: config.sessionId, mode: "single", state: "running", steps: [] });
+writeJson(join(artifactDir, "startup-snapshot.json"), {
+  cwd: process.cwd(),
+  taskId: config.taskId,
+  agent: config.agent,
+  files: Object.fromEntries((config.snapshotPaths ?? []).map(path => [path, (() => { try { return readFileSync(join(process.cwd(), path), "utf8"); } catch { return null; } })()])),
+});
+log({ event: "ready", at: Date.now(), taskId: config.taskId, mode: config.mode });
 
 const waitFor = async path => {
   while (true) {
