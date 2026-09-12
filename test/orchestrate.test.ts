@@ -2876,6 +2876,45 @@ test("L5: liveFeatureNotReadyToApprove is true until plan-reviewer is done", () 
   }
 });
 
+test("L5: a later planning draft does not block approve for a sibling whose plan-reviewer is done", () => {
+  const REF = join(homedir(), "Dev", "git", "icemining");
+  const root = idleParentRoot([
+    { name: "feat-ready", phase: "reviewing", worktree: "none" },
+    { name: "feat-later", phase: "planning", worktree: "none" },
+  ]);
+  try {
+    writeFileSync(
+      join(root, "icemining", "feat-ready", "status.md"),
+      [
+        "# Status",
+        "repo: icemining",
+        "name: feat-ready",
+        "phase: reviewing",
+        "plan_review: done",
+        "worktree: none",
+      ].join("\n") + "\n",
+    );
+    writeFileSync(
+      join(root, "icemining", "feat-later", "status.md"),
+      [
+        "# Status",
+        "repo: icemining",
+        "name: feat-later",
+        "phase: planning",
+        "plan_review: none",
+        "worktree: none",
+      ].join("\n") + "\n",
+    );
+    assert.equal(
+      orch.liveFeatureNotReadyToApprove(REF, root),
+      false,
+      "a sibling still in planning must not suppress approve for a Feature whose plan-reviewer is done",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("L5: reconcile is wired to session_start, the command handler, and an unref'd timer", () => {
   const src = readFileSync(ORCH_SRC, "utf8");
   assert.equal(

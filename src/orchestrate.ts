@@ -5901,14 +5901,27 @@ export function liveFeatureNotReadyToApprove(cwd: string, root?: string): boolea
     archiveDir: join(repoDir, "archive"),
   };
   const gitRoot = join(REF_ROOT, repo);
-  return discoverFeatures(paths).some((row) => {
-    if (!row.live) return false;
-    if (isApproved(row.plan)) return false;
-    if (planReviewState(row.status) === "done") return false;
+  let readySibling = false;
+  let unready = false;
+  for (const row of discoverFeatures(paths)) {
+    if (!row.live) continue;
+    if (isApproved(row.plan)) continue;
     const worktree = statusField(row.status, "worktree");
-    if (worktree && !isPendingToken(worktree)) return samePath(cwd, worktree);
-    return samePath(cwd, gitRoot);
-  });
+    const here =
+      worktree && !isPendingToken(worktree)
+        ? samePath(cwd, worktree)
+        : samePath(cwd, gitRoot);
+    if (!here) continue;
+    if (planReviewState(row.status) === "done") {
+      readySibling = true;
+      continue;
+    }
+    unready = true;
+  }
+  // Planning Features share the git-root match. A later live draft still in
+  // planning must not hide approve for a sibling whose plan-reviewer is done.
+  if (readySibling) return false;
+  return unready;
 }
 
 export function liveFeatureTaskChain(cwd: string, root?: string): boolean {
