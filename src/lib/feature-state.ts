@@ -107,9 +107,14 @@ export function writeStatusFields(
 		if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(">") || trimmed.startsWith("|")) {
 			continue;
 		}
-		const at = trimmed.indexOf(":");
+		// Same list-marker strip as `parseStatusFields`. Without it the key is
+		// `- phase` (space → skipped), a second `phase:` is appended, and the
+		// leftover list item stays first so readPhase never moves.
+		let field = trimmed;
+		if (field.startsWith("- ")) field = field.slice(2).trim();
+		const at = field.indexOf(":");
 		if (at <= 0) continue;
-		const key = trimmed.slice(0, at).trim().toLowerCase();
+		const key = field.slice(0, at).trim().toLowerCase();
 		if (!key || key.includes(" ")) continue;
 		lastFieldAt = i;
 		// First occurrence wins, matching `parseStatusFields`. A duplicate key
