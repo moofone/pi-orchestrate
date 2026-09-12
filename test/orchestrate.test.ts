@@ -6100,6 +6100,65 @@ test("P3 F14: reconcilePlanReview clears the wedge and lets approve through", ()
   }
 });
 
+test("P3 F14: reconcilePlanReview stamps awaiting approval when an orphaned reviewer finished", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-f14-done-"));
+  try {
+    const runDir = writeRunStatus(dir, {
+      state: "complete",
+      startedAt: 1000,
+      endedAt: 2000,
+      pid: 999999,
+      steps: [{ status: "complete" }],
+    });
+    const paths = { statusFile: join(dir, "status.md"), planFile: join(dir, "plan.md") } as never;
+    writeFileSync(
+      (paths as { statusFile: string }).statusFile,
+      [
+        "# Status",
+        "repo: r",
+        "plan: p",
+        "phase: reviewing",
+        "plan_review: running",
+        "reviewer_run_id: dead-run",
+        `reviewer_run_dir: ${runDir}`,
+        "next_action: x",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      (paths as { planFile: string }).planFile,
+      "# Feature: X\n\n> Status: DRAFT\n\nbody\n",
+    );
+    const notices: string[] = [];
+    const ctx = {
+      ui: { notify: (m: string) => notices.push(String(m)) },
+    } as never;
+
+    const proceed = orch.reconcilePlanReview(ctx, paths);
+    assert.equal(proceed, true, "a finished orphaned reviewer must not stop the caller");
+    const afterStatus = readFileSync((paths as { statusFile: string }).statusFile, "utf8");
+    assert.equal(
+      orch.planReviewState(afterStatus),
+      "done",
+      "status records the finished review so cards treat the Feature as approvable",
+    );
+    const afterPlan = readFileSync((paths as { planFile: string }).planFile, "utf8");
+    assert.match(afterPlan, /^> Status: DRAFT — awaiting approval$/m);
+    assert.doesNotMatch(
+      afterPlan,
+      /^> Status: DRAFT$/m,
+      "same header contract as in-session reviewPlan: rewrite DRAFT, do not leave it",
+    );
+    assert.equal(
+      afterPlan.match(/^> Status:/gm)?.length,
+      1,
+      "a single Status line so the header is not session-dependent",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("P3 F14: reviewPlan records the run it spawned", () => {
   const src = readFileSync(ORCH_SRC, "utf8");
   const fn = src.slice(src.indexOf("async function reviewPlan("));
@@ -6225,9 +6284,17 @@ test("P4 F16: approve refuses a repo with no origin, and says so in one line", (
 
 test("P4 F16: markPlanAwaitingApproval is a no-op on APPROVED and rewrites DRAFT", () => {
   assert.equal(typeof orch.markPlanAwaitingApproval, "function");
-  assert.match(
-    orch.markPlanAwaitingApproval("# Feature: X\n\n> Status: DRAFT\n"),
-    /^> Status: DRAFT — awaiting approval$/m,
+  const rewritten = orch.markPlanAwaitingApproval("# Feature: X\n\n> Status: DRAFT\n");
+  assert.match(rewritten, /^> Status: DRAFT — awaiting approval$/m);
+  assert.doesNotMatch(
+    rewritten,
+    /^> Status: DRAFT$/m,
+    "the DRAFT line is replaced, not duplicated",
+  );
+  assert.equal(
+    rewritten.match(/^> Status:/gm)?.length,
+    1,
+    "a single Status line: rewrite, not prepend",
   );
   assert.match(
     orch.markPlanAwaitingApproval("# Feature: X\n\n> Status: APPROVED\n"),

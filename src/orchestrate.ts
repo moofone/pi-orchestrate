@@ -6263,6 +6263,10 @@ export function reconcilePlanReview(ctx: ExtensionCommandContext, paths: Paths):
       reviewerRunId: "none",
       reviewerRunDir: "none",
     });
+    const reviewedPlan = readText(paths.planFile);
+    if (reviewedPlan.trim() && !isApproved(reviewedPlan)) {
+      writeText(paths.planFile, markPlanAwaitingApproval(reviewedPlan));
+    }
     uiNotify(ctx, `plan-reviewer from an earlier session finished; plan review recorded done.`, "info");
     return true;
   }
