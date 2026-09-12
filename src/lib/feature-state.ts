@@ -36,12 +36,17 @@
 export function parseStatusFields(text: string): Map<string, string> {
 	const out = new Map<string, string>();
 	for (const raw of text.split("\n")) {
-		const line = raw.trim();
+		let line = raw.trim();
 		// `## Tasks` and the table under it are not fields, and a task row is
 		// full of colons — stop there. The document's own `# Status` title is a
 		// single hash and must not end the scan before it starts.
 		if (line.startsWith("##")) break;
 		if (!line || line.startsWith("#") || line.startsWith(">") || line.startsWith("|")) continue;
+		// Planners sometimes overwrite the field block as markdown list items
+		// (`- phase: planning`). Those keys contain a space (`- phase`) and
+		// were skipped, so readPhase was undefined and every later move was
+		// refused as "Cannot start a Feature". Strip one list marker.
+		if (line.startsWith("- ")) line = line.slice(2).trim();
 		const at = line.indexOf(":");
 		if (at <= 0) continue;
 		const key = line.slice(0, at).trim().toLowerCase();
@@ -102,9 +107,14 @@ export function writeStatusFields(
 		if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(">") || trimmed.startsWith("|")) {
 			continue;
 		}
-		const at = trimmed.indexOf(":");
+		// Same list-marker strip as `parseStatusFields`. Without it the key is
+		// `- phase` (space → skipped), a second `phase:` is appended, and the
+		// leftover list item stays first so readPhase never moves.
+		let field = trimmed;
+		if (field.startsWith("- ")) field = field.slice(2).trim();
+		const at = field.indexOf(":");
 		if (at <= 0) continue;
-		const key = trimmed.slice(0, at).trim().toLowerCase();
+		const key = field.slice(0, at).trim().toLowerCase();
 		if (!key || key.includes(" ")) continue;
 		lastFieldAt = i;
 		// First occurrence wins, matching `parseStatusFields`. A duplicate key

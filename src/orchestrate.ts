@@ -167,7 +167,7 @@ export const FORBIDDEN = [
   "Do NOT edit, stage, or commit in a reference checkout under ~/Dev/git/<repo>.",
   "Do NOT launch tdd-worker with cwd set to a reference checkout.",
   "Do NOT spawn tdd-worker, fixer, feature-qa, qa-opus, planner, or plan-reviewer from this parent. The /orchestrate extension launches those.",
-  "Do NOT launch tdd-worker on composer-*, inherit, or unnamed models. Simple and critical tdd-worker are openai-codex/gpt-5.6-luna:xhigh. feature-qa, qa-opus, and plan-reviewer run on the reviewer model configured once in extensions/orchestrate.json (`qaModel`, xai/grok-4.6:high) — never name your own. Never fall back to this session's model.",
+  "Do NOT launch tdd-worker on composer-*, inherit, or unnamed models. Simple and critical tdd-worker are xai/grok-4.6:medium. feature-qa, qa-opus, and plan-reviewer run on the reviewer model configured once in extensions/orchestrate.json (`qaModel`, xai/grok-4.6:high) — never name your own. Never fall back to this session's model.",
   "ALWAYS follow git-workflow aliases: `git wt`, `git pr-await`, `git pr-land`, `git wt-rm`. Never raw `git worktree add` / `gh pr merge` for those steps.",
   "`next=yield` means stop talking. Do not re-invoke, pipe, `timeout`, or `--once` on `git pr-await`. `ghl-pr-await` owns the wait.",
 ].join("\n");
@@ -187,14 +187,14 @@ const RESERVED_NAMES = new Set(["current", "archive", "pending"]);
 
 const WORKERS = {
   simple: {
-    model: "openai-codex/gpt-5.6-luna",
-    thinking: "xhigh",
-    short: "luna xhigh",
+    model: "xai/grok-4.6",
+    thinking: "medium",
+    short: "grok medium",
   },
   critical: {
-    model: "openai-codex/gpt-5.6-luna",
-    thinking: "xhigh",
-    short: "luna xhigh",
+    model: "xai/grok-4.6",
+    thinking: "medium",
+    short: "grok medium",
   },
 } as const;
 
@@ -208,11 +208,10 @@ const WRITER_AGENTS = new Set(["tdd-worker", "fixer", "feature-qa", "qa-opus", "
  * The review agents, and the one place their model is decided.
  *
  * Reviewers are a different allow-list from writers: `settings.json` scopes
- * these three to `qaModel` (xai/grok-4.6). OpenAI Luna xhigh is the tdd-worker
- * pin and refused here; launching QA on the wrong id is refused by
- * modelScope before the child starts and parks a finished Feature at
- * `feature-qa failed` with no PR, forever, which is why the id is read from
- * one place rather than repeated at each launch site.
+ * these three to `qaModel` (xai/grok-4.6). tdd-worker is native grok-4.6
+ * medium — the same family as modelScope.agents.tdd-worker (`xai/grok-4.6*`).
+ * Launching on Luna/GLM is refused by modelScope and parks the Feature at
+ * blocked with no PR, which is why the id is read from one place.
  *
  * To change the reviewer model, edit `qaModel` in `orchestrate.json` and
  * widen `modelScope.agents.*` in settings.json to match. Nothing else.
@@ -226,7 +225,7 @@ const QA_THINKING: Record<string, string> = {
   "plan-reviewer": "high",
 };
 
-/** QA never launches above high. tdd-worker is OpenAI Luna xhigh. */
+/** QA never launches above high. tdd-worker is native grok-4.6 medium. */
 function capThinking(level: string): string {
   return /^(xhigh|extra-high|max)$/i.test(level.trim()) ? "high" : level;
 }
@@ -261,15 +260,15 @@ export function isAllowedQaModel(model: string, jsonText?: string): boolean {
 }
 
 /**
- * Orchestration writers run one billed id: `openai-codex/gpt-5.6-luna`.
- * Anything else (legacy GLM/cursor/Anthropic ids, composer, inherit) is off
- * the allow-list — `applySpawnPolicy` repins it onto Luna and
+ * Orchestration writers run one billed id: `xai/grok-4.6` (medium).
+ * Anything else (Luna, GLM, cursor-billed grok, composer, inherit) is off
+ * the allow-list — `applySpawnPolicy` repins it onto grok medium and
  * `writerSpawnRejection` names the refuse for callers that bypass the pin.
  */
 export function isAllowedWriterModel(model: string): boolean {
   if (typeof model !== "string") return false;
   const base = (model.split(":")[0] ?? "").trim().toLowerCase();
-  return base === "openai-codex/gpt-5.6-luna";
+  return base === "xai/grok-4.6";
 }
 
 /** Why this spawn must not go out. `undefined` means the guard does not apply or the model is allowed. */
@@ -283,7 +282,7 @@ export function writerSpawnRejection(params: Record<string, unknown>): string | 
   return QA_AGENTS.has(agent)
     ? `refusing ${agent} on ${shown}; QA is ${qaModelFor(agent)} only — never inherit`
     : `refusing ${agent} on ${shown}; orchestration writers are ` +
-        `openai-codex/gpt-5.6-luna only — never composer or inherit`;
+        `xai/grok-4.6 only — never composer or inherit`;
 }
 
 /**
@@ -6124,7 +6123,7 @@ Overwrite ${paths.planFile}:
 - […]
 \`\`\`
 
-Also overwrite ${paths.statusFile} with repo/plan/feature, name: pending, branch: pending, phase: planning, active_task: none, worktree: none, pr: none, next_action: wait for plan-reviewer after # Feature: title exists, and a Tasks table.
+Do **not** overwrite ${paths.statusFile}. The host owns \`phase\`, \`phase_prev\`, \`name\`, \`branch\`, and \`worktree\` as \`key: value\` lines (never markdown list items like \`- phase: planning\`). You may refresh the Tasks table under \`## Tasks\` only.
 
 TDD: every Task is preceded by a described failing test; prove correctness and rejection; cite spec anchors.
 Present ${paths.planFile} as a path only. Stop. Do not implement.

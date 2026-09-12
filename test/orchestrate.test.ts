@@ -1233,7 +1233,7 @@ test("T1: mixed dash then colon in one plan both parse", () => {
  * W1 — orchestration writers must not inherit Cursor Grok / Composer
  * ---------------------------------------------------------------- */
 
-test("W1: isAllowedWriterModel allows only OpenAI Luna writers", () => {
+test("W1: isAllowedWriterModel allows native grok-4.6 writers", () => {
   assert.equal(
     typeof (orch as Record<string, unknown>).isAllowedWriterModel,
     "function",
@@ -1242,11 +1242,11 @@ test("W1: isAllowedWriterModel allows only OpenAI Luna writers", () => {
   const allowed = (orch as never as { isAllowedWriterModel: (m: string) => boolean })
     .isAllowedWriterModel;
 
-  assert.equal(allowed("openai-codex/gpt-5.6-luna"), true);
-  assert.equal(allowed("openai-codex/gpt-5.6-luna:xhigh"), true);
+  assert.equal(allowed("xai/grok-4.6"), true);
+  assert.equal(allowed("xai/grok-4.6:medium"), true);
   // Legacy writer ids stay off the allow-list so applySpawnPolicy repins them
-  // onto OpenAI Luna instead of letting them through unpinned.
-  assert.equal(allowed("zai/glm-5.3-flash"), false, "legacy GLM writer must repin onto Luna");
+  // onto grok-4.6 medium instead of letting them through unpinned.
+  assert.equal(allowed("zai/glm-5.3-flash"), false, "legacy GLM writer must repin onto grok");
   assert.equal(allowed("zai/glm-5.3-flash:medium"), false);
   assert.equal(allowed("zai/glm-5.3-flash:high"), false);
   assert.equal(allowed("cursor/grok-4.6"), false);
@@ -1262,7 +1262,7 @@ test("W1: isAllowedWriterModel allows only OpenAI Luna writers", () => {
   assert.equal(allowed("grok-4.6"), false, "bare grok-4.6 inherits Cursor billing");
   assert.equal(allowed("cursor/composer-2.5-fast"), false);
   assert.equal(allowed("cursor/composer-2.5-fast:high"), false);
-  assert.equal(allowed("xai/grok-4.6:high"), false, "planner model is not a writer");
+  assert.equal(allowed("xai/grok-4.6:high"), true, "native grok is the writer id");
   assert.equal(allowed("grok-build/grok-4.6:high"), false, "retired grok-build planner id is not a writer");
   assert.equal(allowed("inherit"), false);
   assert.equal(allowed(""), false);
@@ -1279,7 +1279,7 @@ test("W1: writerSpawnRejection names the refuse for tdd-worker on cursor/grok", 
   ).writerSpawnRejection;
 
   assert.equal(
-    reject({ agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" }),
+    reject({ agent: "tdd-worker", model: "xai/grok-4.6:medium" }),
     undefined,
   );
   // Legacy writer ids are off the allow-list: the refuse text names the one
@@ -1292,7 +1292,7 @@ test("W1: writerSpawnRejection names the refuse for tdd-worker on cursor/grok", 
   ]) {
     const refusal = reject({ agent: "tdd-worker", model: legacy });
     assert.equal(typeof refusal, "string", `${legacy} is no longer an allowed writer`);
-    assert.match(String(refusal), /gpt-5\.6-luna/, "refusal names the only legal writer id");
+    assert.match(String(refusal), /xai\/grok-4\.6/, "refusal names the only legal writer id");
   }
   assert.equal(
     reject({ agent: "planner", model: "xai/grok-4.6:high" }),
@@ -1300,11 +1300,11 @@ test("W1: writerSpawnRejection names the refuse for tdd-worker on cursor/grok", 
     "planner is not a writer; this guard does not apply",
   );
   // Pinning replaced hard-refuse for known writers: applySpawnPolicy rewrites
-  // composer/inherit onto OpenAI Luna. writerSpawnRejection stays the allow-list check.
+  // composer/inherit onto grok-4.6 medium. writerSpawnRejection stays the allow-list check.
   const composer = reject({ agent: "tdd-worker", model: "cursor/composer-2.5-fast:high" });
   assert.equal(typeof composer, "string");
   assert.match(String(composer), /composer/i);
-  assert.match(String(composer), /gpt-5\.6-luna/);
+  assert.match(String(composer), /xai\/grok-4\.6/);
   assert.equal(typeof reject({ agent: "tdd-worker" }), "string", "missing model is inherit");
   assert.equal(typeof reject({ agent: "feature-qa", model: "grok-4.6" }), "string");
   assert.equal(
@@ -1315,7 +1315,7 @@ test("W1: writerSpawnRejection names the refuse for tdd-worker on cursor/grok", 
   assert.equal(typeof reject({ agent: "qa-opus", model: "cursor/composer-2.5-fast" }), "string");
 });
 
-test("W1: runChild pins a tdd-worker on composer onto OpenAI Luna before spawn", async () => {
+test("W1: runChild pins a tdd-worker on composer onto grok-4.6 medium before spawn", async () => {
   const pi = makeFakePi();
   const spawn = captureSpawn(pi);
   const p = (orch as never as { runChild: Function }).runChild(pi, {
@@ -1331,14 +1331,14 @@ test("W1: runChild pins a tdd-worker on composer onto OpenAI Luna before spawn",
   const outcome = (await withDeadline(p)) as { ok?: boolean; reason?: string };
   assert.notEqual(outcome.reason, "TEST_TIMEOUT", "pinned spawn must go out");
   assert.equal(outcome.ok, true);
-  assert.equal(spawn.params.model, "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(spawn.params.model, "xai/grok-4.6:medium");
   assert.doesNotMatch(String(spawn.params.model), /composer/);
   assert.equal(spawn.params.context, "fresh");
   assert.equal((spawn.params.turnBudget as { maxTurns: number }).maxTurns, 220);
 });
 
 const PARKED_EXCLUSION =
-  "Requested subagent model 'openai-codex/gpt-5.6-luna:xhigh' is excluded and cannot be replaced by a fallback (reason: Subagent produced no output (possible model cold-start or empty response).; expires: 2026-08-27T22:39:42.777Z).";
+  "Requested subagent model 'xai/grok-4.6:medium' is excluded and cannot be replaced by a fallback (reason: Subagent produced no output (possible model cold-start or empty response).; expires: 2026-08-27T22:39:42.777Z).";
 
 test("W3: isExcludedModelFailure matches the pi-subagents parking throw", () => {
   assert.equal(
@@ -1375,14 +1375,14 @@ test("W3: excluded simple luna tdd-worker does not retry when critical is the sa
 
   const p = (orch as never as { runChild: Function }).runChild(pi, {
     agent: "tdd-worker",
-    model: "openai-codex/gpt-5.6-luna:xhigh",
+    model: "xai/grok-4.6:medium",
     timeoutMs: 60_000,
   });
   const outcome = (await withDeadline(p, 2000)) as { ok?: boolean; reason?: string };
   assert.notEqual(outcome.reason, "TEST_TIMEOUT", "exclusion retry never settled");
   assert.equal(outcome.ok, false);
   assert.equal(spawns.length, 1, "retrying luna onto luna would loop");
-  assert.equal(spawns[0]?.params.model, "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(spawns[0]?.params.model, "xai/grok-4.6:medium");
 });
 
 test("W3: a non-exclusion spawn failure does not retry", async () => {
@@ -1405,7 +1405,7 @@ test("W3: a non-exclusion spawn failure does not retry", async () => {
 
   const p = (orch as never as { runChild: Function }).runChild(pi, {
     agent: "tdd-worker",
-    model: "openai-codex/gpt-5.6-luna:xhigh",
+    model: "xai/grok-4.6:medium",
     timeoutMs: 60_000,
   });
   const outcome = (await withDeadline(p, 2000)) as { ok?: boolean; reason?: string };
@@ -1434,7 +1434,7 @@ test("W3: an excluded critical luna writer does not retry (no loop)", async () =
 
   const p = (orch as never as { runChild: Function }).runChild(pi, {
     agent: "tdd-worker",
-    model: "openai-codex/gpt-5.6-luna:xhigh",
+    model: "xai/grok-4.6:medium",
     timeoutMs: 60_000,
   });
   const outcome = (await withDeadline(p, 2000)) as { ok?: boolean; reason?: string };
@@ -1483,19 +1483,19 @@ test("W2: applySpawnPolicy pins writers and planner; rejects other cursor billin
   const writer: SpawnParams = { agent: "tdd-worker", model: "cursor/composer-2.5-fast:high", timeoutMs: 4 * 60 * 60 * 1000 };
   const w = apply(writer);
   assert.equal(w.action, "pin");
-  assert.equal(writer.model, "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(writer.model, "xai/grok-4.6:medium");
   assert.equal(writer.context, "fresh");
   assert.ok((writer.timeoutMs as number) <= 90 * 60 * 1000, "4h writer timeout must clamp");
   assert.equal((writer.turnBudget as { maxTurns: number }).maxTurns, 220);
 
-  const already: SpawnParams = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
+  const already: SpawnParams = { agent: "tdd-worker", model: "xai/grok-4.6:medium" };
   assert.equal(apply(already).action, "allow");
-  assert.equal(already.model, "openai-codex/gpt-5.6-luna:xhigh", "do not demote an allowed writer");
+  assert.equal(already.model, "xai/grok-4.6:medium", "do not demote an allowed writer");
   assert.equal((already.turnBudget as { maxTurns: number }).maxTurns, 220);
 
-  const critical: SpawnParams = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
+  const critical: SpawnParams = { agent: "tdd-worker", model: "xai/grok-4.6:medium" };
   assert.equal(apply(critical).action, "allow");
-  assert.equal(critical.model, "openai-codex/gpt-5.6-luna:xhigh", "do not demote the critical writer");
+  assert.equal(critical.model, "xai/grok-4.6:medium", "do not demote the critical writer");
 
   const anthropicQa: SpawnParams = { agent: "feature-qa", model: "anthropic/claude-opus-5:high" };
   assert.equal(apply(anthropicQa).action, "pin");
@@ -1550,7 +1550,7 @@ test("W2: applySpawnPolicy pins every parallel writer task", () => {
   };
   apply(params);
   for (const task of params.parallel) {
-    assert.equal(task.model, "openai-codex/gpt-5.6-luna:xhigh");
+    assert.equal(task.model, "xai/grok-4.6:medium");
   }
   assert.ok((params.concurrency as number) <= 2, "writer fanout must not keep concurrency 7");
 });
@@ -1580,7 +1580,7 @@ test("W2: subagentToolGuard blocks unknown cursor billing and mutates writer inp
   );
   assert.equal(
     writerInput.model,
-    "openai-codex/gpt-5.6-luna:xhigh",
+    "xai/grok-4.6:medium",
     "inherit still pins onto the writer",
   );
 
@@ -2358,13 +2358,13 @@ test("Q2: applySpawnPolicy pins a QA agent off a cursor-billed id onto native gr
   assert.equal(cursorGrok.model, "xai/grok-4.6:high", "cursor-billed grok is not the QA id");
 
   // tdd-worker keeps OpenAI Luna: modelScope allows it for that agent.
-  const worker = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
+  const worker = { agent: "tdd-worker", model: "xai/grok-4.6:medium" };
   assert.equal(apply(worker).action, "allow");
-  assert.equal(worker.model, "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(worker.model, "xai/grok-4.6:medium");
 
   const retiredOpus = { agent: "tdd-worker", model: "cursor/claude-opus-5:high" };
   assert.equal(apply(retiredOpus).action, "pin");
-  assert.equal(retiredOpus.model, "openai-codex/gpt-5.6-luna:xhigh", "retired cursor Opus pins onto OpenAI Luna");
+  assert.equal(retiredOpus.model, "xai/grok-4.6:medium", "retired cursor Opus pins onto OpenAI Luna");
 });
 
 /**
@@ -3238,7 +3238,7 @@ test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and
   assert.equal(params.agent, "fixer", "review-fix is fixer, not tdd-worker");
   assert.equal(params.cwd, worktree, "the fixer writes in the Feature worktree only");
   assert.equal(params.context, "fresh");
-  assert.equal(params.model, "openai-codex/gpt-5.6-luna:xhigh", "review-fix is the critical writer");
+  assert.equal(params.model, "xai/grok-4.6:medium", "review-fix is the critical writer");
   assert.equal(
     String(params.output).startsWith(paths.handoffsDir),
     true,
@@ -4328,10 +4328,10 @@ test("T1: applySpawnPolicy still pins writers for the extension rpcCall path", (
   assert.equal(apply(legacyWriter).action, "pin");
   assert.equal(
     legacyWriter.model,
-    "openai-codex/gpt-5.6-luna:xhigh",
+    "xai/grok-4.6:medium",
     "cursor-billed Luna repins onto the OpenAI writer id",
   );
-  const writer = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
+  const writer = { agent: "tdd-worker", model: "xai/grok-4.6:medium" };
   assert.equal(apply(writer).action, "allow");
   const planner = { agent: "planner", model: "xai/grok-4.6:high" };
   assert.notEqual(apply(planner).action, "reject");
@@ -4345,7 +4345,7 @@ test("T2: pinWriterCaps is a ceiling — a smaller requested budget survives", (
   ).applySpawnPolicy;
   const open = {
     agent: "tdd-worker",
-    model: "openai-codex/gpt-5.6-luna:xhigh",
+    model: "xai/grok-4.6:medium",
     turnBudget: { maxTurns: 15, graceTurns: 5 },
   };
   apply(open);
@@ -4512,7 +4512,7 @@ test("T3: QA remediations are always critical tdd-worker, even if the finding sa
   const plan = readFileSync(planFile, "utf8");
   assert.match(plan, /### Task 2 — QA: Pearl live HashrateSampleRecorded still persists/);
   assert.match(plan, /- Complexity: critical/);
-  assert.match(plan, /- Worker: openai-codex\/gpt-5.6-luna, thinking xhigh/);
+  assert.match(plan, /- Worker: xai\/grok-4.6, thinking medium/);
   assert.equal(
     [...plan.matchAll(/- Complexity: simple/g)].length,
     1,
@@ -4693,7 +4693,7 @@ test("T7: mutation writers never get contact_supervisor or an intercom bridge", 
 
   const writer = {
     agent: "tdd-worker",
-    model: "openai-codex/gpt-5.6-luna:xhigh",
+    model: "xai/grok-4.6:medium",
     intercomBridge: { mode: "always" },
     tools: ["read", "contact_supervisor"],
   };
@@ -4745,7 +4745,7 @@ test("T9: workerLaunchParams is a host-gated implementer, not a findings report"
   ) as Record<string, unknown>;
   assert.equal(params.agent, "tdd-worker");
   assert.equal(params.context, "fresh");
-  assert.equal(params.model, "openai-codex/gpt-5.6-luna:xhigh", "simple Task is OpenAI Luna xhigh");
+  assert.equal(params.model, "xai/grok-4.6:medium", "simple Task is OpenAI Luna xhigh");
   assert.equal(params.output, undefined, "findings output injected Write your findings and Luna never edited");
   assert.deepEqual(params.agentContract, { version: 1 });
   assert.equal((params.intercomBridge as { mode: string }).mode, "off");
