@@ -5,7 +5,7 @@ import { validateImportedManifest, type ImportOptions } from "./plan-import.ts";
 export type LegacyRole = "worker" | "plan-reviewer" | "feature-qa";
 /** Only selectable legacy defaults; never imported by the plan-driven normalizer. */
 export function legacyProfileDefaults(role: LegacyRole): ExecutionProfile {
-	return { agent: role === "worker" ? "tdd-worker" : role, model: role === "worker" ? "openai-codex/gpt-5.6-luna" : "xai/grok-4.6", thinking: role === "worker" ? "xhigh" : "high", context: "fresh", supervisor: false, intercom: false, tools: ["read", "grep", "find", "ls", "bash", "edit", "write"], maxTurns: role === "worker" ? 220 : 60, timeoutMs: 90 * 60 * 1000 };
+	return { agent: role === "worker" ? "tdd-worker" : role, model: role === "worker" ? "xai/grok-4.6" : "xai/grok-4.6", thinking: role === "worker" ? "medium" : "high", context: "fresh", supervisor: false, intercom: false, tools: ["read", "grep", "find", "ls", "bash", "edit", "write"], maxTurns: role === "worker" ? 220 : 60, timeoutMs: 90 * 60 * 1000 };
 }
 /** Return launch overrides, not the agent's resolved settings. Undefined resolution means
  * the caller has not resolved the agent yet: withhold fallback fields in that case. */

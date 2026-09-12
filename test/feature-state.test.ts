@@ -631,3 +631,47 @@ test("chaos: no legal sequence reaches a phase unreachable from the entry", () =
     assert.ok(reachesDone, `"${start}" cannot reach done — a Feature there can never finish`);
   }
 });
+
+
+/* ================================================================== *
+ * 5. Planner-clobbered status.md (markdown list field block)
+ * ================================================================== */
+
+const listClobberedStatus = [
+  "# Status",
+  "",
+  "- repo: math-site",
+  "- name: grade-level-lesson-grouping",
+  "- branch: feat/grade-level-lesson-grouping",
+  "- worktree: /tmp/wt",
+  "- phase: planning",
+  "- phase_prev: none",
+  "",
+  "## Tasks",
+  "",
+  "| id | title | status | handoff |",
+].join("\n");
+
+test("planner list-item fields still parse phase and name", () => {
+  assert.equal(statusField(listClobberedStatus, "phase"), "planning");
+  assert.equal(statusField(listClobberedStatus, "name"), "grade-level-lesson-grouping");
+  assert.equal(readPhase(listClobberedStatus), "planning");
+});
+
+test("a list-clobbered Feature can enter blocked instead of being treated as new", () => {
+  const from = readPhase(listClobberedStatus);
+  assert.equal(from, "planning");
+  assert.equal(canTransition(from, "blocked"), true);
+  assert.equal(transitionRefusal(from, "blocked"), undefined);
+  assert.equal(
+    transitionRefusal(undefined, "blocked")?.includes("Cannot start a Feature"),
+    true,
+    "a truly missing phase is still a new Feature",
+  );
+});
+
+test("writeStatusFields updates a list-item phase line to a real field", () => {
+  const next = writeStatusFields(listClobberedStatus, [["phase", "blocked"]]);
+  assert.equal(readPhase(next), "blocked");
+  assert.equal(statusField(next, "name"), "grade-level-lesson-grouping");
+});
