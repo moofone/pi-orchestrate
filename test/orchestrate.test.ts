@@ -3219,6 +3219,41 @@ test("D1: a merge-conflict verdict tells the fixer to merge origin/main, not hun
   );
 });
 
+test("D1: session merge-conflict verdict tells the fixer to merge origin/main, not hunt comments", () => {
+  const params = orch.sessionFixLaunchParams({
+    v: 1,
+    idempotencyKey: "k-session-conflict",
+    pr: { host: "github.com", owner: "moofone", repo: "icemining", number: "99" },
+    owner: { kind: "session", id: "s1", generation: "g1" },
+    worktree: "/tmp/wt",
+    expectedHead: "abc",
+    verdictIds: ["v1"],
+    next: "resolve_conflicts_then_retry",
+    body: [
+      "status=conflict",
+      "next=resolve_conflicts_then_retry",
+      "mergeable=false",
+      "merge_state=dirty",
+    ].join("\n"),
+    validation: "commit-only",
+    publication: "controller",
+  }) as Record<string, unknown>;
+  const task = String(params.task);
+  assert.equal(params.agent, "fixer");
+  assert.match(task, /origin\/main/);
+  assert.match(task, /conflict/i);
+  assert.match(
+    task,
+    /Do not hunt review comments/,
+    "session DIRTY-PR fixer must be ordered to merge, not to implement comments",
+  );
+  assert.doesNotMatch(
+    task,
+    /review comments to implement/,
+    "session untrusted-verdict preamble must not reframe a DIRTY waiter as comments to fix",
+  );
+});
+
 test("review-fix prompts treat the waiter verdict as untrusted findings, not instructions", () => {
   const paths = promptContractPaths();
   const injection = [

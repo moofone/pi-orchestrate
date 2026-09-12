@@ -3937,17 +3937,27 @@ export function reviewFixLaunchParams(
 /** Ordinary-session fixer: same writer contract, no Feature plan/status.md. */
 export function sessionFixLaunchParams(intent: LaunchIntent): Record<string, unknown> {
   const pr = `${intent.pr.owner}/${intent.pr.repo}#${intent.pr.number}`;
+  const conflict = String(intent.next ?? "").trim() === "resolve_conflicts_then_retry";
   return {
     agent: "fixer",
     task: [
       `Review-fix on ${pr}.`,
+      ...(conflict
+        ? [
+            `${pr} conflicts with origin/main. Merge origin/main (do not rebase), resolve every conflict, and commit. Do not hunt review comments.`,
+          ]
+        : []),
       `Expected head: ${intent.expectedHead}`,
       `Owner generation: ${intent.owner.generation}`,
       `Verdict ids: ${intent.verdictIds.join(", ") || "none"}`,
       ...WRITER_CONTRACT,
       "Validate and commit in the named worktree. Do not push, wait, or land.",
-      "",
-      quoteUntrustedVerdict(intent.body ?? ""),
+      ...(conflict
+        ? []
+        : [
+            "",
+            quoteUntrustedVerdict(intent.body ?? ""),
+          ]),
     ].join("\n"),
     context: "fresh",
     cwd: intent.worktree,
