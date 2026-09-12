@@ -23,7 +23,7 @@ test("execution-presets: fallback precedence never overwrites explicit or agent 
 	const profile = legacyLaunchProfile("worker", { context: "fork", model: "explicit" }, { model: "agent", tools: ["read"], supervisor: true });
 	assert.equal(profile.model, "explicit"); assert.equal(profile.context, "fork");
 	assert.equal(profile.tools, undefined); assert.equal(profile.supervisor, undefined);
-	assert.equal(profile.thinking, "xhigh"); assert.equal(legacyProfileDefaults("feature-qa").model, "xai/grok-4.6");
+	assert.equal(profile.thinking, "medium"); assert.equal(legacyProfileDefaults("feature-qa").model, "xai/grok-4.6");
 });
 
 test("execution-presets: no legacy task cap and no shell conversion of Markdown gates", async () => {
