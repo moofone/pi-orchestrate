@@ -766,9 +766,9 @@ export function approveCommand(name: string): string {
 export function stripApproveFences(markdown: string): { markdown: string; names: string[] } {
   const names: string[] = [];
   let next = markdown.replace(
-    /[ \t]*```[a-zA-Z0-9_-]*[ \t]*\r?\n[ \t]*\/orchestrate[ \t]+approve[ \t]+([a-z0-9][a-z0-9-]{0,48})[ \t]*\r?\n[ \t]*```[ \t]*/gi,
-    (_m, name: string) => {
-      names.push(String(name));
+    /[ \t]*```[a-zA-Z0-9_-]*[ \t]*\r?\n[ \t]*\/orchestrate[ \t]+approve(?:[ \t]+([a-z0-9][a-z0-9-]{0,48}))?[ \t]*\r?\n[ \t]*```[ \t]*/gi,
+    (_m, name?: string) => {
+      if (name) names.push(String(name));
       return "";
     },
   );
@@ -1019,6 +1019,18 @@ export function markPlanApproved(plan: string): string {
     return plan.replace(/^(#\s+.+)$/m, `$1\n\n> Status: APPROVED`);
   }
   return `> Status: APPROVED\n${plan}`;
+}
+
+/** After plan-reviewer finishes: only then is the draft waiting on the human. */
+export function markPlanAwaitingApproval(plan: string): string {
+  if (isApproved(plan)) return plan;
+  if (/^>\s*Status:/m.test(plan)) {
+    return plan.replace(/^>\s*Status:.*$/m, "> Status: DRAFT — awaiting approval");
+  }
+  if (/^#\s+.+$/m.test(plan)) {
+    return plan.replace(/^(#\s+.+)$/m, `$1\n\n> Status: DRAFT — awaiting approval`);
+  }
+  return `> Status: DRAFT — awaiting approval\n${plan}`;
 }
 
 export type ApprovePreflight = { ok: true } | { ok: false; reason: string };
@@ -1852,7 +1864,7 @@ export function ensureFeatureNamed(
   const branch = `feat/${name}`;
   const next = applyFeatureIdentity(paths, plan, name, branch);
   upsertStatusFile(paths, {
-    nextAction: `wait for /orchestrate approve ${name}`,
+    nextAction: "wait for plan-reviewer; do not approve yet",
   });
   return { plan: next, name, branch, assigned: true };
 }
@@ -2408,7 +2420,7 @@ function seedFeature(paths: Paths, objective: string): void {
       [
         "# Feature: (planning)",
         "",
-        "> Status: DRAFT — awaiting approval",
+        "> Status: DRAFT",
         "> Name: pending",
         "> Branch: pending",
         `> Repo: ${paths.repo}`,
@@ -5871,6 +5883,46 @@ export function liveFeaturePlanReviewRunning(cwd: string, root?: string): boolea
   });
 }
 
+/** Draft Feature whose plan-reviewer has not finished — approve is not the next step. */
+export function liveFeatureNotReadyToApprove(cwd: string, root?: string): boolean {
+  if (!cwd) return false;
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir,
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(repoDir, "archive"),
+  };
+  const gitRoot = join(REF_ROOT, repo);
+  let readySibling = false;
+  let unready = false;
+  for (const row of discoverFeatures(paths)) {
+    if (!row.live) continue;
+    if (isApproved(row.plan)) continue;
+    const worktree = statusField(row.status, "worktree");
+    const here =
+      worktree && !isPendingToken(worktree)
+        ? samePath(cwd, worktree)
+        : samePath(cwd, gitRoot);
+    if (!here) continue;
+    if (planReviewState(row.status) === "done") {
+      readySibling = true;
+      continue;
+    }
+    unready = true;
+  }
+  // Planning Features share the git-root match. A later live draft still in
+  // planning must not hide approve for a sibling whose plan-reviewer is done.
+  if (readySibling) return false;
+  return unready;
+}
+
 export function liveFeatureTaskChain(cwd: string, root?: string): boolean {
   if (!cwd) return false;
   const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
@@ -5911,9 +5963,16 @@ export function parentGitWorkflowAppend(input: {
   featureLive?: boolean;
   latchWake?: boolean;
   planReviewRunning?: boolean;
+  notReadyToApprove?: boolean;
   taskChain?: boolean;
 }): string | undefined {
-  if (!input.featureLive && !input.latchWake && !input.planReviewRunning && !input.taskChain) {
+  if (
+    !input.featureLive &&
+    !input.latchWake &&
+    !input.planReviewRunning &&
+    !input.notReadyToApprove &&
+    !input.taskChain
+  ) {
     return undefined;
   }
   const parts: string[] = [];
@@ -5935,7 +5994,11 @@ export function parentGitWorkflowAppend(input: {
   }
   if (input.planReviewRunning) {
     parts.push(
-      "plan-reviewer is still running. Stay quiet. Do NOT summarize the plan as a Task table, todo list, or slice board. Do NOT suggest or run /orchestrate approve. One short line is enough: plan-reviewer is running; wait.",
+      "plan-reviewer is still running. Stay quiet. Do NOT summarize the plan as a Task table, todo list, or slice board. Do NOT suggest or run /orchestrate approve. Do NOT present Approve with: or an approve command. One short line is enough: plan-reviewer is running; wait.",
+    );
+  } else if (input.notReadyToApprove) {
+    parts.push(
+      "This Feature is not ready to approve. plan-reviewer has not finished. Do NOT suggest or run /orchestrate approve. Do NOT present Approve with: or an approve command. Do not tell the user to /orchestrate implement.",
     );
   }
   if (input.taskChain) {
@@ -6012,7 +6075,7 @@ Overwrite ${paths.planFile}:
 \`\`\`markdown
 # Feature: [short 3–6 word title]
 
-> Status: DRAFT — awaiting approval
+> Status: DRAFT
 > Name: pending
 > Branch: pending
 > Repo: ${paths.repo}
@@ -6063,8 +6126,9 @@ Overwrite ${paths.planFile}:
 Do **not** overwrite ${paths.statusFile}. The host owns \`phase\`, \`phase_prev\`, \`name\`, \`branch\`, and \`worktree\` as \`key: value\` lines (never markdown list items like \`- phase: planning\`). You may refresh the Tasks table under \`## Tasks\` only.
 
 TDD: every Task is preceded by a described failing test; prove correctness and rejection; cite spec anchors.
-Present ${paths.planFile}. Stop. Do not implement.
-The next human step is \`/orchestrate approve <kebab-of-# Feature: title>\` — always the specific name, never a bare \`/orchestrate approve\`.
+Present ${paths.planFile} as a path only. Stop. Do not implement.
+Do not mention \`/orchestrate approve\` or \`/orchestrate implement\`. Do not say the plan is ready for approval or awaiting approval.
+Code starts plan-reviewer after you stop; the human approves only after that child finishes.
 `;
 }
 
@@ -6156,6 +6220,10 @@ async function reviewPlan(
     reviewerRunDir: "none",
     nextAction: `wait for /orchestrate approve ${featureName}`,
   });
+  const reviewedPlan = readText(paths.planFile);
+  if (reviewedPlan.trim() && !isApproved(reviewedPlan)) {
+    writeText(paths.planFile, markPlanAwaitingApproval(reviewedPlan));
+  }
   return true;
 }
 
@@ -6194,6 +6262,10 @@ export function reconcilePlanReview(ctx: ExtensionCommandContext, paths: Paths):
       reviewerRunId: "none",
       reviewerRunDir: "none",
     });
+    const reviewedPlan = readText(paths.planFile);
+    if (reviewedPlan.trim() && !isApproved(reviewedPlan)) {
+      writeText(paths.planFile, markPlanAwaitingApproval(reviewedPlan));
+    }
     uiNotify(ctx, `plan-reviewer from an earlier session finished; plan review recorded done.`, "info");
     return true;
   }
@@ -6463,6 +6535,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       featureLive: liveFeatureNeedsIdleParent(cwd),
       latchWake: /pr-latch:|read_comments_and_fix/.test(prompt),
       planReviewRunning: liveFeaturePlanReviewRunning(cwd),
+      notReadyToApprove: liveFeatureNotReadyToApprove(cwd),
       taskChain: liveFeatureTaskChain(cwd),
     });
     if (!extra) return;
