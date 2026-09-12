@@ -123,11 +123,13 @@ export function classifyFeaturePrNext(
   if (verdict === "done") return "archive";
   if (verdict === "stop") return "confirm";
   if (MECHANICAL.has(verdict)) return "land";
-  if (verdict === "read_comments_and_fix") {
+  if (verdict === "read_comments_and_fix" || verdict === "resolve_conflicts_then_retry") {
     // One writer per Feature. A second fixer pushing onto the same branch is
     // how two children clobber each other's commits. This outranks the
     // termination rules below: a held Feature queues the verdict for retry,
     // and spending it on a disagreement would throw the round away.
+    // A DIRTY/CONFLICTING PR is the same writer job: merge origin/main.
+    // `notify` is how the parent sat forever (pi-orchestrate#15).
     if (state.chainLocked || state.workerLive) return "refuse";
     // The loop ends at merge or at disagreement, and nothing else (F6).
     if (state.findingsRepeated) return "disagree";

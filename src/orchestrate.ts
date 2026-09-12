@@ -3885,11 +3885,14 @@ export function reviewFixLaunchParams(
 ): Record<string, unknown> {
   const waiterRound =
     result.round && result.round !== "none" ? `, reviewer round ${result.round}` : "";
+  const conflict = String(result.next ?? "").trim() === "resolve_conflicts_then_retry";
   return {
     agent: "fixer",
     task: [
       `Review-fix round ${spawn} on PR ${pr}.`,
-      `Fix the review findings on PR ${pr} and nothing else.`,
+      conflict
+        ? `PR ${pr} conflicts with origin/main. Merge origin/main (do not rebase), resolve every conflict, and commit. Do not hunt review comments.`
+        : `Fix the review findings on PR ${pr} and nothing else.`,
       ...WRITER_CONTRACT,
       `The review is not yours to wait on: once you settle, code runs \`git pr-await ${pr}\` once (fixer round ${spawn} latch).`,
       `Feature plan: ${paths.planFile}`,
@@ -5784,7 +5787,7 @@ The PR lifecycle controller owns review fixes, publication, re-await, and landin
 Parent already ran \`git wt <branch>\` (or reused the farm). Do **not** \`git wt\` again. If \`${wt}\` is missing or is a reference checkout: **STOP**. Do not implement in ${paths.gitRoot}.
 tdd-worker and fixer must NOT \`git wt\`, must NOT open a PR, must NOT \`git pr-await\`.
 
-**After Tasks + QA cap:** code runs \`gh pr create\` (not a tdd-worker) and \`git pr-await\` once. A judgment \`next=\` on this Feature's PR (\`read_comments_and_fix\`, \`investigate_dead_reviewers\`, \`fix_command_or_environment\`) is then dispatched by this extension, not by you: a review fix spawns one \`fixer\` in the Feature worktree, and code runs \`git pr-await\` once after that writer settles. A later undelivered \`read_comments_and_fix\` spawns another fixer — code keeps doing that until the waiter lands or the user merges. Never stop while review data still says there are current-head findings to fix. The parent session stays idle — it does not repair review findings and does not run \`git pr-await\` itself. Never \`gh pr merge\`. Never \`git worktree add\`. Never pipe/timeout/--once on \`git pr-await\`.
+**After Tasks + QA cap:** code runs \`gh pr create\` (not a tdd-worker) and \`git pr-await\` once. A judgment \`next=\` on this Feature's PR (\`read_comments_and_fix\`, \`resolve_conflicts_then_retry\`, \`investigate_dead_reviewers\`, \`fix_command_or_environment\`) is then dispatched by this extension, not by you: a review fix spawns one \`fixer\` in the Feature worktree, and code runs \`git pr-await\` once after that writer settles. A later undelivered \`read_comments_and_fix\` spawns another fixer — code keeps doing that until the waiter lands or the user merges. Never stop while review data still says there are current-head findings to fix. The parent session stays idle — it does not repair review findings and does not run \`git pr-await\` itself. Never \`gh pr merge\`. Never \`git worktree add\`. Never pipe/timeout/--once on \`git pr-await\`.
 One Feature = one worktree = one branch = one PR. Never a draft. Never a PR per Task. If a Task is blocked, stop.
 `;
 }

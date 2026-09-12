@@ -18,6 +18,11 @@ import { classifyFeaturePrNext, fixerSettleAction } from "../src/lib/feature-pr.
 test("feature-pr: classifyFeaturePrNext routes judgments and rejects a second writer", () => {
   // Current-head findings are fixed by a writer, not by the parent session.
   assert.equal(classifyFeaturePrNext("read_comments_and_fix", { prRound: 0 }), "spawn_writer");
+  assert.equal(
+    classifyFeaturePrNext("resolve_conflicts_then_retry", { prRound: 0 }),
+    "spawn_writer",
+    "a merge conflict is a writer job (merge origin/main), not a notify-and-sit",
+  );
 
   // Quiet verdicts stay idle even when a chain lock is held: the model is
   // never supposed to see `next=yield`, so it must not become refuse or notify.

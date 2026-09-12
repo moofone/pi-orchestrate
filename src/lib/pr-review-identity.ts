@@ -195,7 +195,7 @@ export type VerdictKind = "fix" | "env" | "dead_reviewers" | "terminal" | "other
 
 export function classifyVerdictNext(next: string, body = ""): VerdictKind {
 	const n = String(next ?? "").trim().toLowerCase();
-	if (n === "read_comments_and_fix") return "fix";
+	if (n === "read_comments_and_fix" || n === "resolve_conflicts_then_retry") return "fix";
 	if (n === "investigate_dead_reviewers") return "dead_reviewers";
 	if (n === "done" || n === "stop" || n === "git_pr_land" || n === "git_pr_land_continue") {
 		return "terminal";
