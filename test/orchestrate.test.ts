@@ -1718,6 +1718,15 @@ test("L5: stripApproveFences leaves other fences and inline backticks alone", ()
   assert.match(out.markdown, /rtk cargo test/);
 });
 
+test("L5: stripApproveFences also drops a nameless /orchestrate approve fence", () => {
+  const src = ["Draft plan is ready.", "", "```text", "  /orchestrate approve", "```", ""].join("\n");
+  const out = orch.stripApproveFences(src);
+  assert.deepEqual(out.names, []);
+  assert.doesNotMatch(out.markdown, /```/);
+  assert.doesNotMatch(out.markdown, /\/orchestrate approve/);
+  assert.match(out.markdown, /Draft plan is ready/);
+});
+
 test("L5: draftApproveCards keeps named drafts and drops pending/approved/archived", () => {
   const draft = {
     archived: false,
@@ -1843,7 +1852,7 @@ test("L5: ensureFeatureNamed promotes pending-* to the title slug so approve has
   assert.equal(existsSync(dest), true, "pending-* must be renamed to the title slug");
   assert.match(
     readFileSync(join(dest, "status.md"), "utf8"),
-    /next_action: wait for \/orchestrate approve block-chance-honesty/,
+    /next_action: wait for plan-reviewer; do not approve yet/,
   );
 });
 
@@ -2675,6 +2684,20 @@ test("L4: parentGitWorkflowAppend injects role/state and keeps a Feature parent 
   );
   assert.match(wake, /next=yield/, "the wake says code injects the next turn");
   assert.match(wake, /controller owns review/);
+  const reviewing = orch.parentGitWorkflowAppend({ planReviewRunning: true }) as string;
+  assert.match(reviewing, /Do NOT suggest or run \/orchestrate approve/);
+  assert.match(reviewing, /plan-reviewer is still running/);
+  const beforeReview = orch.parentGitWorkflowAppend({ notReadyToApprove: true }) as string;
+  assert.match(beforeReview, /not ready to approve/);
+  assert.match(beforeReview, /Do NOT suggest or run \/orchestrate approve/);
+  assert.match(beforeReview, /Do not tell the user to \/orchestrate implement/);
+  assert.doesNotMatch(beforeReview, /plan-reviewer is still running/);
+  const both = orch.parentGitWorkflowAppend({
+    planReviewRunning: true,
+    notReadyToApprove: true,
+  }) as string;
+  assert.match(both, /plan-reviewer is still running/);
+  assert.doesNotMatch(both, /not ready to approve/);
 });
 
 test("L4: orchestrate.ts registers resources_discover with an empty skill catalog", () => {
@@ -2696,6 +2719,11 @@ test("P5 F17: resources_discover no longer publishes git-workflow", () => {
     src,
     /liveFeatureNeedsIdleParent\(cwd\)/,
     "the prompt append is gated on this session's own cwd, not on the repo",
+  );
+  assert.match(
+    src,
+    /notReadyToApprove: liveFeatureNotReadyToApprove\(cwd\)/,
+    "parent must be told not to advertise approve until plan-reviewer is done",
   );
 });
 
@@ -2800,6 +2828,49 @@ test("L5: an unrelated cwd is never silenced", () => {
       false,
     );
     assert.equal(orch.liveFeatureNeedsIdleParent("", root), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("L5: liveFeatureNotReadyToApprove is true until plan-reviewer is done", () => {
+  const REF = join(homedir(), "Dev", "git", "icemining");
+  const root = idleParentRoot([{ name: "feat-draft", phase: "planning", worktree: "none" }]);
+  try {
+    assert.equal(typeof orch.liveFeatureNotReadyToApprove, "function");
+    assert.equal(
+      orch.liveFeatureNotReadyToApprove(REF, root),
+      true,
+      "a draft with plan_review unset must not be advertised as approvable",
+    );
+    writeFileSync(
+      join(root, "icemining", "feat-draft", "status.md"),
+      [
+        "# Status",
+        "repo: icemining",
+        "name: feat-draft",
+        "phase: reviewing",
+        "plan_review: running",
+        "worktree: none",
+      ].join("\n") + "\n",
+    );
+    assert.equal(orch.liveFeatureNotReadyToApprove(REF, root), true);
+    writeFileSync(
+      join(root, "icemining", "feat-draft", "status.md"),
+      [
+        "# Status",
+        "repo: icemining",
+        "name: feat-draft",
+        "phase: reviewing",
+        "plan_review: done",
+        "worktree: none",
+      ].join("\n") + "\n",
+    );
+    assert.equal(
+      orch.liveFeatureNotReadyToApprove(REF, root),
+      false,
+      "once plan-reviewer is done, the approve card is the next step",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -4286,7 +4357,7 @@ test("T2: plannerLaunchParams is a planner child, not a parent prompt", () => {
   assert.equal((params.turnBudget as { maxTurns: number }).maxTurns, 80);
 });
 
-test("T2: planner always instructs the specific Feature name, never bare /orchestrate approve", () => {
+test("T2: planner does not tell anyone to /orchestrate approve — plan-reviewer runs first", () => {
   const params = (orch.plannerLaunchParams as Function)(
     promptContractPaths(),
     "bound objective",
@@ -4294,15 +4365,22 @@ test("T2: planner always instructs the specific Feature name, never bare /orches
   const task = String(params.task);
   assert.doesNotMatch(
     task,
-    /next_action: wait for \/orchestrate approve \(/,
-    "status seed must not teach a nameless approve command",
+    /The next human step is/,
+    "planner must not advertise approve as the next human step",
   );
-  assert.match(
+  assert.doesNotMatch(
     task,
-    /\/orchestrate approve <kebab-of-# Feature: title>/,
-    "planner must be told the named approve command shape",
+    /next_action: wait for named approve/,
+    "status seed must not teach approve before plan-reviewer",
   );
-  assert.match(task, /never a bare `\/orchestrate approve`/);
+  assert.doesNotMatch(
+    task,
+    /DRAFT — awaiting approval/,
+    "awaiting approval is written only after plan-reviewer finishes",
+  );
+  assert.match(task, /> Status: DRAFT\n/);
+  assert.match(task, /Do not mention `\/orchestrate approve`/);
+  assert.match(task, /plan-reviewer/);
 });
 
 test("T2: reviewLaunchParams is a plan-reviewer child", () => {
@@ -5992,6 +6070,15 @@ test("P3 F14: reviewPlan records the run it spawned", () => {
     /reviewerRunId: runId, reviewerRunDir: asyncRunDir\(runId\)/,
     "without the run id there is nothing for reconciliation to read",
   );
+  assert.match(
+    body,
+    /markPlanAwaitingApproval\(reviewedPlan\)/,
+    "awaiting approval is written only after plan-reviewer succeeds",
+  );
+  assert.ok(
+    body.indexOf('planReview: "done"') < body.indexOf("markPlanAwaitingApproval"),
+    "the Status header must not say awaiting approval while review is still in flight",
+  );
   const begin = src.slice(src.indexOf("async function beginImplementation("));
   assert.ok(
     begin.indexOf("reconcilePlanReview(ctx, paths)") <
@@ -6094,6 +6181,22 @@ test("P4 F16: approve refuses a repo with no origin, and says so in one line", (
     orch.approveRemoteRequirement({ hostBase: true, originUrl: "", repo: "pi-extensions" }),
     { ok: true },
     "a host base materializes its worktree by copy + git init and never opens a PR",
+  );
+});
+
+test("P4 F16: markPlanAwaitingApproval is a no-op on APPROVED and rewrites DRAFT", () => {
+  assert.equal(typeof orch.markPlanAwaitingApproval, "function");
+  assert.match(
+    orch.markPlanAwaitingApproval("# Feature: X\n\n> Status: DRAFT\n"),
+    /^> Status: DRAFT — awaiting approval$/m,
+  );
+  assert.match(
+    orch.markPlanAwaitingApproval("# Feature: X\n\n> Status: APPROVED\n"),
+    /^> Status: APPROVED$/m,
+  );
+  assert.doesNotMatch(
+    orch.markPlanAwaitingApproval("# Feature: X\n\n> Status: APPROVED\n"),
+    /awaiting approval/,
   );
 });
 
