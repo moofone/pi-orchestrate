@@ -12,6 +12,7 @@ export const ACTIONABLE = new Set([
 	"read_comments_and_fix",
 	"investigate_dead_reviewers",
 	"fix_command_or_environment",
+	"resolve_conflicts_then_retry",
 ]);
 
 /**

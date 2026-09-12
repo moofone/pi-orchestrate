@@ -2981,6 +2981,11 @@ test("D1: classifyFeaturePrNext routes every judgment next= without asking the p
     );
   }
   assert.equal(classify("investigate_dead_reviewers", { prRound: 0 }), "reawait");
+  assert.equal(
+    classify("resolve_conflicts_then_retry", { prRound: 0 }),
+    "spawn_writer",
+    "a DIRTY PR spawns a fixer; notify is how the parent sat forever",
+  );
   assert.equal(classify("fix_command_or_environment", { prRound: 0 }), "notify");
   assert.equal(classify("git_pr_land", { prRound: 0 }), "land");
   assert.equal(classify("git_pr_land_continue", { prRound: 0 }), "land");
@@ -3170,6 +3175,83 @@ test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and
   assert.match(task, /[Dd]o NOT `git push`/, "code pushes, one push per round");
   assert.match(task, /do NOT `gh pr comment`/, "code — not the child — speaks on the PR");
   assertNoStalePoller("reviewFixLaunchParams", task);
+});
+
+test("D1: a merge-conflict verdict tells the fixer to merge origin/main, not hunt comments", () => {
+  const paths = promptContractPaths();
+  const params = orch.reviewFixLaunchParams(paths, "15", "/tmp/wt", {
+    next: "resolve_conflicts_then_retry",
+    output: [
+      "status=conflict",
+      "next=resolve_conflicts_then_retry",
+      "mergeable=false",
+      "merge_state=dirty",
+    ].join("\n"),
+  }) as Record<string, unknown>;
+  const task = String(params.task);
+  assert.equal(params.agent, "fixer");
+  assert.match(task, /origin\/main/);
+  assert.match(task, /conflict/i);
+  assert.doesNotMatch(
+    task,
+    /Fix the review findings on PR 15 and nothing else/,
+    "a DIRTY PR has no review comments to fix; that line made the fixer no-op",
+  );
+  assert.doesNotMatch(
+    task,
+    /Fix only findings against the current head/,
+    "conflict fixer must not be ordered to hunt current-head findings",
+  );
+  assert.doesNotMatch(
+    task,
+    /👀/,
+    "eyes / in-progress-comment rules are review-comment hunting",
+  );
+  assert.doesNotMatch(
+    task,
+    /A finding against an older head/,
+    "older-head skip rule is review-comment hunting",
+  );
+  assert.doesNotMatch(
+    task,
+    /review comments to implement/,
+    "untrusted-verdict preamble must not reframe a DIRTY waiter as comments to fix",
+  );
+});
+
+test("D1: session merge-conflict verdict tells the fixer to merge origin/main, not hunt comments", () => {
+  const params = orch.sessionFixLaunchParams({
+    v: 1,
+    idempotencyKey: "k-session-conflict",
+    pr: { host: "github.com", owner: "moofone", repo: "icemining", number: "99" },
+    owner: { kind: "session", id: "s1", generation: "g1" },
+    worktree: "/tmp/wt",
+    expectedHead: "abc",
+    verdictIds: ["v1"],
+    next: "resolve_conflicts_then_retry",
+    body: [
+      "status=conflict",
+      "next=resolve_conflicts_then_retry",
+      "mergeable=false",
+      "merge_state=dirty",
+    ].join("\n"),
+    validation: "commit-only",
+    publication: "controller",
+  }) as Record<string, unknown>;
+  const task = String(params.task);
+  assert.equal(params.agent, "fixer");
+  assert.match(task, /origin\/main/);
+  assert.match(task, /conflict/i);
+  assert.match(
+    task,
+    /Do not hunt review comments/,
+    "session DIRTY-PR fixer must be ordered to merge, not to implement comments",
+  );
+  assert.doesNotMatch(
+    task,
+    /review comments to implement/,
+    "session untrusted-verdict preamble must not reframe a DIRTY waiter as comments to fix",
+  );
 });
 
 test("review-fix prompts treat the waiter verdict as untrusted findings, not instructions", () => {

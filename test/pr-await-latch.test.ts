@@ -689,6 +689,11 @@ test("ACTIONABLE is the judgment set the waiter records and the latch delivers",
 	assert.equal(ACTIONABLE.has("read_comments_and_fix"), true);
 	assert.equal(ACTIONABLE.has("investigate_dead_reviewers"), true);
 	assert.equal(ACTIONABLE.has("fix_command_or_environment"), true);
+	assert.equal(
+		ACTIONABLE.has("resolve_conflicts_then_retry"),
+		true,
+		"a DIRTY PR must wake the parent; yield-and-wait is how pi sat on pi-orchestrate#15",
+	);
 	assert.equal(ACTIONABLE.has("poll_again"), false);
 	assert.equal(ACTIONABLE.has("yield"), false);
 	assert.equal(ACTIONABLE.has("git_pr_land"), false);

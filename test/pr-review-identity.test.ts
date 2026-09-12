@@ -67,6 +67,11 @@ test("GitHub 500 is an env verdict, not a code fix", () => {
 	assert.equal(isGithubServerError("error=HTTP 500: oops"), true);
 	assert.equal(classifyVerdictNext("fix_command_or_environment", "HTTP 500"), "env");
 	assert.equal(classifyVerdictNext("read_comments_and_fix"), "fix");
+	assert.equal(
+		classifyVerdictNext("resolve_conflicts_then_retry"),
+		"fix",
+		"a merge conflict is a writer job, not env/other",
+	);
 });
 
 test("explicit fix next= is not env just because the review body mentions HTTP 500", () => {
