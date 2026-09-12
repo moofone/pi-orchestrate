@@ -46,7 +46,7 @@ export function featureTitle(plan: string, fallback: string): string {
 
 export function isApproved(plan: string): boolean {
   const s = planHeaderStatus(plan).toLowerCase();
-  return s.startsWith("approved") || s.includes("approved");
+  return s.startsWith("approved");
 }
 
 export function isDraft(plan: string): boolean {

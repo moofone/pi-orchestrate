@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseTasks, taskGateCommand } from "../src/lib/plan-tasks.ts";
+import { isApproved, parseTasks, taskGateCommand } from "../src/lib/plan-tasks.ts";
 
 test("plan-tasks: colon headings parse and a numbered list under ## Tasks is rejected", () => {
   const colonPlan = [
@@ -79,5 +79,28 @@ test("plan-tasks: taskGateCommand refuses prose including pending", () => {
     taskGateCommand("- Command: `a` and `b`"),
     "",
     "two fenced spans are prose, not one command",
+  );
+});
+
+test("plan-tasks: isApproved only matches Status that begins with approved", () => {
+  assert.equal(
+    isApproved("> Status: APPROVED"),
+    true,
+    "bare APPROVED is approved",
+  );
+  assert.equal(
+    isApproved("> Status: APPROVED — extra reviewer note"),
+    true,
+    "APPROVED with a suffix stays approved",
+  );
+  assert.equal(
+    isApproved("> Status: DRAFT — feature not approved"),
+    false,
+    "mid-line approved must not count as approved",
+  );
+  assert.equal(
+    isApproved("> Status: not approved"),
+    false,
+    "a Status that merely contains approved is not approved",
   );
 });
