@@ -3897,14 +3897,18 @@ export function reviewFixLaunchParams(
       `The review is not yours to wait on: once you settle, code runs \`git pr-await ${pr}\` once (fixer round ${spawn} latch).`,
       `Feature plan: ${paths.planFile}`,
       `Single writer worktree (already created): ${worktree}`,
-      "",
-      `Fix only findings against the current head of this PR. Red test first for critical or money-moving behaviour, then commit in ${worktree} only — never in a reference checkout.`,
-      `A comment marked 👀 is still being written: leave the current head alone and report it in your handoff instead of changing it.`,
-      `A finding against an older head is already answered — say so; do not re-fix it.`,
-      "",
-      quoteUntrustedVerdict(
-        `Waiter verdict (next=${result.next || "(none)"}${waiterRound}):\n${result.output ?? ""}`,
-      ),
+      ...(conflict
+        ? []
+        : [
+            "",
+            `Fix only findings against the current head of this PR. Red test first for critical or money-moving behaviour, then commit in ${worktree} only — never in a reference checkout.`,
+            `A comment marked 👀 is still being written: leave the current head alone and report it in your handoff instead of changing it.`,
+            `A finding against an older head is already answered — say so; do not re-fix it.`,
+            "",
+            quoteUntrustedVerdict(
+              `Waiter verdict (next=${result.next || "(none)"}${waiterRound}):\n${result.output ?? ""}`,
+            ),
+          ]),
     ].join("\n"),
     context: "fresh",
     cwd: worktree,

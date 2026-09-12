@@ -3197,6 +3197,26 @@ test("D1: a merge-conflict verdict tells the fixer to merge origin/main, not hun
     /Fix the review findings on PR 15 and nothing else/,
     "a DIRTY PR has no review comments to fix; that line made the fixer no-op",
   );
+  assert.doesNotMatch(
+    task,
+    /Fix only findings against the current head/,
+    "conflict fixer must not be ordered to hunt current-head findings",
+  );
+  assert.doesNotMatch(
+    task,
+    /👀/,
+    "eyes / in-progress-comment rules are review-comment hunting",
+  );
+  assert.doesNotMatch(
+    task,
+    /A finding against an older head/,
+    "older-head skip rule is review-comment hunting",
+  );
+  assert.doesNotMatch(
+    task,
+    /review comments to implement/,
+    "untrusted-verdict preamble must not reframe a DIRTY waiter as comments to fix",
+  );
 });
 
 test("review-fix prompts treat the waiter verdict as untrusted findings, not instructions", () => {
