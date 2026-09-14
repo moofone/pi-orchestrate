@@ -18,6 +18,7 @@
  * acceptance harness reported failed. Per-Feature override:
  * `auto_advance_on_landed` in status.md.
  * Approve is a TUI card (`orchestrate-approve` entry), not a markdown fence.
+ * Assistant ```json fences are unwrapped and pretty-printed; Pi draws fences as literal backticks.
  * Never .pi/plan.md / enter_plan_mode. Workers never open a PR; code runs `gh pr create`.
  */
 
@@ -775,6 +776,64 @@ export function stripApproveFences(markdown: string): { markdown: string; names:
   next = next.replace(/^[ \t]*Approve with:[ \t]*\n+/gim, "");
   next = next.replace(/\n{3,}/g, "\n\n");
   return { markdown: next, names };
+}
+
+/** Pi draws ```json fences as literal backticks. Unwrap and pretty-print JSON instead. */
+export function unwrapJsonFences(markdown: string): string {
+  const opening = /^[ \t]*```json[ \t]*\r?\n/gim;
+  const closing = /^[ \t]*```[ \t]*(?=\r?$)/gm;
+  let cursor = 0;
+  let next = "";
+
+  while (cursor < markdown.length) {
+    opening.lastIndex = cursor;
+    const opener = opening.exec(markdown);
+    if (!opener) {
+      next += markdown.slice(cursor);
+      break;
+    }
+
+    next += markdown.slice(cursor, opener.index);
+    const bodyStart = opening.lastIndex;
+    closing.lastIndex = bodyStart;
+    let firstFence: RegExpExecArray | undefined;
+    let parsed: unknown;
+    let parsedFence: RegExpExecArray | undefined;
+
+    let fence: RegExpExecArray | null;
+    while ((fence = closing.exec(markdown))) {
+      firstFence ??= fence;
+      const body = markdown.slice(bodyStart, fence.index).trim();
+      try {
+        parsed = JSON.parse(body);
+        parsedFence = fence;
+        break;
+      } catch {
+        // A triple backtick in a JSON string is not the closing fence.
+      }
+    }
+
+    if (parsedFence) {
+      next += JSON.stringify(parsed, null, 2);
+      cursor = parsedFence.index + parsedFence[0].length;
+    } else if (firstFence) {
+      // Preserve the previous invalid-JSON behavior: strip fence chrome, but
+      // do not interpret the body as JSON.
+      next += markdown.slice(bodyStart, firstFence.index).trim();
+      cursor = firstFence.index + firstFence[0].length;
+    } else {
+      // An unterminated opener was not a fence we can safely transform.
+      next += markdown.slice(opener.index);
+      break;
+    }
+  }
+
+  return next;
+}
+
+/** Assistant markdown as shown in `/o`: approve cards, not fence chrome. */
+export function formatAssistantMarkdown(markdown: string): string {
+  return unwrapJsonFences(stripApproveFences(markdown).markdown);
 }
 
 export function approveCardMarkerPath(dir: string): string {
@@ -6567,7 +6626,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   );
   pi.registerMarkdownTransformer((markdown, { messageType }) => {
     if (messageType !== "assistant") return markdown;
-    return stripApproveFences(markdown).markdown;
+    return formatAssistantMarkdown(markdown);
   });
   pi.on("agent_settled", async (_event, ctx) => {
     try {
