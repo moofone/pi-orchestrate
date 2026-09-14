@@ -192,6 +192,19 @@ test("shared-tree: wave F11 blocks dirt outside the wave scope", () => {
   assert.match(source.slice(start, end), /firstWaveTaskBlockedByDirtyTree/);
 });
 
+test("shared-tree: wave checks for unassigned dirt after all lanes settle", () => {
+  const source = readFileSync(ORCH_SRC, "utf8");
+  const start = source.indexOf("async function runTaskBatch");
+  const end = source.indexOf("\nasync function runChainTaskOnce", start);
+  const batch = source.slice(start, end);
+  const settled = batch.indexOf("const results = await Promise.all");
+  assert.ok(settled >= 0, "the wave must settle all lanes together");
+  const backstop = batch.slice(settled);
+  assert.match(backstop, /const afterWave = await porcelainStatus/);
+  assert.match(backstop, /unassigned paths remain dirty after the Task wave/);
+  assert.ok(backstop.indexOf("return results.every(Boolean)") > backstop.indexOf("const afterWave"));
+});
+
 test("shared-tree: selectTaskBatch takes disjoint scoped Tasks, skips the rest", () => {
   const plan = [
     "# Feature: t",

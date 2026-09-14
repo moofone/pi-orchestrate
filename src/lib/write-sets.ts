@@ -184,6 +184,11 @@ const WRITERS_LOCK = ".writers.lock";
 const WRITER_LOCK_STALE_MS = 30_000;
 const WRITER_LOCK_WAIT_MS = 10;
 const WRITER_LOCK_TIMEOUT_MS = 30_000;
+const HELD_WRITER_LOCKS = new Set<string>();
+
+function writerLockPath(dir: string): string {
+  return join(dir, WRITERS_LOCK);
+}
 
 function sidecarPath(dir: string): string {
   return join(dir, WRITERS_SIDECAR);
@@ -230,45 +235,77 @@ function staleWriterLock(lockPath: string): boolean {
   }
 }
 
+function tryAcquireWriterLock(lockPath: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(lockPath, "wx", 0o600);
+    writeFileSync(
+      fd,
+      `${JSON.stringify({ pid: process.pid, token: randomUUID() })}\n`,
+      "utf8",
+    );
+    closeSync(fd);
+    return true;
+  } catch (error) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* incomplete owner record */ }
+      rmSync(lockPath, { force: true });
+      throw error;
+    }
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (staleWriterLock(lockPath)) rmSync(lockPath, { force: true });
+    return false;
+  }
+}
+
 function acquireWriterLock(dir: string): string {
   mkdirSync(dir, { recursive: true });
-  const lockPath = join(dir, WRITERS_LOCK);
+  const lockPath = writerLockPath(dir);
   const deadline = Date.now() + WRITER_LOCK_TIMEOUT_MS;
   for (;;) {
-    let fd: number | undefined;
-    try {
-      fd = openSync(lockPath, "wx", 0o600);
-      writeFileSync(
-        fd,
-        `${JSON.stringify({ pid: process.pid, token: randomUUID() })}\n`,
-        "utf8",
-      );
-      closeSync(fd);
-      return lockPath;
-    } catch (error) {
-      if (fd !== undefined) {
-        try { closeSync(fd); } catch { /* incomplete owner record */ }
-        rmSync(lockPath, { force: true });
-        throw error;
-      }
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (staleWriterLock(lockPath)) {
-        rmSync(lockPath, { force: true });
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`timed out waiting for ${WRITERS_LOCK}`);
-      }
-      waitSync(WRITER_LOCK_WAIT_MS);
+    if (tryAcquireWriterLock(lockPath)) return lockPath;
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${WRITERS_LOCK}`);
     }
+    waitSync(WRITER_LOCK_WAIT_MS);
   }
 }
 
 function withWriterLock<T>(dir: string, action: () => T): T {
+  const requested = writerLockPath(dir);
+  if (HELD_WRITER_LOCKS.has(requested)) return action();
   const lockPath = acquireWriterLock(dir);
   try {
     return action();
   } finally {
+    rmSync(lockPath, { recursive: true, force: true });
+  }
+}
+
+/** Async counterpart: do not block this process while another writer holds it. */
+async function acquireWriterLockAsync(dir: string): Promise<string> {
+  mkdirSync(dir, { recursive: true });
+  const lockPath = writerLockPath(dir);
+  const deadline = Date.now() + WRITER_LOCK_TIMEOUT_MS;
+  for (;;) {
+    if (tryAcquireWriterLock(lockPath)) return lockPath;
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${WRITERS_LOCK}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, WRITER_LOCK_WAIT_MS));
+  }
+}
+
+/** Hold the same sidecar lock across an asynchronous writer operation. */
+export async function withWriterLockAsync<T>(dir: string, action: () => Promise<T>): Promise<T> {
+  const requested = writerLockPath(dir);
+  if (HELD_WRITER_LOCKS.has(requested)) return action();
+  const lockPath = await acquireWriterLockAsync(dir);
+  HELD_WRITER_LOCKS.add(lockPath);
+  try {
+    return await action();
+  } finally {
+    HELD_WRITER_LOCKS.delete(lockPath);
     rmSync(lockPath, { recursive: true, force: true });
   }
 }

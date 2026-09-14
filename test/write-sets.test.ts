@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -169,6 +169,36 @@ function sidecarChild(script: string, args: string[]): Promise<string> {
     });
   });
 }
+
+test("write-sets: async sidecar lock covers the whole held operation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "writers-async-lock-"));
+  const ready = join(dir, "ready");
+  const script = `
+    import { appendFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    import { withWriterLockAsync } from ${JSON.stringify(WRITE_SETS_URL)};
+    const [dir, id, delay, ready] = process.argv.slice(1);
+    await withWriterLockAsync(dir, async () => {
+      appendFileSync(join(dir, 'order'), id + ':enter\\n');
+      if (ready) appendFileSync(ready, 'ready');
+      await new Promise(resolve => setTimeout(resolve, Number(delay)));
+      appendFileSync(join(dir, 'order'), id + ':exit\\n');
+    });
+  `;
+  const first = sidecarChild(script, [dir, "first", "100", ready]);
+  for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(existsSync(ready), true, "the first process must hold the sidecar lock");
+  const second = sidecarChild(script, [dir, "second", "0", ""]);
+  await Promise.all([first, second]);
+  assert.deepEqual(readFileSync(join(dir, "order"), "utf8").trim().split("\n"), [
+    "first:enter",
+    "first:exit",
+    "second:enter",
+    "second:exit",
+  ]);
+});
 
 test("write-sets: keyed Task run sidecar preserves siblings and sweeps settled ids", () => {
   const dir = mkdtempSync(join(tmpdir(), "task-runs-"));

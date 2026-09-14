@@ -6035,7 +6035,7 @@ test("P3 F11: staged rename commits both source and destination", async () => {
   assert.equal(gate.state, "committed");
 });
 
-test("P3 F11: scoped rename stages only the side in the writer scope", async () => {
+test("P3 F11: scoped rename stages both endpoints when the source is in scope", async () => {
   let dirty = "R  src/a.ts -> src/b.ts";
   const calls: string[][] = [];
   const pi = makeFakePi(async (_cmd, args) => {
@@ -6058,7 +6058,7 @@ test("P3 F11: scoped rename stages only the side in the writer scope", async () 
   assert.equal(gate.state, "committed");
   const staged = calls.filter((args) => args[0] === "add" || args[0] === "commit").flat();
   assert.ok(staged.includes(":(literal)src/a.ts"));
-  assert.equal(staged.includes(":(literal)src/b.ts"), false, "sibling rename destination stays out");
+  assert.ok(staged.includes(":(literal)src/b.ts"), "a rename destination must stay with its source");
 });
 
 test("P3 F11: quoted porcelain paths are committed decoded, not still-escaped", async () => {

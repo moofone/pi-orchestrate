@@ -116,6 +116,7 @@ import {
   sweepTaskRuns,
   updateTaskRuns,
   upsertTaskRun,
+  withWriterLockAsync,
   WORKER_MAX_CONCURRENT,
   writeSetsOverlap,
   type TaskRunRecord,
@@ -3648,6 +3649,7 @@ export async function ensureWriterCommit(
   message: string,
   platform: NodeJS.Platform = process.platform,
   onlyPaths?: readonly string[],
+  writerLockDir?: string,
 ): Promise<{ state: CommitGateState; reason: string }> {
   // Scoped gate for shared-tree waves: commit ONLY the writer's assigned
   // paths. A tree-wide `git add -A` here would sweep a sibling writer's
@@ -3656,7 +3658,7 @@ export async function ensureWriterCommit(
   const normalizedScope = onlyPaths === undefined ? null : normalizeWriteSet(onlyPaths);
   // Empty/unknown scope is the legacy whole-tree gate, never a no-op.
   const scope = normalizedScope?.length ? normalizedScope : null;
-  return withWriterCommitLock(async () => {
+  const gate = async (): Promise<{ state: CommitGateState; reason: string }> => {
     const before = await porcelainStatus(pi, cwd);
     if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
     const inScope = (line: string): boolean => {
@@ -3672,8 +3674,7 @@ export async function ensureWriterCommit(
           .split("\n")
           .filter((line) => line.trim() && inScope(line))
           .flatMap((line) => porcelainEntryPaths(line))
-          .filter((path) => !isCommitGateIgnoredPath(path, platform))
-          .filter((path) => scope === null || writeSetsOverlap(scope, [path])),
+          .filter((path) => !isCommitGateIgnoredPath(path, platform)),
       ),
     ];
     if (paths.length === 0) return { state: "clean", reason: "" };
@@ -3707,7 +3708,10 @@ export async function ensureWriterCommit(
       }
     }
     return { state: "committed", reason: "" };
-  });
+  };
+  return withWriterCommitLock(() =>
+    writerLockDir ? withWriterLockAsync(writerLockDir, gate) : gate(),
+  );
 }
 
 /**
@@ -4674,37 +4678,46 @@ async function runFixLane(
   provisionalId: string | null,
 ): Promise<FixLaneResult> {
   let settledId: string | null = null;
-  const outcome = await runChildInPhase(
-    pi,
-    ctx,
-    "implement",
-    reviewFixLaunchParams(paths, pr, worktree, result, spawn, {
-      writeSet: lane.writeSet,
-      findingsText: lane.findingsText,
-      output: lane.handoff,
-    }),
-    (runId) => {
-      settledId = runId;
-      if (provisionalId) swapWriterSlot(paths, provisionalId, runId);
-      upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
-    },
-  );
-  // Keep the slot live through the scoped gate: another resume must not start
-  // overlapping work while this lane is still staging and committing.
+  let outcome: ChildOutcome;
   let gate: Awaited<ReturnType<typeof ensureWriterCommit>>;
   try {
+    outcome = await runChildInPhase(
+      pi,
+      ctx,
+      "implement",
+      reviewFixLaunchParams(paths, pr, worktree, result, spawn, {
+        writeSet: lane.writeSet,
+        findingsText: lane.findingsText,
+        output: lane.handoff,
+      }),
+      (runId) => {
+        settledId = runId;
+        if (provisionalId) swapWriterSlot(paths, provisionalId, runId);
+        upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
+      },
+    );
+    // Keep the slot live through the scoped gate: another resume must not start
+    // overlapping work while this lane is still staging and committing.
     gate = await ensureWriterCommit(
       pi,
       worktree,
       `fix: review round ${spawn} (${lane.key})`,
       process.platform,
       lane.writeSet.length > 0 ? lane.writeSet : undefined,
+      paths.handoffsDir,
     );
   } finally {
-    try {
-      releaseWriterSlot(paths.handoffsDir, settledId ?? provisionalId ?? "");
-    } catch {
-      /* bookkeeping */
+    const releaseIds = new Set(
+      [provisionalId, settledId].filter(
+        (runId): runId is string => Boolean(runId),
+      ),
+    );
+    for (const runId of releaseIds) {
+      try {
+        releaseWriterSlot(paths.handoffsDir, runId);
+      } catch {
+        /* bookkeeping */
+      }
     }
   }
   if (gate.state === "dirty") {
@@ -4924,6 +4937,7 @@ async function runReviewFixWriter(
     `fix: review round ${spawn}`,
     process.platform,
     roundPaths,
+    paths.handoffsDir,
   );
   const afterGate = await porcelainStatus(pi, worktree);
   if (afterGate === undefined) {
@@ -5695,6 +5709,31 @@ async function runTaskBatch(
         }),
       ),
     );
+    const wavePaths = normalizeWriteSet(admitted.flatMap((item) => item.writeSet));
+    const afterWave = await porcelainStatus(pi, worktree);
+    const outside = afterWave === undefined
+      ? []
+      : actionablePorcelain(afterWave, process.platform)
+        .split("\n")
+        .filter((line) => line.trim())
+        .filter((line) => porcelainEntryPaths(line).some(
+          (path) => !writeSetsOverlap(wavePaths, [path]),
+        ));
+    if (afterWave === undefined || outside.length > 0) {
+      const reason = afterWave === undefined
+        ? "could not verify paths outside the Task wave"
+        : "unassigned paths remain dirty after the Task wave";
+      const nextAction = `Task wave on ${name} blocked: ${reason}; /orchestrate resume.`;
+      upsertStatusFile(paths, {
+        phase: "blocked",
+        activeTask: "none",
+        worktree,
+        nextAction,
+        tasks: parseTasks(readText(paths.planFile)),
+      });
+      uiNotify(ctx, `${name}: ${nextAction}\nChain stopped, no PR opened.`, "error");
+      return false;
+    }
     return results.every(Boolean);
   } finally {
     // A guard or spawn failure can happen before a per-task settler exists.
@@ -5811,24 +5850,25 @@ async function runChainTaskOnce(
     workerRunDir: "none",
   });
   let settledId: string | null = null;
-  const outcome = await runChildInPhase(
-    pi,
-    ctx,
-    "implement",
-    workerLaunchParams(paths, task, worktree, readText(paths.planFile), {
-      writeSet: scope ?? [],
-    }),
-    (runId) => {
-      settledId = runId;
-      if (opts.batch?.provisionalId) swapWriterSlot(paths, opts.batch.provisionalId, runId);
-      updateSavedTaskRun(paths, task.id, {
-        runId,
-        runDir: asyncRunDir(runId),
-      });
-      upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
-    },
-  );
+  let outcome: ChildOutcome;
   try {
+    outcome = await runChildInPhase(
+      pi,
+      ctx,
+      "implement",
+      workerLaunchParams(paths, task, worktree, readText(paths.planFile), {
+        writeSet: scope ?? [],
+      }),
+      (runId) => {
+        settledId = runId;
+        if (opts.batch?.provisionalId) swapWriterSlot(paths, opts.batch.provisionalId, runId);
+        updateSavedTaskRun(paths, task.id, {
+          runId,
+          runDir: asyncRunDir(runId),
+        });
+        upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
+      },
+    );
     const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
   // A child this extension stopped (`/orchestrate pause now`) is not a
   // failed Task. Leaving it `blocked` would make `/orchestrate resume`
@@ -5863,6 +5903,7 @@ async function runChainTaskOnce(
     `Task ${task.id} — ${task.title}`,
     process.platform,
     scope?.length ? scope : undefined,
+    paths.handoffsDir,
   );
   // A scoped admitted-solo Task has no sibling to leave ownership of
   // out-of-scope edits. Waves intentionally keep the scoped-only gate, but a
