@@ -1552,7 +1552,8 @@ test("W2: applySpawnPolicy pins every parallel writer task", () => {
   for (const task of params.parallel) {
     assert.equal(task.model, "xai/grok-4.6:medium");
   }
-  assert.ok((params.concurrency as number) <= 2, "writer fanout must not keep concurrency 7");
+  assert.equal(orch.WRITER_MAX_CONCURRENCY, 4);
+  assert.equal(params.concurrency, orch.WRITER_MAX_CONCURRENCY, "writer fanout must not keep concurrency 7");
 });
 
 test("W2: subagentToolGuard blocks unknown cursor billing and mutates writer input", () => {
