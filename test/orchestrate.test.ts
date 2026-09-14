@@ -1744,6 +1744,16 @@ test("L5: unwrapJsonFences does not close on triple backticks inside a JSON stri
   assert.equal(parsed.async, true);
 });
 
+test("L5: unwrapJsonFences does not close on a language-tagged fence line", () => {
+  const src = [
+    "```json",
+    '{"async":true}',
+    "```bash",
+    "echo one",
+  ].join("\n");
+  assert.equal(orch.unwrapJsonFences(src), src);
+});
+
 test("L5: unwrapJsonFences preserves blank lines outside transformed JSON fences", () => {
   const gap = "\n\n\n\n";
   const fence = "```";
