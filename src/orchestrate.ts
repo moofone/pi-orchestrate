@@ -5547,6 +5547,8 @@ export interface ChainTaskBatch {
   provisionalId: string | null;
   /** True only for a genuine concurrent wave; admitted-solo keeps serial guards. */
   wave: boolean;
+  /** Wave settlement owns slot release, so collect the real child id here. */
+  onRunId?: (runId: string) => void;
 }
 
 /**
@@ -5671,6 +5673,9 @@ async function runTaskBatch(
   // is the authoritative admission at spawn time.
   liveWriterSlots(paths);
   const provisionals = new Map<string, string>();
+  // A wave owns both the provisional reservation and the real child slot until
+  // every lane has been recorded and the union dirt backstop has passed.
+  const waveSlotIds = new Set<string>();
   try {
     for (const item of batch) {
       const provisionalId = `task-${item.task.id}-pending`;
@@ -5692,7 +5697,10 @@ async function runTaskBatch(
       } catch {
         continue;
       }
-      if (claim.ok) provisionals.set(item.task.id, provisionalId);
+      if (claim.ok) {
+        provisionals.set(item.task.id, provisionalId);
+        waveSlotIds.add(provisionalId);
+      }
     }
     const admitted = batch.filter((item) => provisionals.has(item.task.id));
     if (admitted.length === 0) {
@@ -5722,7 +5730,13 @@ async function runTaskBatch(
             writeSet: item.writeSet,
             provisionalId: provisionals.get(item.task.id) ?? null,
             wave,
+            onRunId: wave ? (runId) => waveSlotIds.add(runId) : undefined,
           },
+        }).catch((error) => {
+          // Keep one lane's unexpected host-side error from skipping the
+          // shared settlement pass for its successful siblings.
+          uiNotify(ctx, `Task ${item.task.id} wave lane failed: ${String(error)}`, "error");
+          return String(error).length === 0;
         }),
       ),
     );
@@ -5736,29 +5750,59 @@ async function runTaskBatch(
         .filter((line) => porcelainEntryPaths(line).some(
           (path) => !writeSetsOverlap(wavePaths, [path]),
         ));
-    if (afterWave === undefined || outside.length > 0) {
+    const waveBlockedByBackstop = afterWave === undefined || outside.length > 0;
+    let blockedItem: TaskBatchItem | undefined;
+    if (waveBlockedByBackstop) {
+      // A union failure is a wave-level failure. Keep one still-held lane
+      // blocked so resume stops before QA; the other successful lanes may be
+      // recorded done below.
+      const currentTasks = parseTasks(readText(paths.planFile));
+      blockedItem = admitted.find((item) =>
+        currentTasks.some((current) => current.id === item.task.id && current.status === "in_progress"),
+      );
+    }
+    // Each successful lane is recorded before the shared slots are released.
+    // Failed lanes already recorded blocked/pending in runChainTaskOnce; the
+    // defensive in_progress branch prevents a stale lane from surviving a
+    // failure path that returned without its normal plan mutation.
+    await updatePlanFile(paths, (freshPlan) => {
+      const settled = blockedItem
+        ? setTaskHandoffInPlan(
+          setTaskStatusInPlan(freshPlan, blockedItem.task.id, "blocked"),
+          blockedItem.task.id,
+          join(paths.handoffsDir, `task-${blockedItem.task.id}.md`),
+        )
+        : freshPlan;
+      return admitted.reduce((nextPlan, item, index) => {
+        if (item.task.id === blockedItem?.task.id) return nextPlan;
+        if (results[index]) {
+          return setTaskHandoffInPlan(
+            setTaskStatusInPlan(nextPlan, item.task.id, "done"),
+            item.task.id,
+            join(paths.handoffsDir, `task-${item.task.id}.md`),
+          );
+        }
+        const current = parseTasks(nextPlan).find((task) => task.id === item.task.id);
+        return current?.status === "in_progress"
+          ? setTaskHandoffInPlan(
+            setTaskStatusInPlan(nextPlan, item.task.id, "blocked"),
+            item.task.id,
+            join(paths.handoffsDir, `task-${item.task.id}.md`),
+          )
+          : nextPlan;
+      }, settled);
+    });
+    if (wave) {
+      for (const item of admitted) releaseTaskRun(paths.handoffsDir, item.task.id);
+    }
+    if (waveBlockedByBackstop) {
       const reason = afterWave === undefined
         ? "could not verify paths outside the Task wave"
         : "unassigned paths remain dirty after the Task wave";
-      // Wave lanes deliberately remain in_progress until this point. Block
-      // one held lane on failure so the next resume hits the normal blocked
-      // guard before it can fall through to feature-qa.
-      const currentTasks = parseTasks(readText(paths.planFile));
-      const blockedItem = admitted.find((item) =>
-        currentTasks.some((current) => current.id === item.task.id && current.status === "in_progress"),
-      ) ?? admitted[0]!;
-      const handoff = join(paths.handoffsDir, `task-${blockedItem.task.id}.md`);
-      await updatePlanFile(paths, (freshPlan) =>
-        setTaskHandoffInPlan(
-          setTaskStatusInPlan(freshPlan, blockedItem.task.id, "blocked"),
-          blockedItem.task.id,
-          handoff,
-        ),
-      );
       const nextAction = `Task wave on ${name} blocked: ${reason}; /orchestrate resume.`;
       upsertStatusFile(paths, {
         phase: "blocked",
-        activeTask: blockedItem.task.id,
+        activeTask: blockedItem?.task.id ?? "none",
         worktree,
         nextAction,
         tasks: parseTasks(readText(paths.planFile)),
@@ -5767,16 +5811,6 @@ async function runTaskBatch(
       return false;
     }
     if (!results.every(Boolean)) return false;
-    await updatePlanFile(paths, (freshPlan) =>
-      admitted.reduce(
-        (nextPlan, item) => setTaskHandoffInPlan(
-          setTaskStatusInPlan(nextPlan, item.task.id, "done"),
-          item.task.id,
-          join(paths.handoffsDir, `task-${item.task.id}.md`),
-        ),
-        freshPlan,
-      ),
-    );
     upsertStatusFile(paths, {
       workerRunId: "none",
       workerRunDir: "none",
@@ -5787,11 +5821,12 @@ async function runTaskBatch(
     });
     return true;
   } finally {
-    // A guard or spawn failure can happen before a per-task settler exists.
-    // Release every provisional here, including any run whose swap no-op'd.
-    for (const provisionalId of provisionals.values()) {
+    // Keep every wave reservation through Promise.all, the union backstop, and
+    // the final plan update. A guard or spawn failure can still release all
+    // ids that were claimed, including a swap that no-op'd.
+    for (const runId of waveSlotIds) {
       try {
-        releaseWriterSlot(paths.handoffsDir, provisionalId);
+        releaseWriterSlot(paths.handoffsDir, runId);
       } catch {
         /* bookkeeping */
       }
@@ -5918,6 +5953,7 @@ async function runChainTaskOnce(
       (runId) => {
         settledId = runId;
         if (opts.batch?.provisionalId) swapWriterSlot(paths, opts.batch.provisionalId, runId);
+        opts.batch?.onRunId?.(runId);
         updateSavedTaskRun(paths, task.id, {
           runId,
           runDir: asyncRunDir(runId),
@@ -6150,8 +6186,11 @@ async function runChainTaskOnce(
   }
   return true;
   } finally {
-    releaseTaskRun(paths.handoffsDir, task.id);
-    if (opts.batch) {
+    // Wave recovery metadata stays durable until runTaskBatch records every
+    // lane; otherwise a concurrent resume could mistake an in_progress lane
+    // for an orphan while its sibling is still settling.
+    if (!wave) releaseTaskRun(paths.handoffsDir, task.id);
+    if (opts.batch && !wave) {
       const releaseIds = new Set(
         [opts.batch.provisionalId, settledId].filter(
           (runId): runId is string => Boolean(runId),
@@ -6379,6 +6418,25 @@ export async function reconcileOrphanTask(
     records = readTaskRuns(paths.handoffsDir);
   }
   if (inFlight.length === 0) return true;
+  // An in-progress Task with its own live writer slot belongs to an active
+  // chain, not an orphan. This is especially important while a wave holds
+  // sibling Tasks in_progress through its shared settlement tail. A terminal
+  // orphan may also retain a slot until recovery, but without its keyed run
+  // record it must keep the historical recovery path below.
+  const liveSlotIds = new Set(liveWriterSlots(paths).map((slot) => slot.runId));
+  const activeTaskSlot = inFlight.some((task) => {
+    const record = records.find((run) => run.taskId === task.id);
+    return liveSlotIds.has(`task-${task.id}-pending`) ||
+      liveSlotIds.has(`task-${task.id}-serial-pending`) ||
+      Boolean(record && !isPendingToken(record.runId) && liveSlotIds.has(record.runId));
+  });
+  if (activeTaskSlot) {
+    uiNotify(ctx,
+      `${name} still has live writer slots settling; no recovery or second worker started.`,
+      "info",
+    );
+    return false;
+  }
 
   // status.md remains a compatibility fallback for Features created before
   // task_runs.json. New wave Tasks always use their own keyed record below.
