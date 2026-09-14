@@ -209,12 +209,12 @@ function writeWriterSlots(dir: string, slots: WriterSlot[]): void {
  */
 export function sweepWriterSlots(
   dir: string,
-  isLive: (runDir: string, runId: string) => boolean,
+  isLive: (runDir: string, runId: string, slot?: WriterSlot) => boolean,
 ): { slots: WriterSlot[]; swept: boolean } {
   const recorded = readWriterSlots(dir);
   const live = recorded.filter((slot) => {
     try {
-      return isLive(slot.runDir, slot.runId);
+      return isLive(slot.runDir, slot.runId, slot);
     } catch {
       return false;
     }
@@ -226,7 +226,7 @@ export function sweepWriterSlots(
 export function claimWriterSlot(
   dir: string,
   slot: WriterSlot,
-  isLive: (runDir: string, runId: string) => boolean,
+  isLive: (runDir: string, runId: string, slot?: WriterSlot) => boolean,
   cap: number,
 ): { ok: true } | { ok: false; reason: AdmitRefusal; conflictsWith?: string } {
   const { slots } = sweepWriterSlots(dir, isLive);

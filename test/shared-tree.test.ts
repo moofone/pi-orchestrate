@@ -236,8 +236,9 @@ test("shared-tree: one verdict with two paths dispatches two fixers, one pr-awai
   assert.equal(seen.count, 2, "two disjoint finding-paths must dispatch two fixers");
   const sets = seen.spawns.map((params: Record<string, unknown>) => params.writeSet ?? []);
   assert.deepEqual(sets.sort(), [["src/fee.ts"], ["src/pay.ts"]]);
-  assert.ok(
-    execs.some((e) => e.startsWith("git pr-await")),
+  assert.equal(
+    execs.filter((e) => e.startsWith("git pr-await")).length,
+    1,
     "the round still ends with exactly one code-run pr-await",
   );
   assert.match(readFileSync(paths.statusFile, "utf8"), /^worker_run_id: none$/m);

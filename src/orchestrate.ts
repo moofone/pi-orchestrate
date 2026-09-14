@@ -3276,12 +3276,14 @@ async function worktreeFingerprint(
   onlyPaths?: readonly string[],
 ): Promise<string> {
   try {
-    const head = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: worktree, timeout: 15_000 });
+    const head = onlyPaths === undefined
+      ? await pi.exec("git", ["rev-parse", "HEAD"], { cwd: worktree, timeout: 15_000 })
+      : undefined;
     const status = await pi.exec("git", ["status", "--porcelain"], {
       cwd: worktree,
       timeout: 30_000,
     });
-    if (head.code !== 0 || status.code !== 0) return "";
+    if (status.code !== 0 || (head && head.code !== 0)) return "";
     let porcelain = actionablePorcelain(stripOuterNewlines(status.stdout));
     if (onlyPaths?.length) {
       const scope = normalizeWriteSet(onlyPaths);
@@ -3293,7 +3295,7 @@ async function worktreeFingerprint(
         })
         .join("\n");
     }
-    return `${head.stdout.trim()}\n${porcelain}`;
+    return onlyPaths === undefined ? `${head?.stdout.trim()}\n${porcelain}` : porcelain;
   } catch {
     return "";
   }
@@ -3315,6 +3317,39 @@ async function worktreeFingerprint(
 
 /** `clean` = nothing to do; `committed` = code closed the gate; `unknown` = git could not answer. */
 export type CommitGateState = "clean" | "committed" | "dirty" | "unknown";
+
+/** Shared worktrees have one git index; serialize every in-process gate. */
+let writerCommitTail: Promise<void> = Promise.resolve();
+
+function withWriterCommitLock<T>(work: () => Promise<T>): Promise<T> {
+  const run = writerCommitTail.then(work, work);
+  writerCommitTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+const INDEX_LOCK_RETRIES = 3;
+
+function reportsIndexLockContention(result: { stdout?: string; stderr?: string }): boolean {
+  return /index(?:\.lock| lock)|another git process/i.test(
+    `${String(result.stderr ?? "")}\n${String(result.stdout ?? "")}`,
+  );
+}
+
+/** Retry transient index.lock failures while the in-process gate owns the index. */
+async function execGitWithIndexLockRetry(
+  pi: ExtensionAPI,
+  args: string[],
+  cwd: string,
+): Promise<Awaited<ReturnType<ExtensionAPI["exec"]>>> {
+  for (let attempt = 0; ; attempt++) {
+    const result = await pi.exec("git", args, { cwd, timeout: 120_000 });
+    if (!reportsIndexLockContention(result) || attempt + 1 >= INDEX_LOCK_RETRIES) return result;
+    await sleep(50 * 2 ** attempt);
+  }
+}
 
 /** Drop surrounding newlines without eating porcelain's leading XY space. */
 function stripOuterNewlines(raw: string): string {
@@ -3541,55 +3576,59 @@ export async function ensureWriterCommit(
   // paths. A tree-wide `git add -A` here would sweep a sibling writer's
   // half-done files into this commit. Solo callers pass nothing and keep
   // the exact old behaviour.
-  const scope = onlyPaths?.length ? normalizeWriteSet(onlyPaths) : null;
-  const before = await porcelainStatus(pi, cwd);
-  if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
-  const inScope = (line: string): boolean => {
-    if (!scope) return true;
-    const touched = porcelainEntryPaths(line).filter(
-      (path) => !isCommitGateIgnoredPath(path, platform),
-    );
-    return touched.length > 0 && writeSetsOverlap(scope, touched);
-  };
-  const paths = [
-    ...new Set(
-      actionablePorcelain(before, platform)
+  const scope = onlyPaths === undefined ? null : normalizeWriteSet(onlyPaths);
+  return withWriterCommitLock(async () => {
+    const before = await porcelainStatus(pi, cwd);
+    if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
+    const inScope = (line: string): boolean => {
+      if (scope === null) return true;
+      if (scope.length === 0) return false;
+      const touched = porcelainEntryPaths(line).filter(
+        (path) => !isCommitGateIgnoredPath(path, platform),
+      );
+      return touched.length > 0 && writeSetsOverlap(scope, touched);
+    };
+    const paths = [
+      ...new Set(
+        actionablePorcelain(before, platform)
+          .split("\n")
+          .filter((line) => line.trim() && inScope(line))
+          .flatMap((line) => porcelainEntryPaths(line))
+          .filter((path) => !isCommitGateIgnoredPath(path, platform)),
+      ),
+    ];
+    if (paths.length === 0) return { state: "clean", reason: "" };
+    try {
+      const literalPaths = paths.map((path) => `:(literal)${path}`);
+      const addArgs = scope !== null
+        ? ["add", "--", ...literalPaths]
+        : ["add", "-A"];
+      const add = await execGitWithIndexLockRetry(pi, addArgs, cwd);
+      if (add.code !== 0) {
+        return { state: "dirty", reason: `git add failed: ${(add.stderr || "").trim()}` };
+      }
+      const commit = await execGitWithIndexLockRetry(
+        pi,
+        ["commit", "-m", message, "--", ...literalPaths],
+        cwd,
+      );
+      if (commit.code !== 0) {
+        return { state: "dirty", reason: `git commit failed: ${(commit.stderr || "").trim()}` };
+      }
+    } catch (error) {
+      return { state: "dirty", reason: `commit gate error: ${String(error)}` };
+    }
+    const after = await porcelainStatus(pi, cwd);
+    if (after) {
+      const remaining = actionablePorcelain(after, platform)
         .split("\n")
-        .filter((line) => line.trim() && inScope(line))
-        .flatMap((line) => porcelainEntryPaths(line))
-        .filter((path) => !isCommitGateIgnoredPath(path, platform)),
-    ),
-  ];
-  if (paths.length === 0) return { state: "clean", reason: "" };
-  try {
-    const literalPaths = paths.map((path) => `:(literal)${path}`);
-    const addArgs = scope
-      ? ["add", "--", ...literalPaths]
-      : ["add", "-A"];
-    const add = await pi.exec("git", addArgs, { cwd, timeout: 120_000 });
-    if (add.code !== 0) {
-      return { state: "dirty", reason: `git add failed: ${(add.stderr || "").trim()}` };
+        .filter((line) => line.trim() && inScope(line));
+      if (remaining.length > 0) {
+        return { state: "dirty", reason: "assigned paths still dirty after the commit" };
+      }
     }
-    const commit = await pi.exec("git", ["commit", "-m", message, "--", ...literalPaths], {
-      cwd,
-      timeout: 120_000,
-    });
-    if (commit.code !== 0) {
-      return { state: "dirty", reason: `git commit failed: ${(commit.stderr || "").trim()}` };
-    }
-  } catch (error) {
-    return { state: "dirty", reason: `commit gate error: ${String(error)}` };
-  }
-  const after = await porcelainStatus(pi, cwd);
-  if (after) {
-    const remaining = actionablePorcelain(after, platform)
-      .split("\n")
-      .filter((line) => line.trim() && inScope(line));
-    if (remaining.length > 0) {
-      return { state: "dirty", reason: "assigned paths still dirty after the commit" };
-    }
-  }
-  return { state: "committed", reason: "" };
+    return { state: "committed", reason: "" };
+  });
 }
 
 /**
@@ -4396,6 +4435,9 @@ export async function recordFeatureDisagreement(
   );
 }
 
+/** Fresh provisional claims remain live while the child run id is being assigned. */
+const PROVISIONAL_WRITER_SLOT_TTL_MS = 15 * 60_000;
+
 /** Live writer slots for this Feature, swept and persisted. See write-sets.ts. */
 function liveWriterSlots(paths: Paths): WriterSlot[] {
   const { slots, swept } = sweepWriterSlots(paths.handoffsDir, writerSlotIsLive);
@@ -4409,7 +4451,13 @@ function liveWriterSlots(paths: Paths): WriterSlot[] {
   return slots;
 }
 
-function writerSlotIsLive(runDir: string, runId: string): boolean {
+function writerSlotIsLive(runDir: string, runId: string, slot?: WriterSlot): boolean {
+  // A pre-claim has no snapshot yet. Keep it live for a bounded window so a
+  // replacement session cannot sweep it and admit an overlapping writer.
+  if (!runDir && runId.endsWith("-pending")) {
+    const age = Date.now() - (slot?.claimedAt ?? 0);
+    return Number.isFinite(age) && age >= 0 && age < PROVISIONAL_WRITER_SLOT_TTL_MS;
+  }
   const dir = runDir && !isPendingToken(runDir) ? runDir : asyncRunDir(runId);
   try {
     const snapshot = readRunSnapshot(dir);
@@ -4546,15 +4594,8 @@ async function runFixLane(
       upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
     },
   );
-  // The slot frees the moment the lane settles: the scoped gate below only
-  // ever touches this lane's paths, so siblings cannot be swept into it.
-  // The slot carries the real run id after the swap; before any spawn it is
-  // still the provisional one.
-  try {
-    releaseWriterSlot(paths.handoffsDir, settledId ?? provisionalId ?? "");
-  } catch {
-    /* bookkeeping */
-  }
+  // Keep the slot live through the scoped gate: another resume must not start
+  // overlapping work while this lane is still staging and committing.
   const gate = await ensureWriterCommit(
     pi,
     worktree,
@@ -4562,6 +4603,11 @@ async function runFixLane(
     process.platform,
     lane.writeSet.length > 0 ? lane.writeSet : undefined,
   );
+  try {
+    releaseWriterSlot(paths.handoffsDir, settledId ?? provisionalId ?? "");
+  } catch {
+    /* bookkeeping */
+  }
   if (gate.state === "dirty") {
     return {
       key: lane.key,
@@ -4590,12 +4636,39 @@ async function runFixLanes(
   lanes: FixLane[],
 ): Promise<FixLaneResult[]> {
   const results: FixLaneResult[] = [];
-  const runSoloLane = async (lane: FixLane): Promise<void> => {
-    results.push(await runFixLane(pi, ctx, paths, pr, worktree, result, spawn, lane, null));
+  const runSoloLane = async (lane: FixLane, index: number): Promise<void> => {
+    const live = liveWriterSlots(paths);
+    const decision = admitWriteSlot(live, lane, FIXER_MAX_CONCURRENT);
+    if (!decision.ok) {
+      results.push({
+        key: lane.key,
+        handoff: lane.handoff,
+        outcome: { ok: false, reason: `lane ${lane.key} was not admitted (${decision.reason})` },
+      });
+      return;
+    }
+    const provisionalId = `pr-${pr}-r${spawn}-solo${index}-pending`;
+    const claimed = [
+      ...live,
+      {
+        runId: provisionalId,
+        runDir: "",
+        agent: "fixer",
+        writeSet: lane.writeSet,
+        claimedAt: Date.now(),
+        label: lane.key,
+      },
+    ];
+    try {
+      persistWriterSlots(paths.handoffsDir, claimed);
+    } catch {
+      /* a missing sidecar only weakens the guard; the sets stay disjoint */
+    }
+    results.push(await runFixLane(pi, ctx, paths, pr, worktree, result, spawn, lane, provisionalId));
   };
   const soloFirst = lanes.filter((lane) => lane.writeSet.length === 0);
   const concurrent = lanes.filter((lane) => lane.writeSet.length > 0);
-  for (const lane of soloFirst) await runSoloLane(lane);
+  for (const [index, lane] of soloFirst.entries()) await runSoloLane(lane, index);
   // The single-record field clears after every wave, solo or shared: a
   // finished run must not keep worker_run_id set (D3).
   upsertStatusFile(paths, { workerRunId: "none", workerRunDir: "none" });
@@ -4636,7 +4709,7 @@ async function runFixLanes(
       admitted.map((lane) => runFixLane(pi, ctx, paths, pr, worktree, result, spawn, lane, provisionalOf(lane))),
     )),
   );
-  for (const lane of deferred) await runSoloLane(lane);
+  for (const [index, lane] of deferred.entries()) await runSoloLane(lane, concurrent.length + index);
   upsertStatusFile(paths, { workerRunId: "none", workerRunDir: "none" });
   return results;
 }
@@ -4710,7 +4783,30 @@ async function runReviewFixWriter(
   // invisible to `fixerPushState`, which would call the round a no-op and
   // post a disagreement over work that was actually done. Each lane gated
   // its own paths already; this is the backstop for what lanes left behind.
-  const gate = await ensureWriterCommit(pi, worktree, `fix: review round ${spawn}`);
+  // Keep it scoped to the round: unrelated dirt must remain dirty and fail,
+  // never get swept into a review-fix commit.
+  const roundPaths = normalizeWriteSet(lanes.flatMap((lane) => lane.writeSet));
+  let gate = await ensureWriterCommit(
+    pi,
+    worktree,
+    `fix: review round ${spawn}`,
+    process.platform,
+    roundPaths,
+  );
+  const afterGate = await porcelainStatus(pi, worktree);
+  if (afterGate === undefined) {
+    gate = { state: "dirty", reason: "could not verify paths outside the review lanes" };
+  } else {
+    const outside = actionablePorcelain(afterGate, process.platform)
+      .split("\n")
+      .filter((line) => line.trim())
+      .filter((line) => porcelainEntryPaths(line).some(
+        (path) => !writeSetsOverlap(roundPaths, [path]),
+      ));
+    if (outside.length > 0) {
+      gate = { state: "dirty", reason: "unassigned paths remain dirty after the review-fix gate" };
+    }
+  }
   if (gate.state === "dirty") {
     upsertStatusFile(paths, {
       phase: "pr",
@@ -5381,16 +5477,17 @@ async function runTaskBatch(
   } catch {
     /* a missing sidecar only weakens the guard; the sets stay disjoint */
   }
+  const admitted = batch.filter((item) => provisionals.has(item.task.id));
   upsertStatusFile(paths, {
     phase: "implementing",
-    activeTask: batch.map((item) => item.task.id).join("+"),
+    activeTask: admitted.map((item) => item.task.id).join("+"),
     worktree,
-    nextAction: `tdd-worker wave: ${batch.map((item) => `Task ${item.task.id} (${item.writeSet.join(", ")})`).join("; ")}`,
+    nextAction: `tdd-worker wave: ${admitted.map((item) => `Task ${item.task.id} (${item.writeSet.join(", ")})`).join("; ")}`,
   });
-  uiNotify(ctx, `Task wave on ${name}: ${batch.length} tdd-workers, disjoint paths.`, "info");
+  uiNotify(ctx, `Task wave on ${name}: ${admitted.length} tdd-workers, disjoint paths.`, "info");
   const results = await Promise.all(
-    batch.map((item) =>
-      runChainTaskOnce(pi, ctx, paths, name, worktree, item.task, plan, batch.map((entry) => entry.task), undefined, {
+    admitted.map((item) =>
+      runChainTaskOnce(pi, ctx, paths, name, worktree, item.task, plan, admitted.map((entry) => entry.task), undefined, {
         batch: { writeSet: item.writeSet, provisionalId: provisionals.get(item.task.id) ?? null },
       }),
     ),
@@ -5498,15 +5595,8 @@ async function runChainTaskOnce(
       upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
     },
   );
-  if (opts.batch) {
-    try {
-      releaseWriterSlot(paths.handoffsDir, settledId ?? opts.batch.provisionalId ?? "");
-    } catch {
-      /* bookkeeping */
-    }
-  }
-
-  const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
+  try {
+    const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
   // A child this extension stopped (`/orchestrate pause now`) is not a
   // failed Task. Leaving it `blocked` would make `/orchestrate resume`
   // hit the blocked guard above and refuse forever.
@@ -5692,6 +5782,15 @@ async function runChainTaskOnce(
     return false;
   }
   return true;
+  } finally {
+    if (opts.batch) {
+      try {
+        releaseWriterSlot(paths.handoffsDir, settledId ?? opts.batch.provisionalId ?? "");
+      } catch {
+        /* bookkeeping */
+      }
+    }
+  }
 }
 
 async function runFeatureChain(
