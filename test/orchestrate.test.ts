@@ -1546,14 +1546,19 @@ test("W2: applySpawnPolicy pins every parallel writer task", () => {
       { agent: "tdd-worker", model: "grok-4.6" },
       { agent: "tdd-worker", model: "cursor/composer-2.5-fast:high" },
     ],
-    concurrency: 7,
+    concurrency: 9,
   };
   apply(params);
   for (const task of params.parallel) {
     assert.equal(task.model, "xai/grok-4.6:medium");
   }
   assert.equal(orch.WRITER_MAX_CONCURRENCY, 4);
-  assert.equal(params.concurrency, orch.WRITER_MAX_CONCURRENCY, "writer fanout must not keep concurrency 7");
+  assert.equal(orch.WRITER_CONCURRENCY_CAP["tdd-worker"], 8);
+  assert.equal(orch.WRITER_CONCURRENCY_CAP["fixer"], 4);
+  assert.equal(params.concurrency, 8, "tdd-worker fanout must clamp to its cap of 8, not keep 9");
+  const fixer = { agent: "fixer", model: "xai/grok-4.6:high", concurrency: 7 };
+  apply(fixer);
+  assert.equal(fixer.concurrency, 4, "fixer fanout must clamp to its cap of 4, not keep 7");
 });
 
 test("W2: subagentToolGuard blocks unknown cursor billing and mutates writer input", () => {
@@ -5479,9 +5484,11 @@ test("P2 F5: runReviewFixWriter decides from the branch and pushes what the fixe
   assert.match(body, /branchHeads\(/, "the round must record the branch heads itself");
   assert.match(body, /fixerPushState\(/, "the settle input must come from the branch");
   assert.match(body, /push_then_await/, "code owes the push when the fixer only committed");
+  // Lanes spawn inside runFixLanes (helpers above); what matters is the
+  // round reads its before-head before any lane runs.
   assert.ok(
-    body.indexOf("branchHeads(") < body.indexOf("runChildInPhase"),
-    "the before-head must be read before the fixer runs, not after",
+    body.indexOf("branchHeads(") < body.indexOf("runFixLanes("),
+    "the before-head must be read before the fixer lanes run, not after",
   );
 });
 

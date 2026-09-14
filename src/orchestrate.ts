@@ -100,6 +100,20 @@ import {
   fixerSettleAction,
   type FeaturePrAction,
 } from "./lib/feature-pr.ts";
+import {
+  admitWriteSlot,
+  FIXER_MAX_CONCURRENT,
+  parseFilesScalar,
+  groupFindingsByPath,
+  normalizeWriteSet,
+  packPathGroups,
+  persistWriterSlots,
+  releaseWriterSlot,
+  sweepWriterSlots,
+  WORKER_MAX_CONCURRENT,
+  writeSetsOverlap,
+  type WriterSlot,
+} from "./lib/write-sets.ts";
 import { registerReviewLaunch, requestExecutionController, type LaunchIntent, type LaunchResult } from "./lib/pr-review-events.ts";
 import {
   featureTitle,
@@ -2541,8 +2555,20 @@ const CHILD_WATCHDOG_GRACE_MS = 5 * 60 * 1000;
 const WRITER_TURN_BUDGET = { maxTurns: 220, graceTurns: 30 };
 export const QA_TURN_BUDGET = { maxTurns: 60, graceTurns: 10 };
 const PLANNER_TURN_BUDGET = { maxTurns: 80, graceTurns: 15 };
-/** Max parallel tdd-worker / fixer fanout. Feature Tasks stay sequential on one worktree; this only clamps subagent `concurrency`. */
+/** Default max parallel writer fanout (QA writers). Fixers and tdd-workers share one worktree with disjoint write-sets at higher caps. */
 export const WRITER_MAX_CONCURRENCY = 4;
+/**
+ * Per-agent same-tree concurrency caps. Same worktree, disjoint write-sets:
+ * up to 4 concurrent fixers, up to 8 concurrent tdd-workers. Anything else
+ * keeps the default cap above.
+ */
+export const WRITER_CONCURRENCY_CAP: Record<string, number> = {
+  fixer: FIXER_MAX_CONCURRENT,
+  "tdd-worker": WORKER_MAX_CONCURRENT,
+};
+export function writerConcurrencyCap(agent: string): number {
+  return WRITER_CONCURRENCY_CAP[agent] ?? WRITER_MAX_CONCURRENCY;
+}
 const PLANNER_MODEL = "xai/grok-4.6:high";
 export const MAX_QA_FINDINGS = 8;
 
@@ -2678,10 +2704,11 @@ function applyOneSpawn(params: Record<string, unknown>): {
       }
     }
     pinWriterCaps(params);
-    if (typeof params.concurrency === "number" && params.concurrency > WRITER_MAX_CONCURRENCY) {
-      params.concurrency = WRITER_MAX_CONCURRENCY;
+    const cap = writerConcurrencyCap(agent);
+    if (typeof params.concurrency === "number" && params.concurrency > cap) {
+      params.concurrency = cap;
       action = "pin";
-      reason ??= `clamped ${agent} concurrency to ${WRITER_MAX_CONCURRENCY}`;
+      reason ??= `clamped ${agent} concurrency to ${cap}`;
     }
     return { action, reason };
   }
@@ -3243,7 +3270,11 @@ function gateAcceptance(command: string): Record<string, unknown> {
  * Returns "" when git cannot answer. An unreadable fingerprint is
  * inconclusive and must never block a Task on its own.
  */
-async function worktreeFingerprint(pi: ExtensionAPI, worktree: string): Promise<string> {
+async function worktreeFingerprint(
+  pi: ExtensionAPI,
+  worktree: string,
+  onlyPaths?: readonly string[],
+): Promise<string> {
   try {
     const head = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: worktree, timeout: 15_000 });
     const status = await pi.exec("git", ["status", "--porcelain"], {
@@ -3251,7 +3282,18 @@ async function worktreeFingerprint(pi: ExtensionAPI, worktree: string): Promise<
       timeout: 30_000,
     });
     if (head.code !== 0 || status.code !== 0) return "";
-    return `${head.stdout.trim()}\n${actionablePorcelain(stripOuterNewlines(status.stdout))}`;
+    let porcelain = actionablePorcelain(stripOuterNewlines(status.stdout));
+    if (onlyPaths?.length) {
+      const scope = normalizeWriteSet(onlyPaths);
+      porcelain = porcelain
+        .split("\n")
+        .filter((line) => {
+          if (!line.trim()) return false;
+          return writeSetsOverlap(scope, porcelainEntryPaths(line));
+        })
+        .join("\n");
+    }
+    return `${head.stdout.trim()}\n${porcelain}`;
   } catch {
     return "";
   }
@@ -3493,25 +3535,41 @@ export async function ensureWriterCommit(
   cwd: string,
   message: string,
   platform: NodeJS.Platform = process.platform,
+  onlyPaths?: readonly string[],
 ): Promise<{ state: CommitGateState; reason: string }> {
+  // Scoped gate for shared-tree waves: commit ONLY the writer's assigned
+  // paths. A tree-wide `git add -A` here would sweep a sibling writer's
+  // half-done files into this commit. Solo callers pass nothing and keep
+  // the exact old behaviour.
+  const scope = onlyPaths?.length ? normalizeWriteSet(onlyPaths) : null;
   const before = await porcelainStatus(pi, cwd);
   if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
+  const inScope = (line: string): boolean => {
+    if (!scope) return true;
+    const touched = porcelainEntryPaths(line).filter(
+      (path) => !isCommitGateIgnoredPath(path, platform),
+    );
+    return touched.length > 0 && writeSetsOverlap(scope, touched);
+  };
   const paths = [
     ...new Set(
       actionablePorcelain(before, platform)
         .split("\n")
-        .filter((line) => line.trim())
+        .filter((line) => line.trim() && inScope(line))
         .flatMap((line) => porcelainEntryPaths(line))
         .filter((path) => !isCommitGateIgnoredPath(path, platform)),
     ),
   ];
   if (paths.length === 0) return { state: "clean", reason: "" };
   try {
-    const add = await pi.exec("git", ["add", "-A"], { cwd, timeout: 120_000 });
-    if (add.code !== 0) {
-      return { state: "dirty", reason: `git add -A failed: ${(add.stderr || "").trim()}` };
-    }
     const literalPaths = paths.map((path) => `:(literal)${path}`);
+    const addArgs = scope
+      ? ["add", "--", ...literalPaths]
+      : ["add", "-A"];
+    const add = await pi.exec("git", addArgs, { cwd, timeout: 120_000 });
+    if (add.code !== 0) {
+      return { state: "dirty", reason: `git add failed: ${(add.stderr || "").trim()}` };
+    }
     const commit = await pi.exec("git", ["commit", "-m", message, "--", ...literalPaths], {
       cwd,
       timeout: 120_000,
@@ -3523,8 +3581,13 @@ export async function ensureWriterCommit(
     return { state: "dirty", reason: `commit gate error: ${String(error)}` };
   }
   const after = await porcelainStatus(pi, cwd);
-  if (after && actionablePorcelain(after, platform)) {
-    return { state: "dirty", reason: "worktree still dirty after the commit" };
+  if (after) {
+    const remaining = actionablePorcelain(after, platform)
+      .split("\n")
+      .filter((line) => line.trim() && inScope(line));
+    if (remaining.length > 0) {
+      return { state: "dirty", reason: "assigned paths still dirty after the commit" };
+    }
   }
   return { state: "committed", reason: "" };
 }
@@ -3542,6 +3605,7 @@ const WRITER_CONTRACT = [
   "You write code and commit it. Nothing else on this Feature is yours.",
   "Work only in the worktree named below, never in a reference checkout.",
   "Commit what you finish. Do NOT `git push` — code pushes once per round.",
+  "Commit ONLY your assigned paths (`git add -- <paths>`), never `git add -A`: siblings share this tree and a sweep would commit their half-done work.",
   "Do NOT open a PR, do NOT `gh pr comment`, do NOT `gh pr merge`, do NOT `git wt`, do NOT `git pr-await`, do NOT `git pr-land`.",
   "Anything you cannot do goes in your handoff. Then settle; code takes it from there.",
 ];
@@ -3551,16 +3615,24 @@ export function workerLaunchParams(
   task: Task,
   worktree: string,
   plan: string,
+  opts: { writeSet?: readonly string[] } = {},
 ): Record<string, unknown> {
   const worker = workerFor(task.complexity) ?? WORKERS.simple;
   const body = taskSection(plan, task.id);
   const gate = taskGateCommand(body);
   const cwd = taskWorkerCwd(body, worktree, plan, planHeaderField(plan, "Branch"));
+  const writeSet = normalizeWriteSet(opts.writeSet ?? []);
   const params: Record<string, unknown> = {
     agent: "tdd-worker",
     task: [
       `Implement exactly this Task and nothing else.`,
       ...WRITER_CONTRACT,
+      ...(writeSet.length > 0
+        ? [
+            `Assigned paths (yours alone — sibling writers own the rest of this tree): ${writeSet.join(", ")}.`,
+            `Touch nothing outside them.`,
+          ]
+        : []),
       `Do NOT start the next Task.`,
       `Feature plan (this Task's section only): ${paths.planFile}`,
       `Writer cwd: ${cwd}`,
@@ -3577,6 +3649,9 @@ export function workerLaunchParams(
     // v1: do not inject "write an acceptance-report JSON". That made Luna
     // reread the Task's Read list forever (0 edits, thousands of reads).
     agentContract: { version: 1 },
+    // Declared write-set for shared-tree admission. Siblings' sets are
+    // disjoint by construction; the slot registry refuses overlaps.
+    ...(writeSet.length > 0 ? { writeSet } : {}),
   };
   params.acceptance = gate
     ? gateAcceptance(gate)
@@ -3954,10 +4029,12 @@ export function reviewFixLaunchParams(
   worktree: string,
   result: { next: string; output: string; round?: string },
   spawn = 1,
+  opts: { writeSet?: readonly string[]; findingsText?: string; output?: string } = {},
 ): Record<string, unknown> {
   const waiterRound =
     result.round && result.round !== "none" ? `, reviewer round ${result.round}` : "";
   const conflict = String(result.next ?? "").trim() === "resolve_conflicts_then_retry";
+  const writeSet = normalizeWriteSet(opts.writeSet ?? []);
   return {
     agent: "fixer",
     task: [
@@ -3966,6 +4043,12 @@ export function reviewFixLaunchParams(
         ? `PR ${pr} conflicts with origin/main. Merge origin/main (do not rebase), resolve every conflict, and commit. Do not hunt review comments.`
         : `Fix the review findings on PR ${pr} and nothing else.`,
       ...WRITER_CONTRACT,
+      ...(writeSet.length > 0
+        ? [
+            `Assigned paths (yours alone — sibling fixers own the rest of this tree): ${writeSet.join(", ")}.`,
+            `Touch nothing outside them.`,
+          ]
+        : []),
       `The review is not yours to wait on: once you settle, code runs \`git pr-await ${pr}\` once (fixer round ${spawn} latch).`,
       `Feature plan: ${paths.planFile}`,
       `Single writer worktree (already created): ${worktree}`,
@@ -3978,7 +4061,7 @@ export function reviewFixLaunchParams(
             `A finding against an older head is already answered — say so; do not re-fix it.`,
             "",
             quoteUntrustedVerdict(
-              `Waiter verdict (next=${result.next || "(none)"}${waiterRound}):\n${result.output ?? ""}`,
+              `Waiter verdict (next=${result.next || "(none)"}${waiterRound}):\n${opts.findingsText ?? result.output ?? ""}`,
             ),
           ]),
     ].join("\n"),
@@ -3987,8 +4070,10 @@ export function reviewFixLaunchParams(
     // A review fix touches already-reviewed code on an open PR; that is the
     // critical writer's job, not the cheap one's.
     model: modelWithThinking(WORKERS.critical),
-    output: join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`),
+    output: opts.output ?? join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`),
     outputMode: "inline",
+    // Declared write-set for shared-tree admission (see write-sets.ts).
+    ...(writeSet.length > 0 ? { writeSet } : {}),
     timeoutMs: CHILD_TIMEOUT_MS,
     turnBudget: WRITER_TURN_BUDGET,
     intercomBridge: { ...WRITER_INTERCOM_OFF },
@@ -4115,7 +4200,7 @@ function featurePrVerdictNotice(
 ): string {
   const head = `PR ${pr} — pr-await next=${verdict || "(none)"}`;
   if (action === "refuse") {
-    return `${head}: a writer already holds this Feature. No second fixer was started.`;
+    return `${head}: writers already hold this Feature (slots full or paths overlap). No new fixer was started.`;
   }
   if (action === "reawait") {
     return `${head}: no code finding to fix — code runs git pr-await once more (fixer round ${spent}).`;
@@ -4311,10 +4396,263 @@ export async function recordFeatureDisagreement(
   );
 }
 
+/** Live writer slots for this Feature, swept and persisted. See write-sets.ts. */
+function liveWriterSlots(paths: Paths): WriterSlot[] {
+  const { slots, swept } = sweepWriterSlots(paths.handoffsDir, writerSlotIsLive);
+  if (swept) {
+    try {
+      persistWriterSlots(paths.handoffsDir, slots);
+    } catch {
+      /* bookkeeping must never take down the dispatcher */
+    }
+  }
+  return slots;
+}
+
+function writerSlotIsLive(runDir: string, runId: string): boolean {
+  const dir = runDir && !isPendingToken(runDir) ? runDir : asyncRunDir(runId);
+  try {
+    const snapshot = readRunSnapshot(dir);
+    return Boolean(snapshot && !snapshot.terminal);
+  } catch {
+    return false;
+  }
+}
+
+/** Swap a pre-claimed provisional slot for the real run id (construction already admitted it). */
+function swapWriterSlot(paths: Paths, provisionalId: string, runId: string): void {
+  const dir = paths.handoffsDir;
+  const { slots } = sweepWriterSlots(dir, writerSlotIsLive);
+  const kept = slots.filter((slot) => slot.runId !== provisionalId);
+  const provisional = slots.find((slot) => slot.runId === provisionalId);
+  const entry: WriterSlot = {
+    runId,
+    runDir: asyncRunDir(runId),
+    agent: provisional?.agent ?? "fixer",
+    writeSet: provisional?.writeSet ?? [],
+    claimedAt: Date.now(),
+    ...(provisional?.label ? { label: provisional.label } : {}),
+  };
+  try {
+    persistWriterSlots(dir, [...kept, entry]);
+  } catch {
+    /* the run is already going; a missing slot only weakens the guard */
+  }
+}
+
+/** Any writer this Feature still owns, single-record or slotted. */
+function featureWritersLive(paths: Paths, status: string): boolean {
+  if (featureWorkerLive(status)) return true;
+  return liveWriterSlots(paths).length > 0;
+}
+
+export interface FixLane {
+  key: string;
+  /** Disjoint repo paths this lane may write. [] = unscoped = runs solo. */
+  writeSet: string[];
+  /** The verdict subset this lane fixes (full verdict when solo). */
+  findingsText: string;
+  handoff: string;
+}
+
 /**
- * One review-fix round: a `fixer` in the Feature worktree, then a single
- * `git pr-await` run by code. A judgment `next=` from that await is dispatched
- * again — that is how a later review round still gets a fixer.
+ * Split a verdict into disjoint fixer lanes. Path-bearing findings group by
+ * exact `path=` and bin-pack into at most 4 bundles (merging is safe;
+ * splitting is what must stay disjoint). Pathless findings become one
+ * unscoped lane that the runner puts solo first. Conflicts and finding-free
+ * verdicts are a single solo lane carrying the whole verdict.
+ */
+export function planFixLanes(
+  paths: Paths,
+  pr: string,
+  spawn: number,
+  verdictOutput: string,
+  conflict: boolean,
+): FixLane[] {
+  const solo = (findingsText: string): FixLane[] => [
+    {
+      key: "solo",
+      writeSet: [],
+      findingsText,
+      handoff: join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`),
+    },
+  ];
+  if (conflict) return solo(verdictOutput);
+  // Group the raw lines, not the parsed set: parsing extracts `path=` away,
+  // and pathless lines keep their full detail for the lane that fixes them.
+  const rawLines = String(verdictOutput ?? "")
+    .split("\n")
+    .filter((line) => /^\s*brief_finding\s/.test(line));
+  const groups = groupFindingsByPath(rawLines.length > 0 ? rawLines : parseBriefFindings(verdictOutput));
+  const scoped = groups.filter((group) => group.path);
+  const unscoped = groups.filter((group) => !group.path);
+  if (scoped.length === 0) return solo(verdictOutput);
+  const byPath = new Map(scoped.map((group) => [group.path, group.findings]));
+  const lanes: FixLane[] = packPathGroups(scoped.map((group) => group.path), FIXER_MAX_CONCURRENT).map(
+    (keys, index) => ({
+      key: keys.join(","),
+      writeSet: normalizeWriteSet(keys),
+      findingsText: keys
+        .flatMap((key) => byPath.get(key) ?? [])
+        .join("\n"),
+      handoff: join(paths.handoffsDir, `pr-fix-${pr}-${spawn}-g${index}.md`),
+    }),
+  );
+  if (unscoped.length > 0) {
+    lanes.unshift({
+      key: "unscoped",
+      writeSet: [],
+      findingsText: unscoped.flatMap((group) => group.findings).join("\n"),
+      handoff: join(paths.handoffsDir, `pr-fix-${pr}-${spawn}-unscoped.md`),
+    });
+  }
+  if (lanes.length === 1 && lanes[0]?.writeSet.length) {
+    // Single scoped bundle: keep the legacy handoff name.
+    lanes[0]!.handoff = join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`);
+  }
+  return lanes;
+}
+
+interface FixLaneResult {
+  key: string;
+  handoff: string;
+  outcome: ChildOutcome;
+}
+
+async function runFixLane(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  paths: Paths,
+  pr: string,
+  worktree: string,
+  result: { next: string; output: string; round?: string },
+  spawn: number,
+  lane: FixLane,
+  provisionalId: string | null,
+): Promise<FixLaneResult> {
+  let settledId: string | null = null;
+  const outcome = await runChildInPhase(
+    pi,
+    ctx,
+    "implement",
+    reviewFixLaunchParams(paths, pr, worktree, result, spawn, {
+      writeSet: lane.writeSet,
+      findingsText: lane.findingsText,
+      output: lane.handoff,
+    }),
+    (runId) => {
+      settledId = runId;
+      if (provisionalId) swapWriterSlot(paths, provisionalId, runId);
+      upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
+    },
+  );
+  // The slot frees the moment the lane settles: the scoped gate below only
+  // ever touches this lane's paths, so siblings cannot be swept into it.
+  // The slot carries the real run id after the swap; before any spawn it is
+  // still the provisional one.
+  try {
+    releaseWriterSlot(paths.handoffsDir, settledId ?? provisionalId ?? "");
+  } catch {
+    /* bookkeeping */
+  }
+  const gate = await ensureWriterCommit(
+    pi,
+    worktree,
+    `fix: review round ${spawn} (${lane.key})`,
+    process.platform,
+    lane.writeSet.length > 0 ? lane.writeSet : undefined,
+  );
+  if (gate.state === "dirty") {
+    return {
+      key: lane.key,
+      handoff: lane.handoff,
+      outcome: { ok: false, reason: `lane ${lane.key} left its paths dirty: ${gate.reason}` },
+    };
+  }
+  return { key: lane.key, handoff: lane.handoff, outcome };
+}
+
+/**
+ * Run the lanes: the unscoped lane (if any) solo first, then everything
+ * admitted for the concurrent wave at once, then whatever the admission
+ * rule deferred, sequentially. Admission is by construction disjoint, so
+ * the pre-claim below only ever refuses against genuinely-live slots from
+ * another session — and those lanes simply wait their turn.
+ */
+async function runFixLanes(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  paths: Paths,
+  pr: string,
+  worktree: string,
+  result: { next: string; output: string; round?: string },
+  spawn: number,
+  lanes: FixLane[],
+): Promise<FixLaneResult[]> {
+  const results: FixLaneResult[] = [];
+  const runSoloLane = async (lane: FixLane): Promise<void> => {
+    results.push(await runFixLane(pi, ctx, paths, pr, worktree, result, spawn, lane, null));
+  };
+  const soloFirst = lanes.filter((lane) => lane.writeSet.length === 0);
+  const concurrent = lanes.filter((lane) => lane.writeSet.length > 0);
+  for (const lane of soloFirst) await runSoloLane(lane);
+  // The single-record field clears after every wave, solo or shared: a
+  // finished run must not keep worker_run_id set (D3).
+  upsertStatusFile(paths, { workerRunId: "none", workerRunDir: "none" });
+  if (concurrent.length === 0) return results;
+  const live = liveWriterSlots(paths);
+  const admitted: FixLane[] = [];
+  const deferred: FixLane[] = [];
+  const claimed: WriterSlot[] = [...live];
+  for (const [index, lane] of concurrent.entries()) {
+    const decision = admitWriteSlot(claimed, lane, FIXER_MAX_CONCURRENT);
+    if (decision.ok) {
+      admitted.push(lane);
+      claimed.push({
+        runId: `pr-${pr}-r${spawn}-g${index}-pending`,
+        runDir: "",
+        agent: "fixer",
+        writeSet: lane.writeSet,
+        claimedAt: Date.now(),
+        label: lane.key,
+      });
+    } else {
+      deferred.push(lane);
+    }
+  }
+  try {
+    persistWriterSlots(paths.handoffsDir, claimed);
+  } catch {
+    /* a missing sidecar only weakens the guard; the sets stay disjoint */
+  }
+  const provisionalOf = (lane: FixLane): string | null => {
+    const found = claimed.find(
+      (slot) => slot.label === lane.key && slot.runId.endsWith("-pending"),
+    );
+    return found?.runId ?? null;
+  };
+  results.push(
+    ...(await Promise.all(
+      admitted.map((lane) => runFixLane(pi, ctx, paths, pr, worktree, result, spawn, lane, provisionalOf(lane))),
+    )),
+  );
+  for (const lane of deferred) await runSoloLane(lane);
+  upsertStatusFile(paths, { workerRunId: "none", workerRunDir: "none" });
+  return results;
+}
+
+/**
+ * One review-fix round: up to 4 `fixer` children sharing the Feature worktree
+ * with disjoint finding-paths, then a single `git pr-await` run by code. A
+ * judgment `next=` from that await is dispatched again — that is how a later
+ * review round still gets fixers.
+ *
+ * Findings group by their `brief_finding path=` and pack into at most 4
+ * bundles; each bundle is one fixer with a declared write-set, an explicit-
+ * paths commit gate, and its own handoff. Pathless findings cannot prove
+ * disjointness, so they run solo first. A merge verdict is whole-tree work
+ * and stays a single solo fixer. The single-bundle case keeps the legacy
+ * handoff name.
  *
  * The spawn is counted on disk *before* the child starts, so a session that
  * dies mid-fix cannot hand the next one a free round against the cap.
@@ -4328,6 +4666,11 @@ async function runReviewFixWriter(
   result: { next: string; output: string; round?: string },
 ): Promise<void> {
   const spawn = fixSpawnCount(statusField(readText(paths.statusFile), "pr_round")) + 1;
+  const conflict = String(result.next ?? "").trim() === "resolve_conflicts_then_retry";
+  // Split the verdict into disjoint lanes. Merge verdicts are whole-tree
+  // work: one solo lane with no declared set, which the admission rule runs
+  // alone.
+  const lanes = planFixLanes(paths, pr, spawn, result.output, conflict);
   upsertStatusFile(paths, {
     phase: "pr",
     pr,
@@ -4335,31 +4678,38 @@ async function runReviewFixWriter(
     worktree,
     workerRunId: "none",
     workerRunDir: "none",
-    nextAction: `fixer round ${spawn} on PR ${pr}`,
+    nextAction: `fixer round ${spawn} on PR ${pr} (${lanes.length} lane${lanes.length === 1 ? "" : "s"})`,
   });
   uiNotify(ctx,
-    `PR ${pr} — fixer round ${spawn}: one fixer in ${worktree}.\n` +
-      `The session stays idle; code runs git pr-await once (fixer round ${spawn} latch) when that writer settles.`,
+    `PR ${pr} — fixer round ${spawn}: ${lanes.length} fixer${lanes.length === 1 ? "" : "s"} in ${worktree}.${lanes.length === 1 ? "" : " Disjoint paths; explicit-path commits only."}\n` +
+      `The session stays idle; code runs git pr-await once (fixer round ${spawn} latch) when the writers settle.`,
     "info",
   );
 
-  // The branch before the fixer. Read here rather than after, so "did this
+  // The branch before the fixers. Read here rather than after, so "did this
   // round move origin/<branch>?" is a comparison and not a guess.
   const before = await branchHeads(pi, worktree, { fetch: true });
 
-  const outcome = await runChildInPhase(
-    pi,
-    ctx,
-    "implement",
-    reviewFixLaunchParams(paths, pr, worktree, result, spawn),
-    (runId) => upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) }),
-  );
-  upsertStatusFile(paths, { workerRunId: "none", workerRunDir: "none" });
-
+  const laneResults = await runFixLanes(pi, ctx, paths, pr, worktree, result, spawn, lanes);
+  // One combined handoff keeps the settle tail below (and every reader of
+  // `pr-fix-<pr>-<spawn>.md`) working across solo and shared waves alike.
   const handoff = join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`);
+  writeText(
+    handoff,
+    laneResults
+      .map((lane) => `# Lane ${lane.key}\n\n${readText(lane.handoff).trim()}`)
+      .join("\n\n") + "\n",
+  );
+  const outcome = {
+    ok: laneResults.every((lane) => lane.outcome.ok),
+    stopped: laneResults.some((lane) => lane.outcome.stopped),
+    reason: laneResults.find((lane) => !lane.outcome.ok)?.outcome.reason,
+    state: laneResults.find((lane) => !lane.outcome.ok)?.outcome.state,
+  };
   // Commit gate before the branch is read (F11): an uncommitted fix is
   // invisible to `fixerPushState`, which would call the round a no-op and
-  // post a disagreement over work that was actually done.
+  // post a disagreement over work that was actually done. Each lane gated
+  // its own paths already; this is the backstop for what lanes left behind.
   const gate = await ensureWriterCommit(pi, worktree, `fix: review round ${spawn}`);
   if (gate.state === "dirty") {
     upsertStatusFile(paths, {
@@ -4374,7 +4724,7 @@ async function runReviewFixWriter(
     return;
   }
   if (gate.state === "committed") {
-    uiNotify(ctx, `PR ${pr} — fixer round ${spawn} did not commit; code committed it.`, "info");
+    uiNotify(ctx, `PR ${pr} — fixer round ${spawn} left uncommitted work; code committed it.`, "info");
   }
   const after = await branchHeads(pi, worktree, { fetch: true });
   const push = fixerPushState({
@@ -4493,7 +4843,8 @@ export async function dispatchFeaturePrVerdict(
   const action = classifyFeaturePrNext(result.next, {
     prRound: statusField(status, "pr_round"),
     chainLocked: opts.holdsChainLock ? false : RUNNING_CHAINS.has(paths.featureDir),
-    workerLive: featureWorkerLive(status),
+    // Single-record writers and slotted shared-tree writers both hold the Feature.
+    workerLive: featureWritersLive(paths, status),
     findingsRepeated,
   });
 
@@ -4935,6 +5286,414 @@ function structuredResult(outcome: ChildOutcome): unknown {
  * genuinely needs a model is delegated, and each delegation is one child
  * with an explicit contract.
  */
+/** Scope for one shared-tree Task: declared disjoint paths plus its pre-claimed slot. */
+export interface ChainTaskBatch {
+  writeSet: string[];
+  provisionalId: string | null;
+}
+
+/**
+ * Serializes plan.md read-modify-write across concurrent same-tree writers so
+ * two Tasks settling at once cannot lose each other's status lines. Returns
+ * the plan text after the mutation. Uncontended (the serial path) it is just
+ * a fresh read, a pure transform, and a write.
+ */
+let planMutationTail: Promise<void> = Promise.resolve();
+export async function updatePlanFile(
+  paths: Paths,
+  mutate: (plan: string) => string,
+): Promise<string> {
+  const run = planMutationTail.then(() => {
+    const next = mutate(readText(paths.planFile));
+    writeText(paths.planFile, next);
+    return next;
+  });
+  planMutationTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+export interface TaskBatchItem {
+  task: Task;
+  writeSet: string[];
+}
+
+/**
+ * Select a concurrent wave: pending Tasks with declared, pairwise-disjoint
+ * `- Files:` scopes, admitted against live writer slots, up to 8. Null
+ * unless at least two qualify — anything smaller runs the serial path, and
+ * Tasks without a scope always run solo (unknown sets overlap everything).
+ */
+export function selectTaskBatch(
+  plan: string,
+  tasks: Task[],
+  live: readonly WriterSlot[],
+  cap = WORKER_MAX_CONCURRENT,
+): TaskBatchItem[] | null {
+  const claimed: WriterSlot[] = [...live];
+  const batch: TaskBatchItem[] = [];
+  for (const task of tasks) {
+    if (task.status !== "pending") continue;
+    const writeSet = parseFilesScalar(taskSection(plan, task.id));
+    if (writeSet.length === 0) continue;
+    if (!admitWriteSlot(claimed, { writeSet }, cap).ok) continue;
+    claimed.push({ runId: `pending-${task.id}`, runDir: "", agent: "tdd-worker", writeSet, claimedAt: 0 });
+    batch.push({ task, writeSet });
+  }
+  return batch.length >= 2 ? batch : null;
+}
+
+/**
+ * Run one shared-tree wave: pre-claim provisional slots in a single persist
+ * (the sets are disjoint by construction), settle every Task concurrently,
+ * release everything. A false from any lane stops the chain — that lane
+ * already recorded its paused/blocked state and notified.
+ */
+async function runTaskBatch(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  paths: Paths,
+  name: string,
+  worktree: string,
+  plan: string,
+  batch: TaskBatchItem[],
+): Promise<boolean> {
+  const live = liveWriterSlots(paths);
+  const claimed: WriterSlot[] = [...live];
+  const provisionals = new Map<string, string>();
+  for (const item of batch) {
+    const provisionalId = `task-${item.task.id}-pending`;
+    if (!admitWriteSlot(claimed, { writeSet: item.writeSet }, WORKER_MAX_CONCURRENT).ok) continue;
+    claimed.push({
+      runId: provisionalId,
+      runDir: "",
+      agent: "tdd-worker",
+      writeSet: item.writeSet,
+      claimedAt: Date.now(),
+      label: `Task ${item.task.id}`,
+    });
+    provisionals.set(item.task.id, provisionalId);
+  }
+  try {
+    persistWriterSlots(paths.handoffsDir, claimed);
+  } catch {
+    /* a missing sidecar only weakens the guard; the sets stay disjoint */
+  }
+  upsertStatusFile(paths, {
+    phase: "implementing",
+    activeTask: batch.map((item) => item.task.id).join("+"),
+    worktree,
+    nextAction: `tdd-worker wave: ${batch.map((item) => `Task ${item.task.id} (${item.writeSet.join(", ")})`).join("; ")}`,
+  });
+  uiNotify(ctx, `Task wave on ${name}: ${batch.length} tdd-workers, disjoint paths.`, "info");
+  const results = await Promise.all(
+    batch.map((item) =>
+      runChainTaskOnce(pi, ctx, paths, name, worktree, item.task, plan, batch.map((entry) => entry.task), undefined, {
+        batch: { writeSet: item.writeSet, provisionalId: provisionals.get(item.task.id) ?? null },
+      }),
+    ),
+  );
+  return results.every(Boolean);
+}
+
+async function runChainTaskOnce(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  paths: Paths,
+  name: string,
+  worktree: string,
+  task: Task,
+  plan: string,
+  tasks: Task[],
+  inFlight: Task | undefined,
+  opts: { batch?: ChainTaskBatch } = {},
+): Promise<boolean> {
+  const statusNow = readText(paths.statusFile);
+  const blockedByReview = writerBlockedByPlanReview(statusNow);
+  if (blockedByReview || needsPlanReview(plan, statusNow)) {
+    uiNotify(
+      ctx,
+      blockedByReview ?? "plan-reviewer has not finished; not starting Tasks.",
+      "error",
+    );
+    return false;
+  }
+  if (!inFlight && isPaused(statusNow)) {
+    upsertStatusFile(paths, {
+      phase: "paused",
+      pause: "after-task",
+      nextAction: "/orchestrate resume",
+    });
+    uiNotify(ctx, `Paused on ${name} before Task ${task.id}.`, "info");
+    return false;
+  }
+
+  const worker = workerFor(task.complexity) ?? WORKERS.simple;
+  await updatePlanFile(paths, (freshPlan) => setTaskStatusInPlan(freshPlan, task.id, "in_progress"));
+  const planNow = readText(paths.planFile);
+  const body = taskSection(planNow, task.id);
+  const branch = planHeaderField(planNow, "Branch");
+  let writerCwd = taskWorkerCwd(body, worktree, planNow, branch);
+  if (writerCwd === worktree) {
+    const repo = taskRepoName(body, planNow);
+    if (repo && worktreeFarmFor(repo) !== dirname(worktree)) {
+      const made = await ensureRepoWorktree(pi, repo, branch);
+      if (made) writerCwd = made;
+    }
+  }
+  // Nothing has run yet and the tree already has changes: they are not
+  // this Feature's, and the commit gate below would sign them with a Task
+  // message. Stop instead (F11). Skipped inside a batch wave: siblings'
+  // uncommitted work is expected there, and the scoped gate commits only
+  // this Task's own paths.
+  const dirtyFirst = opts.batch
+    ? undefined
+    : firstTaskBlockedByDirtyTree(tasks, await porcelainStatus(pi, writerCwd));
+  if (dirtyFirst) {
+    await updatePlanFile(paths, (freshPlan) => setTaskStatusInPlan(freshPlan, task.id, "pending"));
+    upsertStatusFile(paths, {
+      phase: "blocked",
+      activeTask: "none",
+      nextAction: dirtyFirst,
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+    uiNotify(ctx, `${name}: ${dirtyFirst}\nNo Task started, no PR opened.`, "error");
+    return false;
+  }
+
+  upsertStatusFile(paths, {
+    phase: "implementing",
+    activeTask: task.id,
+    worktree,
+    nextAction: `tdd-worker Task ${task.id} (${worker.short})`,
+    tasks: parseTasks(planNow),
+  });
+  uiNotify(ctx, 
+    `Task ${task.id} — ${task.title}\n${worker.short} · ${task.complexity ?? "simple (default)"}\ncwd ${writerCwd}`,
+    "info",
+  );
+
+  const scope = opts.batch?.writeSet;
+  const beforeFingerprint = await worktreeFingerprint(pi, writerCwd, scope);
+  // Recorded before the spawn, not kept in a local only: if this session
+  // dies mid-Task, the next one still knows what the worktree looked like
+  // before the worker touched it, and can tell landed work from none.
+  upsertStatusFile(paths, {
+    taskBase: fingerprintTag(beforeFingerprint) || "none",
+    workerRunDir: "none",
+  });
+  let settledId: string | null = null;
+  const outcome = await runChildInPhase(
+    pi,
+    ctx,
+    "implement",
+    workerLaunchParams(paths, task, worktree, readText(paths.planFile), {
+      writeSet: scope ?? [],
+    }),
+    (runId) => {
+      settledId = runId;
+      if (opts.batch?.provisionalId) swapWriterSlot(paths, opts.batch.provisionalId, runId);
+      upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
+    },
+  );
+  if (opts.batch) {
+    try {
+      releaseWriterSlot(paths.handoffsDir, settledId ?? opts.batch.provisionalId ?? "");
+    } catch {
+      /* bookkeeping */
+    }
+  }
+
+  const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
+  // A child this extension stopped (`/orchestrate pause now`) is not a
+  // failed Task. Leaving it `blocked` would make `/orchestrate resume`
+  // hit the blocked guard above and refuse forever.
+  if (!outcome.ok && outcome.stopped) {
+    await updatePlanFile(paths, (freshPlan) => setTaskStatusInPlan(freshPlan, task.id, "pending"));
+    upsertStatusFile(paths, {
+      phase: "paused",
+      pause: "after-task",
+      workerRunId: "none",
+      workerRunDir: "none",
+      taskBase: "none",
+      activeTask: "none",
+      nextAction: "/orchestrate resume",
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+    uiNotify(ctx, 
+      `Task ${task.id} stopped and left pending on ${name}.\n/orchestrate resume re-runs it from the start.`,
+      "info",
+    );
+    return false;
+  }
+  // The commit gate, before any fingerprint is read (F11). A worker that
+  // edited and did not commit leaves work that `git push` would not carry,
+  // so code commits it here or the Task blocks. Committing also changes
+  // HEAD, which is what makes the fingerprint below evidence of a *land*
+  // rather than of an unstaged edit.
+  const gate = await ensureWriterCommit(
+    pi,
+    writerCwd,
+    `Task ${task.id} — ${task.title}`,
+    process.platform,
+    scope?.length ? scope : undefined,
+  );
+  if (gate.state === "dirty") {
+    await updatePlanFile(paths, (freshPlan) =>
+      setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "blocked"), task.id, handoff),
+    );
+    upsertStatusFile(paths, {
+      phase: "blocked",
+      workerRunId: "none",
+      workerRunDir: "none",
+      taskBase: "none",
+      activeTask: task.id,
+      nextAction: `dirty worktree after Task ${task.id}: ${gate.reason}`,
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+    uiNotify(ctx,
+      `Task ${task.id} left ${writerCwd} dirty and code could not commit it:\n${gate.reason}\n` +
+        `Chain stopped, no PR opened.`,
+      "error",
+    );
+    return false;
+  }
+  if (gate.state === "committed") {
+    uiNotify(ctx, `Task ${task.id} was not committed by its worker; code committed it.`, "info");
+  }
+
+  // Fingerprint after the child, before deciding fail vs continue. A
+  // harness fail with a changed worktree is a false fail when
+  // autoAdvanceOnLanded is on (default): the work landed, so the next
+  // Task starts instead of waiting for /orchestrate resume.
+  const afterFingerprint = await worktreeFingerprint(pi, writerCwd, scope);
+  const landed = worktreeChanged(beforeFingerprint, afterFingerprint);
+  // A Task with a runnable `- Command:` was graded by the host, so
+  // `outcome.ok` is a verified fact about the code and not the child's
+  // opinion of itself. That changes what a failure means (F13).
+  const gated = Boolean(taskGateCommand(body));
+  const gateResult = taskGateResult({ gated, ok: outcome.ok });
+  const handoffLine = `${handoff}  gate: ${gateResult}`;
+  if (!outcome.ok) {
+    const failSettle = settleTaskOutcome({
+      ok: false,
+      landed,
+      autoAdvance: autoAdvanceOnLanded(readText(paths.statusFile)),
+      gated,
+    });
+    if (failSettle.action === "done_continue") {
+      await updatePlanFile(paths, (freshPlan) =>
+        setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoffLine),
+      );
+      upsertStatusFile(paths, {
+        workerRunId: "none",
+        workerRunDir: "none",
+        taskBase: "none",
+        activeTask: "none",
+        tasks: parseTasks(readText(paths.planFile)),
+      });
+      uiNotify(ctx, 
+        `Task ${task.id} succeeded; harness reported failed. Work landed — continuing.\n` +
+          `Handoff: ${handoff}`,
+        "info",
+      );
+      if (isPaused(readText(paths.statusFile))) {
+        upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
+        uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
+        return false;
+      }
+      return true;
+    }
+    await updatePlanFile(paths, (freshPlan) =>
+      setTaskHandoffInPlan(
+        setTaskStatusInPlan(freshPlan, task.id, "blocked"),
+        task.id,
+        handoffLine,
+      ),
+    );
+    const red = failSettle.reason === "failed_gate";
+    upsertStatusFile(paths, {
+      phase: "blocked",
+      workerRunId: "none",
+      workerRunDir: "none",
+      taskBase: "none",
+      activeTask: task.id,
+      nextAction: red
+        ? `Task ${task.id} gate is red — fix it, then /orchestrate resume`
+        : "inspect the handoff, then /orchestrate resume",
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+    uiNotify(ctx,
+      `Task ${task.id} did not pass (${outcome.reason ?? outcome.state ?? "failed"}).\n` +
+        (red
+          ? `Its \`- Command:\` gate ran and came back red; work landing does not change that.\n`
+          : "") +
+        `Handoff: ${handoff}\nChain stopped, no PR opened.`,
+      "error",
+    );
+    return false;
+  }
+
+  const settle = settleTaskOutcome({
+    ok: outcome.ok,
+    stopped: outcome.stopped,
+    landed,
+    autoAdvance: autoAdvanceOnLanded(readText(paths.statusFile)),
+  });
+  // Host-only Features (edits outside ice-wt) used to die here: success +
+  // unchanged fingerprint marked `blocked`, so the next Task never started.
+  // `settleTaskOutcome` advances to the next Task instead. It never QA/PRs
+  // or starts another Feature — that is the loop below, after Tasks end.
+  if (settle.action === "done_continue" && settle.reason === "ok_unchanged") {
+    await updatePlanFile(paths, (freshPlan) =>
+      setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoffLine),
+    );
+    upsertStatusFile(paths, {
+      workerRunId: "none",
+      workerRunDir: "none",
+      taskBase: "none",
+      activeTask: "none",
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+    uiNotify(ctx, 
+      `Task ${task.id} done (worktree unchanged — host-side edits still count). Next Task.\n` +
+        `Handoff: ${handoff}`,
+      "info",
+    );
+    if (isPaused(readText(paths.statusFile))) {
+      upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
+      uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
+      return false;
+    }
+    return true;
+  }
+
+  await updatePlanFile(paths, (freshPlan) =>
+    setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoffLine),
+  );
+  upsertStatusFile(paths, {
+    workerRunId: "none",
+    workerRunDir: "none",
+    taskBase: "none",
+    activeTask: "none",
+    tasks: parseTasks(readText(paths.planFile)),
+  });
+  uiNotify(
+    ctx,
+    formatTodoProgress(paths, `Task ${task.id} done (gate: ${gateResult}).`),
+    "info",
+  );
+
+  if (isPaused(readText(paths.statusFile))) {
+    upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
+    uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
+    return false;
+  }
+  return true;
+}
+
 async function runFeatureChain(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
@@ -4969,274 +5728,20 @@ async function runFeatureChain(
     const task = inFlight ?? tasks.find((t) => t.status === "pending");
 
     if (task) {
-      const statusNow = readText(paths.statusFile);
-      const blockedByReview = writerBlockedByPlanReview(statusNow);
-      if (blockedByReview || needsPlanReview(plan, statusNow)) {
-        uiNotify(
-          ctx,
-          blockedByReview ?? "plan-reviewer has not finished; not starting Tasks.",
-          "error",
-        );
-        return;
-      }
-      if (!inFlight && isPaused(statusNow)) {
-        upsertStatusFile(paths, {
-          phase: "paused",
-          pause: "after-task",
-          nextAction: "/orchestrate resume",
-        });
-        uiNotify(ctx, `Paused on ${name} before Task ${task.id}.`, "info");
-        return;
-      }
-
-      const worker = workerFor(task.complexity) ?? WORKERS.simple;
-      writeText(paths.planFile, setTaskStatusInPlan(plan, task.id, "in_progress"));
-      const planNow = readText(paths.planFile);
-      const body = taskSection(planNow, task.id);
-      const branch = planHeaderField(planNow, "Branch");
-      let writerCwd = taskWorkerCwd(body, worktree, planNow, branch);
-      if (writerCwd === worktree) {
-        const repo = taskRepoName(body, planNow);
-        if (repo && worktreeFarmFor(repo) !== dirname(worktree)) {
-          const made = await ensureRepoWorktree(pi, repo, branch);
-          if (made) writerCwd = made;
-        }
-      }
-      // Nothing has run yet and the tree already has changes: they are not
-      // this Feature's, and the commit gate below would sign them with a Task
-      // message. Stop instead (F11).
-      const dirtyFirst = firstTaskBlockedByDirtyTree(
-        tasks,
-        await porcelainStatus(pi, writerCwd),
-      );
-      if (dirtyFirst) {
-        writeText(paths.planFile, setTaskStatusInPlan(planNow, task.id, "pending"));
-        upsertStatusFile(paths, {
-          phase: "blocked",
-          activeTask: "none",
-          nextAction: dirtyFirst,
-          tasks: parseTasks(readText(paths.planFile)),
-        });
-        uiNotify(ctx, `${name}: ${dirtyFirst}\nNo Task started, no PR opened.`, "error");
-        return;
-      }
-
-      upsertStatusFile(paths, {
-        phase: "implementing",
-        activeTask: task.id,
-        worktree,
-        nextAction: `tdd-worker Task ${task.id} (${worker.short})`,
-        tasks: parseTasks(planNow),
-      });
-      uiNotify(ctx, 
-        `Task ${task.id} — ${task.title}\n${worker.short} · ${task.complexity ?? "simple (default)"}\ncwd ${writerCwd}`,
-        "info",
-      );
-
-      const beforeFingerprint = await worktreeFingerprint(pi, writerCwd);
-      // Recorded before the spawn, not kept in a local only: if this session
-      // dies mid-Task, the next one still knows what the worktree looked like
-      // before the worker touched it, and can tell landed work from none.
-      upsertStatusFile(paths, {
-        taskBase: fingerprintTag(beforeFingerprint) || "none",
-        workerRunDir: "none",
-      });
-      const outcome = await runChildInPhase(
-        pi,
-        ctx,
-        "implement",
-        workerLaunchParams(paths, task, worktree, readText(paths.planFile)),
-        (runId) =>
-          upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) }),
-      );
-
-      const after = readText(paths.planFile);
-      const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
-      // A child this extension stopped (`/orchestrate pause now`) is not a
-      // failed Task. Leaving it `blocked` would make `/orchestrate resume`
-      // hit the blocked guard above and refuse forever.
-      if (!outcome.ok && outcome.stopped) {
-        writeText(paths.planFile, setTaskStatusInPlan(after, task.id, "pending"));
-        upsertStatusFile(paths, {
-          phase: "paused",
-          pause: "after-task",
-          workerRunId: "none",
-          workerRunDir: "none",
-          taskBase: "none",
-          activeTask: "none",
-          nextAction: "/orchestrate resume",
-          tasks: parseTasks(readText(paths.planFile)),
-        });
-        uiNotify(ctx, 
-          `Task ${task.id} stopped and left pending on ${name}.\n/orchestrate resume re-runs it from the start.`,
-          "info",
-        );
-        return;
-      }
-      // The commit gate, before any fingerprint is read (F11). A worker that
-      // edited and did not commit leaves work that `git push` would not carry,
-      // so code commits it here or the Task blocks. Committing also changes
-      // HEAD, which is what makes the fingerprint below evidence of a *land*
-      // rather than of an unstaged edit.
-      const gate = await ensureWriterCommit(pi, writerCwd, `Task ${task.id} — ${task.title}`);
-      if (gate.state === "dirty") {
-        writeText(
-          paths.planFile,
-          setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "blocked"), task.id, handoff),
-        );
-        upsertStatusFile(paths, {
-          phase: "blocked",
-          workerRunId: "none",
-          workerRunDir: "none",
-          taskBase: "none",
-          activeTask: task.id,
-          nextAction: `dirty worktree after Task ${task.id}: ${gate.reason}`,
-          tasks: parseTasks(readText(paths.planFile)),
-        });
-        uiNotify(ctx,
-          `Task ${task.id} left ${writerCwd} dirty and code could not commit it:\n${gate.reason}\n` +
-            `Chain stopped, no PR opened.`,
-          "error",
-        );
-        return;
-      }
-      if (gate.state === "committed") {
-        uiNotify(ctx, `Task ${task.id} was not committed by its worker; code committed it.`, "info");
-      }
-
-      // Fingerprint after the child, before deciding fail vs continue. A
-      // harness fail with a changed worktree is a false fail when
-      // autoAdvanceOnLanded is on (default): the work landed, so the next
-      // Task starts instead of waiting for /orchestrate resume.
-      const afterFingerprint = await worktreeFingerprint(pi, writerCwd);
-      const landed = worktreeChanged(beforeFingerprint, afterFingerprint);
-      // A Task with a runnable `- Command:` was graded by the host, so
-      // `outcome.ok` is a verified fact about the code and not the child's
-      // opinion of itself. That changes what a failure means (F13).
-      const gated = Boolean(taskGateCommand(body));
-      const gateResult = taskGateResult({ gated, ok: outcome.ok });
-      const handoffLine = `${handoff}  gate: ${gateResult}`;
-      if (!outcome.ok) {
-        const failSettle = settleTaskOutcome({
-          ok: false,
-          landed,
-          autoAdvance: autoAdvanceOnLanded(readText(paths.statusFile)),
-          gated,
-        });
-        if (failSettle.action === "done_continue") {
-          writeText(
-            paths.planFile,
-            setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoffLine),
-          );
-          upsertStatusFile(paths, {
-            workerRunId: "none",
-            workerRunDir: "none",
-            taskBase: "none",
-            activeTask: "none",
-            tasks: parseTasks(readText(paths.planFile)),
-          });
-          uiNotify(ctx, 
-            `Task ${task.id} succeeded; harness reported failed. Work landed — continuing.\n` +
-              `Handoff: ${handoff}`,
-            "info",
-          );
-          if (isPaused(readText(paths.statusFile))) {
-            upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
-            uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
-            return;
-          }
+      // Shared-tree wave: pending Tasks with declared, pairwise-disjoint
+      // `- Files:` scopes run together (up to 8). Anything smaller — or any
+      // Task without a scope — keeps the serial path below, unchanged.
+      if (!inFlight) {
+        const batch = selectTaskBatch(plan, tasks, liveWriterSlots(paths));
+        if (batch) {
+          if (!(await runTaskBatch(pi, ctx, paths, name, worktree, plan, batch))) return;
           continue;
         }
-        writeText(
-          paths.planFile,
-          setTaskHandoffInPlan(
-            setTaskStatusInPlan(after, task.id, "blocked"),
-            task.id,
-            handoffLine,
-          ),
-        );
-        const red = failSettle.reason === "failed_gate";
-        upsertStatusFile(paths, {
-          phase: "blocked",
-          workerRunId: "none",
-          workerRunDir: "none",
-          taskBase: "none",
-          activeTask: task.id,
-          nextAction: red
-            ? `Task ${task.id} gate is red — fix it, then /orchestrate resume`
-            : "inspect the handoff, then /orchestrate resume",
-          tasks: parseTasks(readText(paths.planFile)),
-        });
-        uiNotify(ctx,
-          `Task ${task.id} did not pass (${outcome.reason ?? outcome.state ?? "failed"}).\n` +
-            (red
-              ? `Its \`- Command:\` gate ran and came back red; work landing does not change that.\n`
-              : "") +
-            `Handoff: ${handoff}\nChain stopped, no PR opened.`,
-          "error",
-        );
-        return;
       }
-
-      const settle = settleTaskOutcome({
-        ok: outcome.ok,
-        stopped: outcome.stopped,
-        landed,
-        autoAdvance: autoAdvanceOnLanded(readText(paths.statusFile)),
-      });
-      // Host-only Features (edits outside ice-wt) used to die here: success +
-      // unchanged fingerprint marked `blocked`, so the next Task never started.
-      // `settleTaskOutcome` advances to the next Task instead. It never QA/PRs
-      // or starts another Feature — that is the loop below, after Tasks end.
-      if (settle.action === "done_continue" && settle.reason === "ok_unchanged") {
-        writeText(
-          paths.planFile,
-          setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoffLine),
-        );
-        upsertStatusFile(paths, {
-          workerRunId: "none",
-          workerRunDir: "none",
-          taskBase: "none",
-          activeTask: "none",
-          tasks: parseTasks(readText(paths.planFile)),
-        });
-        uiNotify(ctx, 
-          `Task ${task.id} done (worktree unchanged — host-side edits still count). Next Task.\n` +
-            `Handoff: ${handoff}`,
-          "info",
-        );
-        if (isPaused(readText(paths.statusFile))) {
-          upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
-          uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
-          return;
-        }
-        continue;
-      }
-
-      writeText(
-        paths.planFile,
-        setTaskHandoffInPlan(setTaskStatusInPlan(after, task.id, "done"), task.id, handoffLine),
-      );
-      upsertStatusFile(paths, {
-        workerRunId: "none",
-        workerRunDir: "none",
-        taskBase: "none",
-        activeTask: "none",
-        tasks: parseTasks(readText(paths.planFile)),
-      });
-      uiNotify(
-        ctx,
-        formatTodoProgress(paths, `Task ${task.id} done (gate: ${gateResult}).`),
-        "info",
-      );
-
-      if (isPaused(readText(paths.statusFile))) {
-        upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
-        uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
-        return;
-      }
+      if (!(await runChainTaskOnce(pi, ctx, paths, name, worktree, task, plan, tasks, inFlight))) return;
       continue;
     }
+
 
     // ---- No Tasks left: QA owed? ----
     const status = readText(paths.statusFile);
