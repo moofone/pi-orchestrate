@@ -1728,6 +1728,76 @@ test("L5: stripApproveFences also drops a nameless /orchestrate approve fence", 
   assert.match(out.markdown, /Draft plan is ready/);
 });
 
+test("L5: unwrapJsonFences pretty-prints fenced JSON so Pi does not draw literal backticks", () => {
+  const src = [
+    "I'll launch the scouts with the exact paths you provided.",
+    "",
+    "```json",
+    "  {",
+    '    "workflowScript": "await runs.all([]); return results.map(r => r.output);",',
+    '    "async": true',
+    "  }",
+    "```",
+    "",
+    "```json",
+    "  {",
+    '    "key": "scout-src",',
+    '    "agent": "scout"',
+    "  }",
+    "```",
+    "",
+  ].join("\n");
+  const out = orch.unwrapJsonFences(src);
+  assert.doesNotMatch(out, /```/);
+  assert.match(out, /I'll launch the scouts/);
+  assert.match(out, /"workflowScript": "await runs\.all\(\[\]\); return results\.map\(r => r\.output\);"/);
+  assert.match(out, /"async": true/);
+  assert.match(out, /"key": "scout-src"/);
+  assert.match(out, /"agent": "scout"/);
+  const objects = [...out.matchAll(/\{[\s\S]*?\}/g)].map((m) => JSON.parse(m[0]));
+  assert.equal(objects.length, 2);
+  assert.equal(objects[0].async, true);
+  assert.equal(objects[1].key, "scout-src");
+});
+
+test("L5: unwrapJsonFences leaves non-JSON fences and invalid JSON unfenced without backticks", () => {
+  const src = [
+    "Keep the shell sample:",
+    "```bash",
+    "rtk cargo test",
+    "```",
+    "",
+    "```json",
+    "{ not json",
+    "```",
+    "",
+  ].join("\n");
+  const out = orch.unwrapJsonFences(src);
+  assert.match(out, /```bash/);
+  assert.match(out, /rtk cargo test/);
+  assert.doesNotMatch(out, /```json/);
+  assert.match(out, /\{ not json/);
+});
+
+test("L5: formatAssistantMarkdown unwraps JSON after stripping approve fences", () => {
+  const src = [
+    "Plan is ready.",
+    "",
+    "```",
+    "  /orchestrate approve auth-reject-analytics",
+    "```",
+    "",
+    "```json",
+    '{"async":true}',
+    "```",
+    "",
+  ].join("\n");
+  const out = orch.formatAssistantMarkdown(src);
+  assert.doesNotMatch(out, /```/);
+  assert.match(out, /Plan is ready/);
+  assert.match(out, /"async": true/);
+});
+
 test("L5: draftApproveCards keeps named drafts and drops pending/approved/archived", () => {
   const draft = {
     archived: false,

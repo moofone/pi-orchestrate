@@ -18,6 +18,7 @@
  * acceptance harness reported failed. Per-Feature override:
  * `auto_advance_on_landed` in status.md.
  * Approve is a TUI card (`orchestrate-approve` entry), not a markdown fence.
+ * Assistant ```json fences are unwrapped and pretty-printed; Pi draws fences as literal backticks.
  * Never .pi/plan.md / enter_plan_mode. Workers never open a PR; code runs `gh pr create`.
  */
 
@@ -775,6 +776,27 @@ export function stripApproveFences(markdown: string): { markdown: string; names:
   next = next.replace(/^[ \t]*Approve with:[ \t]*\n+/gim, "");
   next = next.replace(/\n{3,}/g, "\n\n");
   return { markdown: next, names };
+}
+
+/** Pi draws ```json fences as literal backticks. Unwrap and pretty-print JSON instead. */
+export function unwrapJsonFences(markdown: string): string {
+  const next = markdown.replace(
+    /[ \t]*```json[ \t]*\r?\n([\s\S]*?)[ \t]*```[ \t]*/gi,
+    (_m, body: string) => {
+      const trimmed = String(body).trim();
+      try {
+        return JSON.stringify(JSON.parse(trimmed), null, 2);
+      } catch {
+        return trimmed;
+      }
+    },
+  );
+  return next.replace(/\n{3,}/g, "\n\n");
+}
+
+/** Assistant markdown as shown in `/o`: approve cards, not fence chrome. */
+export function formatAssistantMarkdown(markdown: string): string {
+  return unwrapJsonFences(stripApproveFences(markdown).markdown);
 }
 
 export function approveCardMarkerPath(dir: string): string {
@@ -6567,7 +6589,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   );
   pi.registerMarkdownTransformer((markdown, { messageType }) => {
     if (messageType !== "assistant") return markdown;
-    return stripApproveFences(markdown).markdown;
+    return formatAssistantMarkdown(markdown);
   });
   pi.on("agent_settled", async (_event, ctx) => {
     try {
