@@ -1757,6 +1757,11 @@ test("L5: unwrapJsonFences does not close on a language-tagged fence line", () =
   assert.equal(orch.unwrapJsonFences(src), src);
 });
 
+test("L5: unwrapJsonFences only opens JSON fences at the start of a line", () => {
+  const src = "Keep this prose: ```json\n{\"async\":true}\n```";
+  assert.equal(orch.unwrapJsonFences(src), src);
+});
+
 test("L5: unwrapJsonFences preserves blank lines outside transformed JSON fences", () => {
   const gap = "\n\n\n\n";
   const fence = "```";

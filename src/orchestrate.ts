@@ -780,7 +780,7 @@ export function stripApproveFences(markdown: string): { markdown: string; names:
 
 /** Pi draws ```json fences as literal backticks. Unwrap and pretty-print JSON instead. */
 export function unwrapJsonFences(markdown: string): string {
-  const opening = /[ \t]*```json[ \t]*\r?\n/gi;
+  const opening = /^[ \t]*```json[ \t]*\r?\n/gim;
   const closing = /^[ \t]*```[ \t]*(?=\r?$)/gm;
   let cursor = 0;
   let next = "";
