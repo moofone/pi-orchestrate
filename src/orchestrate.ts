@@ -4526,7 +4526,7 @@ function liveWriterSlots(paths: Paths): WriterSlot[] {
   return sweepWriterSlots(paths.handoffsDir, writerSlotIsLive).slots;
 }
 
-function writerSlotIsLive(runDir: string, runId: string, slot?: WriterSlot): boolean {
+export function writerSlotIsLive(runDir: string, runId: string, slot?: WriterSlot): boolean {
   // A pre-claim has no snapshot yet. Keep it live for a bounded window so a
   // replacement session cannot sweep it and admit an overlapping writer.
   if (!runDir && runId.endsWith("-pending")) {
@@ -4536,14 +4536,19 @@ function writerSlotIsLive(runDir: string, runId: string, slot?: WriterSlot): boo
   const dir = runDir && !isPendingToken(runDir) ? runDir : asyncRunDir(runId);
   try {
     const snapshot = readRunSnapshot(dir);
-    return Boolean(snapshot && !snapshot.terminal);
+    // A swapped slot is live until its run writes a terminal snapshot. A
+    // missing or unreadable snapshot is still live inside the claim TTL: the
+    // run may be between spawn and its first status.json write.
+    if (snapshot) return !snapshot.terminal;
   } catch {
-    return false;
+    // The TTL below is the outer backstop for an unreadable run artifact.
   }
+  const age = Date.now() - (slot?.claimedAt ?? 0);
+  return Number.isFinite(age) && age >= 0 && age < PROVISIONAL_WRITER_SLOT_TTL_MS;
 }
 
 /** Swap a pre-claimed provisional slot for the real run id (construction already admitted it). */
-function swapWriterSlot(paths: Paths, provisionalId: string, runId: string): void {
+export function swapWriterSlot(paths: Paths, provisionalId: string, runId: string): void {
   const dir = paths.handoffsDir;
   try {
     updateWriterSlots(dir, writerSlotIsLive, (slots) => {

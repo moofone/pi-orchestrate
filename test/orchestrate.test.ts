@@ -2455,8 +2455,10 @@ test("R6: wave orphan recovery uses each Task's own run and base metadata", asyn
   mkdirSync(runA, { recursive: true });
   mkdirSync(runB, { recursive: true });
   const completed = { state: "complete", startedAt: 1, endedAt: 2, steps: [{ status: "complete" }] };
+  const failed = { state: "failed", startedAt: 1, endedAt: 2, steps: [{ status: "failed" }] };
   writeFileSync(join(runA, "status.json"), JSON.stringify(completed));
-  writeFileSync(join(runB, "status.json"), JSON.stringify(completed));
+  writeFileSync(join(runB, "status.json"), JSON.stringify(failed));
+  const runBBase = orch.fingerprintTag(" M src/a.ts");
   writeFileSync(
     paths.statusFile,
     [
@@ -2466,7 +2468,7 @@ test("R6: wave orphan recovery uses each Task's own run and base metadata", asyn
       "active_task: 1+2",
       "worker_run_id: run-b",
       `worker_run_dir: ${runB}`,
-      "task_base: base-b",
+      `task_base: ${runBBase}`,
       "task_base_head: none",
       "pause: off",
       "",
@@ -2483,19 +2485,30 @@ test("R6: wave orphan recovery uses each Task's own run and base metadata", asyn
     taskId: "2",
     runId: "run-b",
     runDir: runB,
-    baseTag: "base-b",
+    baseTag: runBBase,
     baseHead: "none",
   });
+  assert.deepEqual(
+    readTaskRuns(paths.handoffsDir).map(({ taskId, runId, baseTag }) => ({ taskId, runId, baseTag })),
+    [
+      { taskId: "1", runId: "run-a", baseTag: "base-a" },
+      { taskId: "2", runId: "run-b", baseTag: runBBase },
+    ],
+    "each orphaned Task must have its own run and base record before recovery",
+  );
   const pi = makeFakePi(async (_cmd, args) =>
     args[0] === "status"
-      ? { code: 0, stdout: " M src/a.ts\n M src/b.ts", stderr: "" }
+      ? { code: 0, stdout: " M src/a.ts", stderr: "" }
       : { code: 0, stdout: "", stderr: "" },
   );
-  const { ctx } = makeFakeCtx();
+  const { ctx, notices } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(pi as never, ctx, paths as never, "wave recovery", dir);
-  assert.equal(proceed, true, "all terminal wave Tasks should settle before the chain resumes");
+  assert.equal(proceed, false, "a differentiated failed wave Task must stop recovery after its sibling settles");
   const plan = readFileSync(paths.planFile, "utf8");
-  assert.equal((plan.match(/- Status: done/g) ?? []).length, 2);
+  assert.match(plan, /### Task 1 — a[\s\S]*?- Status: done/);
+  assert.match(plan, /### Task 2 — b[\s\S]*?- Status: blocked/);
+  assert.match(notices.find((notice) => notice.startsWith("Task 1 recovered")) ?? "", /finished \(complete\)/);
+  assert.match(notices.find((notice) => notice.startsWith("Task 2 was orphaned")) ?? "", /\(failed, worktree unchanged\)/);
   assert.deepEqual(readTaskRuns(paths.handoffsDir), [], "settled Task metadata is swept");
   assert.match(readFileSync(paths.statusFile, "utf8"), /^worker_run_id: none$/m);
 });

@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
+import { readWriterSlots, sweepWriterSlots, updateWriterSlots } from "../src/lib/write-sets.ts";
 
 const RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
@@ -260,6 +261,27 @@ test("shared-tree: an empty admission blocks instead of reporting a successful w
   assert.ok(spawn > empty, "the empty-admission branch must precede spawning");
   assert.match(batch.slice(empty, spawn), /phase: "blocked"/);
   assert.match(batch.slice(empty, spawn), /return false/);
+});
+
+test("shared-tree: swapped slot survives sweep before its snapshot appears", () => {
+  const { paths } = prFixture(0);
+  const provisionalId = "writer-pending";
+  const runId = `writer-no-snapshot-${process.pid}-${Date.now()}`;
+  updateWriterSlots(paths.handoffsDir, () => true, () => ({
+    slots: [{
+      runId: provisionalId,
+      runDir: "",
+      agent: "fixer",
+      writeSet: ["src/a.ts"],
+      claimedAt: Date.now(),
+    }],
+    result: undefined,
+  }));
+  orch.swapWriterSlot(paths as never, provisionalId, runId);
+  assert.deepEqual(readWriterSlots(paths.handoffsDir).map((slot) => slot.runId), [runId]);
+  const swept = sweepWriterSlots(paths.handoffsDir, orch.writerSlotIsLive);
+  assert.deepEqual(swept.slots.map((slot) => slot.runId), [runId]);
+  assert.equal(swept.swept, false, "a newly swapped slot must not be swept before status.json appears");
 });
 
 test("shared-tree: task settlement releases both provisional and settled slot ids", () => {
