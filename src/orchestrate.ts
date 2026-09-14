@@ -2482,7 +2482,8 @@ const CHILD_WATCHDOG_GRACE_MS = 5 * 60 * 1000;
 const WRITER_TURN_BUDGET = { maxTurns: 220, graceTurns: 30 };
 export const QA_TURN_BUDGET = { maxTurns: 60, graceTurns: 10 };
 const PLANNER_TURN_BUDGET = { maxTurns: 80, graceTurns: 15 };
-const WRITER_MAX_CONCURRENCY = 2;
+/** Max parallel tdd-worker / fixer fanout. Feature Tasks stay sequential on one worktree; this only clamps subagent `concurrency`. */
+export const WRITER_MAX_CONCURRENCY = 4;
 const PLANNER_MODEL = "xai/grok-4.6:high";
 export const MAX_QA_FINDINGS = 8;
 
