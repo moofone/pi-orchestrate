@@ -111,8 +111,14 @@ import {
   releaseWriterSlot,
   updateWriterSlots,
   sweepWriterSlots,
+  readTaskRuns,
+  releaseTaskRun,
+  sweepTaskRuns,
+  updateTaskRuns,
+  upsertTaskRun,
   WORKER_MAX_CONCURRENT,
   writeSetsOverlap,
+  type TaskRunRecord,
   type WriterSlot,
 } from "./lib/write-sets.ts";
 import { registerReviewLaunch, requestExecutionController, type LaunchIntent, type LaunchResult } from "./lib/pr-review-events.ts";
@@ -3593,6 +3599,41 @@ export function firstTaskBlockedByDirtyTree(
 }
 
 /**
+ * Keep only dirty paths outside a shared wave's union. Rename/copy entries are
+ * expanded into ordinary path entries so an out-of-scope side cannot hide
+ * behind its in-scope sibling.
+ */
+export function porcelainOutsideWriteSet(
+  porcelain: string | undefined,
+  scopedPaths: readonly string[],
+): string {
+  const scope = normalizeWriteSet(scopedPaths);
+  if (!porcelain || scope.length === 0) return porcelain ?? "";
+  return porcelain
+    .split("\n")
+    .flatMap((line) =>
+      porcelainEntryPaths(line)
+        .filter((path) => !writeSetsOverlap(scope, [path]))
+        .map((path) => ` M ${JSON.stringify(path)}`),
+    )
+    .join("\n");
+}
+
+/** F11 for a wave: sibling dirt in its scopes is expected, other dirt blocks. */
+export function firstWaveTaskBlockedByDirtyTree(
+  tasks: Task[],
+  porcelain: string | undefined,
+  scopedPaths: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  return firstTaskBlockedByDirtyTree(
+    tasks,
+    porcelainOutsideWriteSet(porcelain, scopedPaths),
+    platform,
+  );
+}
+
+/**
  * Close the commit gate for one writer.
  *
  * `git add -A` is deliberate: a writer's untracked new files are as much of
@@ -3631,7 +3672,8 @@ export async function ensureWriterCommit(
           .split("\n")
           .filter((line) => line.trim() && inScope(line))
           .flatMap((line) => porcelainEntryPaths(line))
-          .filter((path) => !isCommitGateIgnoredPath(path, platform)),
+          .filter((path) => !isCommitGateIgnoredPath(path, platform))
+          .filter((path) => scope === null || writeSetsOverlap(scope, [path])),
       ),
     ];
     if (paths.length === 0) return { state: "clean", reason: "" };
@@ -4571,8 +4613,17 @@ export function planFixLanes(
     .split("\n")
     .filter((line) => /^\s*brief_finding\s/.test(line));
   const groups = groupFindingsByPath(rawLines.length > 0 ? rawLines : parseBriefFindings(verdictOutput));
-  const scoped = groups.filter((group) => group.path);
-  const unscoped = groups.filter((group) => !group.path);
+  // Reviewer paths are untrusted input. Normalize before deciding whether a
+  // group may receive a scoped writer; invalid paths must use the safe solo
+  // lane instead of becoming an empty scoped gate.
+  const normalizedByPath = new Map<string, string[]>();
+  for (const group of groups) {
+    const path = normalizeWriteSet(group.path ? [group.path] : [])[0] ?? "";
+    normalizedByPath.set(path, [...(normalizedByPath.get(path) ?? []), ...group.findings]);
+  }
+  const normalizedGroups = [...normalizedByPath.entries()].map(([path, findings]) => ({ path, findings }));
+  const scoped = normalizedGroups.filter((group) => group.path);
+  const unscoped = normalizedGroups.filter((group) => !group.path);
   if (scoped.length === 0) return solo(verdictOutput);
   const byPath = new Map(scoped.map((group) => [group.path, group.findings]));
   const lanes: FixLane[] = packPathGroups(scoped.map((group) => group.path), FIXER_MAX_CONCURRENT).map(
@@ -5494,6 +5545,33 @@ export interface TaskBatchItem {
   writeSet: string[];
 }
 
+function saveTaskRun(paths: Paths, record: TaskRunRecord): void {
+  try {
+    upsertTaskRun(paths.handoffsDir, record);
+  } catch {
+    /* recovery metadata must not take down a live worker */
+  }
+}
+
+function updateSavedTaskRun(
+  paths: Paths,
+  taskId: string,
+  patch: Partial<Omit<TaskRunRecord, "taskId">>,
+): void {
+  try {
+    updateTaskRuns(paths.handoffsDir, (runs) => {
+      const current = runs.find((run) => run.taskId === taskId);
+      if (!current) return { runs, result: undefined };
+      return {
+        runs: runs.map((run) => run.taskId === taskId ? { ...run, ...patch } : run),
+        result: undefined,
+      };
+    });
+  } catch {
+    /* recovery metadata must not take down a live worker */
+  }
+}
+
 /**
  * Select a concurrent wave: pending Tasks with declared, pairwise-disjoint
  * `- Files:` scopes, admitted against live writer slots, up to 8. Null
@@ -5534,6 +5612,24 @@ async function runTaskBatch(
   plan: string,
   batch: TaskBatchItem[],
 ): Promise<boolean> {
+  // A wave may inherit sibling dirt inside its union, but anything outside it
+  // predates these writers and must stop the chain before any child spawns.
+  const dirtyFirst = firstWaveTaskBlockedByDirtyTree(
+    batch.map((item) => item.task),
+    await porcelainStatus(pi, worktree),
+    batch.flatMap((item) => item.writeSet),
+  );
+  if (dirtyFirst) {
+    upsertStatusFile(paths, {
+      phase: "blocked",
+      activeTask: "none",
+      worktree,
+      nextAction: dirtyFirst,
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+    uiNotify(ctx, `${name}: ${dirtyFirst}\nNo Task started, no PR opened.`, "error");
+    return false;
+  }
   // Each claim performs its own fresh sweep and admission under the
   // cross-process sidecar lock. The selector is only an optimization; this
   // is the authoritative admission at spawn time.
@@ -5656,9 +5752,9 @@ async function runChainTaskOnce(
   }
   // Nothing has run yet and the tree already has changes: they are not
   // this Feature's, and the commit gate below would sign them with a Task
-  // message. Stop instead (F11). Skipped inside a batch wave: siblings'
-  // uncommitted work is expected there, and the scoped gate commits only
-  // this Task's own paths.
+  // message. The genuine wave performs this check in runTaskBatch before
+  // spawning; once children are live, sibling dirt inside their scopes is
+  // expected and each scoped gate commits only its own paths.
   const dirtyFirst = wave
     ? undefined
     : firstTaskBlockedByDirtyTree(tasks, await porcelainStatus(pi, writerCwd));
@@ -5695,9 +5791,18 @@ async function runChainTaskOnce(
   // Recorded before the spawn, not kept in a local only: if this session
   // dies mid-Task, the next one still knows what the worktree looked like
   // before the worker touched it, and can tell landed work from none.
+  const baseTag = fingerprintTag(beforeFingerprint) || "none";
+  const baseHead = beforeHead || "none";
+  saveTaskRun(paths, {
+    taskId: task.id,
+    runId: "none",
+    runDir: "none",
+    baseTag,
+    baseHead,
+  });
   upsertStatusFile(paths, {
-    taskBase: fingerprintTag(beforeFingerprint) || "none",
-    taskBaseHead: beforeHead || "none",
+    taskBase: baseTag,
+    taskBaseHead: baseHead,
     workerRunDir: "none",
   });
   let settledId: string | null = null;
@@ -5711,6 +5816,10 @@ async function runChainTaskOnce(
     (runId) => {
       settledId = runId;
       if (opts.batch?.provisionalId) swapWriterSlot(paths, opts.batch.provisionalId, runId);
+      updateSavedTaskRun(paths, task.id, {
+        runId,
+        runDir: asyncRunDir(runId),
+      });
       upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
     },
   );
@@ -5928,6 +6037,7 @@ async function runChainTaskOnce(
   }
   return true;
   } finally {
+    releaseTaskRun(paths.handoffsDir, task.id);
     if (opts.batch) {
       const releaseIds = new Set(
         [opts.batch.provisionalId, settledId].filter(
@@ -6124,128 +6234,165 @@ export async function reconcileOrphanTask(
   name: string,
   worktree: string,
 ): Promise<boolean> {
-  const task = parseTasks(readText(paths.planFile)).find((t) => t.status === "in_progress");
-  if (!task) return true;
+  const initialTasks = parseTasks(readText(paths.planFile));
+  const inFlight = initialTasks.filter((task) => task.status === "in_progress");
+  let records: TaskRunRecord[] = [];
+  try {
+    // Keep records for every orphaned Task while dropping settled Tasks. A
+    // dead run must remain available here: its snapshot is the evidence we
+    // are about to reconcile, not a reason to sweep the record first.
+    records = sweepTaskRuns(paths.handoffsDir, inFlight.map((task) => task.id)).runs;
+  } catch {
+    records = readTaskRuns(paths.handoffsDir);
+  }
+  if (inFlight.length === 0) return true;
 
-  const status = readText(paths.statusFile);
-  const runId = statusField(status, "worker_run_id");
-  const recordedDir = statusField(status, "worker_run_dir");
-  const dir = !isPendingToken(recordedDir)
-    ? recordedDir
-    : isPendingToken(runId)
-      ? ""
-      : asyncRunDir(runId);
+  // status.md remains a compatibility fallback for Features created before
+  // task_runs.json. New wave Tasks always use their own keyed record below.
+  const legacyStatus = readText(paths.statusFile);
+  // The old status fields are safe only for the historical single-Task case;
+  // reusing them for a wave would recreate the very cross-task attribution
+  // bug this sidecar avoids.
+  const legacyRunId = inFlight.length === 1 ? statusField(legacyStatus, "worker_run_id") : "none";
+  const legacyRunDir = inFlight.length === 1 ? statusField(legacyStatus, "worker_run_dir") : "none";
+  let canContinue = true;
+  let waitingTask: Task | undefined;
+  let blockedTask: Task | undefined;
 
-  let snapshot = readRunSnapshot(dir);
-  if (snapshot && !snapshot.terminal) {
-    uiNotify(ctx, 
-      `Task ${task.id} is still running from an earlier session (run ${runId.slice(0, 8)}).\n` +
-        `Waiting for it instead of starting it twice. /orchestrate pause now stops it.`,
+  for (const task of inFlight) {
+    const record = records.find((run) => run.taskId === task.id);
+    const runId = record?.runId ?? legacyRunId;
+    const recordedDir = record?.runDir ?? legacyRunDir;
+    const dir = !isPendingToken(recordedDir)
+      ? recordedDir
+      : isPendingToken(runId)
+        ? ""
+        : asyncRunDir(runId);
+
+    let snapshot = readRunSnapshot(dir);
+    if (snapshot && !snapshot.terminal) {
+      uiNotify(ctx,
+        `Task ${task.id} is still running from an earlier session (run ${runId.slice(0, 8)}).\n` +
+          `Waiting for it instead of starting it twice. /orchestrate pause now stops it.`,
+        "info",
+      );
+      const deadline = Date.now() + CHILD_TIMEOUT_MS;
+      while (snapshot && !snapshot.terminal && Date.now() < deadline) {
+        if (isPaused(readText(paths.statusFile))) break;
+        await sleep(ORPHAN_POLL_MS);
+        snapshot = readRunSnapshot(dir);
+      }
+    }
+
+    const statusNow = readText(paths.statusFile);
+    const plan = readText(paths.planFile);
+    const body = taskSection(plan, task.id);
+    const scope = parseFilesScalar(body);
+    const baseTag = record?.baseTag ?? (inFlight.length === 1 ? statusField(statusNow, "task_base") : "none");
+    const beforeHead = record?.baseHead ?? (inFlight.length === 1 ? statusField(statusNow, "task_base_head") : "none");
+    const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
+    const landed = landedByEvidence({
+      baseTag: isPendingToken(baseTag) ? "" : baseTag,
+      nowTag: fingerprintTag(await worktreeFingerprint(pi, worktree, scope.length ? scope : undefined)),
+      handoffMtimeMs: fileMtimeMs(handoff),
+      runStartedAtMs: snapshot?.startedAtMs ?? 0,
+    }) || await committedInScope(
+      pi,
+      worktree,
+      isPendingToken(beforeHead) ? "" : beforeHead,
+      scope.length ? scope : undefined,
+    );
+    const decision = orphanDecision(
+      snapshot,
+      landed,
+      autoAdvanceOnLanded(statusNow),
+      Boolean(taskGateCommand(body)),
+    );
+
+    if (decision === "wait") {
+      canContinue = false;
+      waitingTask ??= task;
+      uiNotify(ctx,
+        `Task ${task.id} on ${name} is still being written by run ${runId.slice(0, 8)}.\n` +
+          `Nothing started, to keep one writer on ${worktree}.`,
+        "warning",
+      );
+      continue;
+    }
+
+    releaseTaskRun(paths.handoffsDir, task.id);
+    if (decision === "done") {
+      await updatePlanFile(paths, (freshPlan) =>
+        setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoff),
+      );
+      uiNotify(ctx,
+        `Task ${task.id} recovered: its worker finished (${snapshot?.state ?? "no run record"}) ` +
+          `after the session that started it ended, and the work is on the branch.\n` +
+          `Handoff: ${handoff}\nContinuing the chain.`,
+        "info",
+      );
+      continue;
+    }
+
+    canContinue = false;
+    if (decision === "blocked") {
+      blockedTask ??= task;
+      await updatePlanFile(paths, (freshPlan) =>
+        setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "blocked"), task.id, handoff),
+      );
+      uiNotify(ctx,
+        `Task ${task.id} was orphaned by a dead session and left nothing usable ` +
+          `(${snapshot?.state ?? "no run record"}${landed ? "" : ", worktree unchanged"}).\n` +
+          `Handoff: ${handoff}\nChain stopped, no PR opened.`,
+        "error",
+      );
+      continue;
+    }
+
+    await updatePlanFile(paths, (freshPlan) => setTaskStatusInPlan(freshPlan, task.id, "pending"));
+    uiNotify(ctx,
+      `Task ${task.id} was orphaned (${snapshot?.state ?? "no run record"}) and left no work. ` +
+        `Re-running it from the start.`,
       "info",
     );
-    const deadline = Date.now() + CHILD_TIMEOUT_MS;
-    while (snapshot && !snapshot.terminal && Date.now() < deadline) {
-      if (isPaused(readText(paths.statusFile))) break;
-      await sleep(ORPHAN_POLL_MS);
-      snapshot = readRunSnapshot(dir);
-    }
   }
 
-  const statusNow = readText(paths.statusFile);
-  const plan = readText(paths.planFile);
-  const scope = parseFilesScalar(taskSection(plan, task.id));
-  const baseTag = statusField(statusNow, "task_base");
-  const beforeHead = statusField(statusNow, "task_base_head");
-  const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
-  const landed = landedByEvidence({
-    baseTag: isPendingToken(baseTag) ? "" : baseTag,
-    nowTag: fingerprintTag(await worktreeFingerprint(pi, worktree, scope.length ? scope : undefined)),
-    handoffMtimeMs: fileMtimeMs(handoff),
-    runStartedAtMs: snapshot?.startedAtMs ?? 0,
-  }) || await committedInScope(
-    pi,
-    worktree,
-    isPendingToken(beforeHead) ? "" : beforeHead,
-    scope.length ? scope : undefined,
-  );
-  const decision = orphanDecision(
-    snapshot,
-    landed,
-    autoAdvanceOnLanded(statusNow),
-    Boolean(taskGateCommand(taskSection(plan, task.id))),
-  );
+  const finalTasks = parseTasks(readText(paths.planFile));
+  const stillInFlight = finalTasks.some((task) => task.status === "in_progress");
   const cleared = {
     workerRunId: "none",
     workerRunDir: "none",
     taskBase: "none",
     taskBaseHead: "none",
   } as const;
-
-  if (decision === "wait") {
+  if (blockedTask) {
     upsertStatusFile(paths, {
-      phase: "paused",
-      nextAction: `Task ${task.id} worker still live (run ${runId}) — /orchestrate pause now, or resume later`,
+      ...(stillInFlight ? {} : cleared),
+      phase: "blocked",
+      activeTask: blockedTask.id,
+      nextAction: "inspect the handoff, then /orchestrate resume",
+      tasks: finalTasks,
     });
-    uiNotify(ctx, 
-      `Task ${task.id} on ${name} is still being written by run ${runId.slice(0, 8)}.\n` +
-        `Nothing started, to keep one writer on ${worktree}.`,
-      "warning",
-    );
-    return false;
-  }
-
-  if (decision === "done") {
-    writeText(
-      paths.planFile,
-      setTaskHandoffInPlan(setTaskStatusInPlan(plan, task.id, "done"), task.id, handoff),
-    );
+  } else if (waitingTask) {
+    upsertStatusFile(paths, {
+      ...(stillInFlight ? {} : cleared),
+      phase: "paused",
+      activeTask: waitingTask.id,
+      nextAction: `Task ${waitingTask.id} worker still live — /orchestrate pause now, or resume later`,
+      tasks: finalTasks,
+    });
+  } else {
     upsertStatusFile(paths, {
       ...cleared,
       activeTask: "none",
-      tasks: parseTasks(readText(paths.planFile)),
+      tasks: finalTasks,
     });
-    uiNotify(ctx, 
-      `Task ${task.id} recovered: its worker finished (${snapshot?.state ?? "no run record"}) ` +
-        `after the session that started it ended, and the work is on the branch.\n` +
-        `Handoff: ${handoff}\nContinuing the chain.`,
-      "info",
-    );
-    return true;
   }
-
-  if (decision === "blocked") {
-    writeText(
-      paths.planFile,
-      setTaskHandoffInPlan(setTaskStatusInPlan(plan, task.id, "blocked"), task.id, handoff),
-    );
-    upsertStatusFile(paths, {
-      ...cleared,
-      phase: "blocked",
-      activeTask: task.id,
-      nextAction: "inspect the handoff, then /orchestrate resume",
-      tasks: parseTasks(readText(paths.planFile)),
-    });
-    uiNotify(ctx, 
-      `Task ${task.id} was orphaned by a dead session and left nothing usable ` +
-        `(${snapshot?.state ?? "no run record"}${landed ? "" : ", worktree unchanged"}).\n` +
-        `Handoff: ${handoff}\nChain stopped, no PR opened.`,
-      "error",
-    );
-    return false;
-  }
-
-  writeText(paths.planFile, setTaskStatusInPlan(plan, task.id, "pending"));
-  upsertStatusFile(paths, {
-    ...cleared,
-    activeTask: "none",
-    tasks: parseTasks(readText(paths.planFile)),
-  });
-  uiNotify(ctx, 
-    `Task ${task.id} was orphaned (${snapshot?.state ?? "no run record"}) and left no work. ` +
-      `Re-running it from the start.`,
-    "info",
-  );
-  return true;
+  // A live orphan keeps its durable status fields for pause/reload; all other
+  // records were cleared above. The per-Task sidecar is the source of truth
+  // when more than one Task was in flight.
+  if (stillInFlight && !blockedTask && !waitingTask) canContinue = false;
+  return canContinue && !stillInFlight;
 }
 
 /**

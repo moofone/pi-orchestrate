@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
 import { registerLatchArm, registerLatchWake } from "../src/lib/pr-await-core.ts";
+import { readTaskRuns, upsertTaskRun } from "../src/lib/write-sets.ts";
 
 const ORCH_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/orchestrate.ts");
 const LIFECYCLE_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/lib/lifecycle.ts");
@@ -2420,6 +2421,83 @@ test("R6: a live orphan run is waited on, never started a second time", async ()
   assert.equal(proceed, false, "one writer per worktree: do not spawn over a live worker");
   assert.match(readFileSync(paths.planFile, "utf8"), /- Status: in_progress/);
   assert.match(notices.join("\n"), /still (running|being written)/i);
+});
+
+test("R6: wave orphan recovery uses each Task's own run and base metadata", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-wave-orphan-"));
+  const paths = {
+    repo: "icemining",
+    gitRoot: dir,
+    repoDir: dir,
+    featureDir: dir,
+    planFile: join(dir, "plan.md"),
+    statusFile: join(dir, "status.md"),
+    handoffsDir: join(dir, "handoffs"),
+    archiveDir: join(dir, "archive"),
+  };
+  writeFileSync(
+    paths.planFile,
+    [
+      "# Feature: wave recovery",
+      "",
+      "### Task 1 — a",
+      "- Status: in_progress",
+      "- Files: src/a.ts",
+      "",
+      "### Task 2 — b",
+      "- Status: in_progress",
+      "- Files: src/b.ts",
+      "",
+    ].join("\n"),
+  );
+  const runA = join(dir, "run-a");
+  const runB = join(dir, "run-b");
+  mkdirSync(runA, { recursive: true });
+  mkdirSync(runB, { recursive: true });
+  const completed = { state: "complete", startedAt: 1, endedAt: 2, steps: [{ status: "complete" }] };
+  writeFileSync(join(runA, "status.json"), JSON.stringify(completed));
+  writeFileSync(join(runB, "status.json"), JSON.stringify(completed));
+  writeFileSync(
+    paths.statusFile,
+    [
+      "# Status",
+      "",
+      "phase: implementing",
+      "active_task: 1+2",
+      "worker_run_id: run-b",
+      `worker_run_dir: ${runB}`,
+      "task_base: base-b",
+      "task_base_head: none",
+      "pause: off",
+      "",
+    ].join("\n"),
+  );
+  upsertTaskRun(paths.handoffsDir, {
+    taskId: "1",
+    runId: "run-a",
+    runDir: runA,
+    baseTag: "base-a",
+    baseHead: "none",
+  });
+  upsertTaskRun(paths.handoffsDir, {
+    taskId: "2",
+    runId: "run-b",
+    runDir: runB,
+    baseTag: "base-b",
+    baseHead: "none",
+  });
+  const pi = makeFakePi(async (_cmd, args) =>
+    args[0] === "status"
+      ? { code: 0, stdout: " M src/a.ts\n M src/b.ts", stderr: "" }
+      : { code: 0, stdout: "", stderr: "" },
+  );
+  const { ctx } = makeFakeCtx();
+  const proceed = await orch.reconcileOrphanTask(pi as never, ctx, paths as never, "wave recovery", dir);
+  assert.equal(proceed, true, "all terminal wave Tasks should settle before the chain resumes");
+  const plan = readFileSync(paths.planFile, "utf8");
+  assert.equal((plan.match(/- Status: done/g) ?? []).length, 2);
+  assert.deepEqual(readTaskRuns(paths.handoffsDir), [], "settled Task metadata is swept");
+  assert.match(readFileSync(paths.statusFile, "utf8"), /^worker_run_id: none$/m);
 });
 
 /* ------------------------------------------------------------------ *
@@ -5942,6 +6020,32 @@ test("P3 F11: staged rename commits both source and destination", async () => {
   });
   const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
   assert.equal(gate.state, "committed");
+});
+
+test("P3 F11: scoped rename stages only the side in the writer scope", async () => {
+  let dirty = "R  src/a.ts -> src/b.ts";
+  const calls: string[][] = [];
+  const pi = makeFakePi(async (_cmd, args) => {
+    const actual = [...(args ?? [])];
+    calls.push(actual);
+    if (actual[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (actual[0] === "commit") {
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(
+    pi as never,
+    "/wt",
+    "Task 1 — x",
+    "linux",
+    ["src/a.ts"],
+  );
+  assert.equal(gate.state, "committed");
+  const staged = calls.filter((args) => args[0] === "add" || args[0] === "commit").flat();
+  assert.ok(staged.includes(":(literal)src/a.ts"));
+  assert.equal(staged.includes(":(literal)src/b.ts"), false, "sibling rename destination stays out");
 });
 
 test("P3 F11: quoted porcelain paths are committed decoded, not still-escaped", async () => {

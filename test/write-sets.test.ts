@@ -20,10 +20,15 @@ import {
   normalizeWriteSet,
   packPathGroups,
   parseFilesScalar,
+  readTaskRuns,
   readWriterSlots,
+  releaseTaskRun,
   releaseWriterSlot,
+  sweepTaskRuns,
   sweepWriterSlots,
   updateWriterSlots,
+  upsertTaskRun,
+  type TaskRunRecord,
   type WriterSlot,
 } from "../src/lib/write-sets.ts";
 
@@ -164,6 +169,25 @@ function sidecarChild(script: string, args: string[]): Promise<string> {
     });
   });
 }
+
+test("write-sets: keyed Task run sidecar preserves siblings and sweeps settled ids", () => {
+  const dir = mkdtempSync(join(tmpdir(), "task-runs-"));
+  const run = (taskId: string): TaskRunRecord => ({
+    taskId,
+    runId: `run-${taskId}`,
+    runDir: `/tmp/run-${taskId}`,
+    baseTag: `base-${taskId}`,
+    baseHead: `head-${taskId}`,
+  });
+  upsertTaskRun(dir, run("1"));
+  upsertTaskRun(dir, run("2"));
+  assert.deepEqual(readTaskRuns(dir).map((entry) => entry.taskId), ["1", "2"]);
+  const swept = sweepTaskRuns(dir, ["2"]);
+  assert.equal(swept.swept, true);
+  assert.deepEqual(swept.runs.map((entry) => entry.taskId), ["2"]);
+  releaseTaskRun(dir, "2");
+  assert.deepEqual(readTaskRuns(dir), []);
+});
 
 test("write-sets: concurrent claims admit no overlapping duplicate", async () => {
   const dir = mkdtempSync(join(tmpdir(), "writers-race-"));

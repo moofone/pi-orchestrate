@@ -155,6 +155,42 @@ test("shared-tree: planFixLanes keeps conflicts and finding-free verdicts solo",
   assert.equal(empty.length, 1);
 });
 
+test("shared-tree: malformed finding paths are routed to the unscoped lane", () => {
+  const { paths } = prFixture(0);
+  const verdict = [
+    "next=read_comments_and_fix",
+    "brief_finding path=../../other.ts sev=P1 title=escape",
+    "brief_finding path=src/owned.ts sev=P1 title=valid",
+  ].join("\n");
+  const lanes = orch.planFixLanes(paths as never, "99", 1, verdict, false);
+  const unscoped = lanes.find((lane) => lane.key === "unscoped");
+  assert.ok(unscoped, "invalid reviewer paths must not create a scoped lane");
+  assert.deepEqual(unscoped!.writeSet, []);
+  assert.match(unscoped!.findingsText, /path=\.\.\/\.\.\/other\.ts/);
+  assert.deepEqual(lanes.filter((lane) => lane.writeSet.length).flatMap((lane) => lane.writeSet), ["src/owned.ts"]);
+});
+
+test("shared-tree: wave F11 blocks dirt outside the wave scope", () => {
+  const tasks = [
+    { id: "1", title: "a", status: "pending" },
+    { id: "2", title: "b", status: "pending" },
+  ] as never;
+  const dirtyOutside = orch.firstWaveTaskBlockedByDirtyTree(
+    tasks,
+    " M src/a.ts\n M src/b.ts\n M sibling.ts",
+    ["src/a.ts", "src/b.ts"],
+  );
+  assert.match(dirtyOutside ?? "", /sibling\.ts/);
+  assert.equal(
+    orch.firstWaveTaskBlockedByDirtyTree(tasks, " M src/a.ts\n M src/b.ts", ["src/a.ts", "src/b.ts"]),
+    undefined,
+  );
+  const source = readFileSync(ORCH_SRC, "utf8");
+  const start = source.indexOf("async function runTaskBatch");
+  const end = source.indexOf("\nasync function runChainTaskOnce", start);
+  assert.match(source.slice(start, end), /firstWaveTaskBlockedByDirtyTree/);
+});
+
 test("shared-tree: selectTaskBatch takes disjoint scoped Tasks, skips the rest", () => {
   const plan = [
     "# Feature: t",

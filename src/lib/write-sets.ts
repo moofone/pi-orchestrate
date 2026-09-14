@@ -169,6 +169,17 @@ export function parseFilesScalar(body: string): string[] {
 }
 
 export const WRITERS_SIDECAR = "writers.json";
+/** Per-Task recovery records; unlike status.md these are keyed by Task id. */
+export const TASK_RUNS_SIDECAR = "task_runs.json";
+
+export interface TaskRunRecord {
+  taskId: string;
+  runId: string;
+  runDir: string;
+  baseTag: string;
+  baseHead: string;
+}
+
 const WRITERS_LOCK = ".writers.lock";
 const WRITER_LOCK_STALE_MS = 30_000;
 const WRITER_LOCK_WAIT_MS = 10;
@@ -176,6 +187,10 @@ const WRITER_LOCK_TIMEOUT_MS = 30_000;
 
 function sidecarPath(dir: string): string {
   return join(dir, WRITERS_SIDECAR);
+}
+
+function taskRunsPath(dir: string): string {
+  return join(dir, TASK_RUNS_SIDECAR);
 }
 
 /**
@@ -284,6 +299,88 @@ export function readWriterSlots(dir: string): WriterSlot[] {
     });
   }
   return out;
+}
+
+/** Read per-Task recovery records. Corrupt records are ignored, never fatal. */
+export function readTaskRuns(dir: string): TaskRunRecord[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(taskRunsPath(dir), "utf-8"));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: TaskRunRecord[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const run = entry as Partial<TaskRunRecord>;
+    if (typeof run.taskId !== "string" || !run.taskId) continue;
+    out.push({
+      taskId: run.taskId,
+      runId: typeof run.runId === "string" ? run.runId : "none",
+      runDir: typeof run.runDir === "string" ? run.runDir : "none",
+      baseTag: typeof run.baseTag === "string" ? run.baseTag : "none",
+      baseHead: typeof run.baseHead === "string" ? run.baseHead : "none",
+    });
+  }
+  return out;
+}
+
+function persistTaskRunsUnlocked(dir: string, runs: TaskRunRecord[]): void {
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `${TASK_RUNS_SIDECAR}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmp, `${JSON.stringify(runs, null, "\t")}\n`, "utf-8");
+    renameSync(tmp, taskRunsPath(dir));
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+/** Atomically update the keyed Task recovery records under the writer lock. */
+export function updateTaskRuns<T>(
+  dir: string,
+  mutate: (runs: TaskRunRecord[]) => { runs: TaskRunRecord[]; result: T },
+): T {
+  return withWriterLock(dir, () => {
+    const updated = mutate(readTaskRuns(dir));
+    persistTaskRunsUnlocked(dir, updated.runs);
+    return updated.result;
+  });
+}
+
+/** Drop records for Tasks no longer in progress, retaining orphan evidence. */
+export function sweepTaskRuns(
+  dir: string,
+  inProgressTaskIds: readonly string[],
+): { runs: TaskRunRecord[]; swept: boolean } {
+  return withWriterLock(dir, () => {
+    const recorded = readTaskRuns(dir);
+    const keep = new Set(inProgressTaskIds);
+    const runs = recorded.filter((run) => keep.has(run.taskId));
+    if (runs.length !== recorded.length) persistTaskRunsUnlocked(dir, runs);
+    return { runs, swept: runs.length !== recorded.length };
+  });
+}
+
+/** Persist one Task's recovery snapshot, replacing any older attempt. */
+export function upsertTaskRun(dir: string, record: TaskRunRecord): void {
+  updateTaskRuns(dir, (runs) => ({
+    runs: [...runs.filter((run) => run.taskId !== record.taskId), record],
+    result: undefined,
+  }));
+}
+
+/** Remove one Task's recovery snapshot after its outcome is settled. */
+export function releaseTaskRun(dir: string, taskId: string): void {
+  try {
+    updateTaskRuns(dir, (runs) => ({
+      runs: runs.filter((run) => run.taskId !== taskId),
+      result: undefined,
+    }));
+  } catch {
+    /* recovery bookkeeping must never take down the settler */
+  }
 }
 
 /** Persist slots atomically (tmp + rename). The write itself is lock-protected. */
