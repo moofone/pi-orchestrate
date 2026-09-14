@@ -1728,6 +1728,22 @@ test("L5: stripApproveFences also drops a nameless /orchestrate approve fence", 
   assert.match(out.markdown, /Draft plan is ready/);
 });
 
+test("L5: unwrapJsonFences does not close on triple backticks inside a JSON string", () => {
+  const src = [
+    "```json",
+    "{",
+    '  "script": "const fence = ```;\\nreturn fence;",',
+    '  "async": true',
+    "}",
+    "```",
+    "",
+  ].join("\n");
+  const out = orch.unwrapJsonFences(src);
+  const parsed = JSON.parse(out.trim()) as { script: string; async: boolean };
+  assert.equal(parsed.script, ["const fence = ```;", "return fence;"].join("\n"));
+  assert.equal(parsed.async, true);
+});
+
 test("L5: unwrapJsonFences pretty-prints fenced JSON so Pi does not draw literal backticks", () => {
   const src = [
     "I'll launch the scouts with the exact paths you provided.",

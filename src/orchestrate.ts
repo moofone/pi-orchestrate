@@ -780,17 +780,54 @@ export function stripApproveFences(markdown: string): { markdown: string; names:
 
 /** Pi draws ```json fences as literal backticks. Unwrap and pretty-print JSON instead. */
 export function unwrapJsonFences(markdown: string): string {
-  const next = markdown.replace(
-    /[ \t]*```json[ \t]*\r?\n([\s\S]*?)[ \t]*```[ \t]*/gi,
-    (_m, body: string) => {
-      const trimmed = String(body).trim();
+  const opening = /[ \t]*```json[ \t]*\r?\n/gi;
+  const closing = /[ \t]*```[ \t]*/g;
+  let cursor = 0;
+  let next = "";
+
+  while (cursor < markdown.length) {
+    opening.lastIndex = cursor;
+    const opener = opening.exec(markdown);
+    if (!opener) {
+      next += markdown.slice(cursor);
+      break;
+    }
+
+    next += markdown.slice(cursor, opener.index);
+    const bodyStart = opening.lastIndex;
+    closing.lastIndex = bodyStart;
+    let firstFence: RegExpExecArray | undefined;
+    let parsed: unknown;
+    let parsedFence: RegExpExecArray | undefined;
+
+    let fence: RegExpExecArray | null;
+    while ((fence = closing.exec(markdown))) {
+      firstFence ??= fence;
+      const body = markdown.slice(bodyStart, fence.index).trim();
       try {
-        return JSON.stringify(JSON.parse(trimmed), null, 2);
+        parsed = JSON.parse(body);
+        parsedFence = fence;
+        break;
       } catch {
-        return trimmed;
+        // A triple backtick in a JSON string is not the closing fence.
       }
-    },
-  );
+    }
+
+    if (parsedFence) {
+      next += JSON.stringify(parsed, null, 2);
+      cursor = parsedFence.index + parsedFence[0].length;
+    } else if (firstFence) {
+      // Preserve the previous invalid-JSON behavior: strip fence chrome, but
+      // do not interpret the body as JSON.
+      next += markdown.slice(bodyStart, firstFence.index).trim();
+      cursor = firstFence.index + firstFence[0].length;
+    } else {
+      // An unterminated opener was not a fence we can safely transform.
+      next += markdown.slice(opener.index);
+      break;
+    }
+  }
+
   return next.replace(/\n{3,}/g, "\n\n");
 }
 
