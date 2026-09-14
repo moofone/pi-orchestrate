@@ -5462,6 +5462,8 @@ function structuredResult(outcome: ChildOutcome): unknown {
 export interface ChainTaskBatch {
   writeSet: string[];
   provisionalId: string | null;
+  /** True only for a genuine concurrent wave; admitted-solo keeps serial guards. */
+  wave: boolean;
 }
 
 /**
@@ -5537,44 +5539,73 @@ async function runTaskBatch(
   // is the authoritative admission at spawn time.
   liveWriterSlots(paths);
   const provisionals = new Map<string, string>();
-  for (const item of batch) {
-    const provisionalId = `task-${item.task.id}-pending`;
-    let claim: ReturnType<typeof claimWriterSlot>;
-    try {
-      claim = claimWriterSlot(
-        paths.handoffsDir,
-        {
-          runId: provisionalId,
-          runDir: "",
-          agent: "tdd-worker",
-          writeSet: item.writeSet,
-          claimedAt: Date.now(),
-          label: `Task ${item.task.id}`,
-        },
-        writerSlotIsLive,
-        WORKER_MAX_CONCURRENT,
-      );
-    } catch {
-      continue;
+  try {
+    for (const item of batch) {
+      const provisionalId = `task-${item.task.id}-pending`;
+      let claim: ReturnType<typeof claimWriterSlot>;
+      try {
+        claim = claimWriterSlot(
+          paths.handoffsDir,
+          {
+            runId: provisionalId,
+            runDir: "",
+            agent: "tdd-worker",
+            writeSet: item.writeSet,
+            claimedAt: Date.now(),
+            label: `Task ${item.task.id}`,
+          },
+          writerSlotIsLive,
+          WORKER_MAX_CONCURRENT,
+        );
+      } catch {
+        continue;
+      }
+      if (claim.ok) provisionals.set(item.task.id, provisionalId);
     }
-    if (claim.ok) provisionals.set(item.task.id, provisionalId);
+    const admitted = batch.filter((item) => provisionals.has(item.task.id));
+    if (admitted.length === 0) {
+      const nextAction = `Task wave on ${name} was not admitted: no Tasks could claim writer slots; /orchestrate resume.`;
+      upsertStatusFile(paths, {
+        phase: "blocked",
+        activeTask: "none",
+        worktree,
+        nextAction,
+        tasks: parseTasks(readText(paths.planFile)),
+      });
+      uiNotify(ctx, nextAction, "warning");
+      return false;
+    }
+    upsertStatusFile(paths, {
+      phase: "implementing",
+      activeTask: admitted.map((item) => item.task.id).join("+"),
+      worktree,
+      nextAction: `tdd-worker wave: ${admitted.map((item) => `Task ${item.task.id} (${item.writeSet.join(", ")})`).join("; ")}`,
+    });
+    uiNotify(ctx, `Task wave on ${name}: ${admitted.length} tdd-workers, disjoint paths.`, "info");
+    const wave = admitted.length >= 2;
+    const results = await Promise.all(
+      admitted.map((item) =>
+        runChainTaskOnce(pi, ctx, paths, name, worktree, item.task, plan, admitted.map((entry) => entry.task), undefined, {
+          batch: {
+            writeSet: item.writeSet,
+            provisionalId: provisionals.get(item.task.id) ?? null,
+            wave,
+          },
+        }),
+      ),
+    );
+    return results.every(Boolean);
+  } finally {
+    // A guard or spawn failure can happen before a per-task settler exists.
+    // Release every provisional here, including any run whose swap no-op'd.
+    for (const provisionalId of provisionals.values()) {
+      try {
+        releaseWriterSlot(paths.handoffsDir, provisionalId);
+      } catch {
+        /* bookkeeping */
+      }
+    }
   }
-  const admitted = batch.filter((item) => provisionals.has(item.task.id));
-  upsertStatusFile(paths, {
-    phase: "implementing",
-    activeTask: admitted.map((item) => item.task.id).join("+"),
-    worktree,
-    nextAction: `tdd-worker wave: ${admitted.map((item) => `Task ${item.task.id} (${item.writeSet.join(", ")})`).join("; ")}`,
-  });
-  uiNotify(ctx, `Task wave on ${name}: ${admitted.length} tdd-workers, disjoint paths.`, "info");
-  const results = await Promise.all(
-    admitted.map((item) =>
-      runChainTaskOnce(pi, ctx, paths, name, worktree, item.task, plan, admitted.map((entry) => entry.task), undefined, {
-        batch: { writeSet: item.writeSet, provisionalId: provisionals.get(item.task.id) ?? null },
-      }),
-    ),
-  );
-  return results.every(Boolean);
 }
 
 async function runChainTaskOnce(
@@ -5590,6 +5621,7 @@ async function runChainTaskOnce(
   opts: { batch?: ChainTaskBatch } = {},
 ): Promise<boolean> {
   const statusNow = readText(paths.statusFile);
+  const wave = opts.batch?.wave === true;
   const blockedByReview = writerBlockedByPlanReview(statusNow);
   if (blockedByReview || needsPlanReview(plan, statusNow)) {
     uiNotify(
@@ -5627,7 +5659,7 @@ async function runChainTaskOnce(
   // message. Stop instead (F11). Skipped inside a batch wave: siblings'
   // uncommitted work is expected there, and the scoped gate commits only
   // this Task's own paths.
-  const dirtyFirst = opts.batch
+  const dirtyFirst = wave
     ? undefined
     : firstTaskBlockedByDirtyTree(tasks, await porcelainStatus(pi, writerCwd));
   if (dirtyFirst) {
@@ -5711,13 +5743,32 @@ async function runChainTaskOnce(
   // so code commits it here or the Task blocks. Committing also changes
   // HEAD, which is what makes the fingerprint below evidence of a *land*
   // rather than of an unstaged edit.
-  const gate = await ensureWriterCommit(
+  let gate = await ensureWriterCommit(
     pi,
     writerCwd,
     `Task ${task.id} — ${task.title}`,
     process.platform,
     scope?.length ? scope : undefined,
   );
+  // A scoped admitted-solo Task has no sibling to leave ownership of
+  // out-of-scope edits. Waves intentionally keep the scoped-only gate, but a
+  // solo writer must block rather than silently strand another path.
+  if (!wave && scope?.length && gate.state !== "dirty") {
+    const afterGate = await porcelainStatus(pi, writerCwd);
+    if (afterGate === undefined) {
+      gate = { state: "dirty", reason: "could not verify paths outside the Task scope" };
+    } else {
+      const outside = actionablePorcelain(afterGate, process.platform)
+        .split("\n")
+        .filter((line) => line.trim())
+        .filter((line) => porcelainEntryPaths(line).some(
+          (path) => !writeSetsOverlap(scope, [path]),
+        ));
+      if (outside.length > 0) {
+        gate = { state: "dirty", reason: "unassigned paths remain dirty after the Task gate" };
+      }
+    }
+  }
   if (gate.state === "dirty") {
     await updatePlanFile(paths, (freshPlan) =>
       setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "blocked"), task.id, handoff),
@@ -5878,10 +5929,17 @@ async function runChainTaskOnce(
   return true;
   } finally {
     if (opts.batch) {
-      try {
-        releaseWriterSlot(paths.handoffsDir, settledId ?? opts.batch.provisionalId ?? "");
-      } catch {
-        /* bookkeeping */
+      const releaseIds = new Set(
+        [opts.batch.provisionalId, settledId].filter(
+          (runId): runId is string => Boolean(runId),
+        ),
+      );
+      for (const runId of releaseIds) {
+        try {
+          releaseWriterSlot(paths.handoffsDir, runId);
+        } catch {
+          /* bookkeeping */
+        }
       }
     }
   }
@@ -5923,7 +5981,8 @@ async function runFeatureChain(
     if (task) {
       // Shared-tree wave: pending Tasks with declared, pairwise-disjoint
       // `- Files:` scopes run together (up to 8). Anything smaller — or any
-      // Task without a scope — keeps the serial path below, unchanged.
+      // Task without a scope — keeps the admitted-solo path below, including
+      // its dirty-tree and unassigned-dirt guards.
       if (!inFlight) {
         const batch = selectTaskBatch(plan, tasks, liveWriterSlots(paths));
         if (batch) {
@@ -5977,7 +6036,7 @@ async function runFeatureChain(
           plan,
           tasks,
           inFlight,
-          { batch: { writeSet: serialWriteSet, provisionalId: serialProvisionalId } },
+          { batch: { writeSet: serialWriteSet, provisionalId: serialProvisionalId, wave: false } },
         ))) return;
       } finally {
         // runChainTaskOnce releases after its commit gate; this outer release

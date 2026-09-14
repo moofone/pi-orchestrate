@@ -9,13 +9,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
 
 const RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
 const ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+const ORCH_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/orchestrate.ts");
 
 function makeFakePi(exec?: (cmd: string, args: string[]) => Promise<unknown>) {
   const handlers = new Map<string, Set<(data: unknown) => void>>();
@@ -193,6 +195,46 @@ test("shared-tree: selectTaskBatch returns null below two qualifiers", () => {
   const plan = "### Task 1 — a\n- Status: pending\n- Files: src/a.ts\n";
   const tasks = [{ id: "1", title: "a", status: "pending" }];
   assert.equal(orch.selectTaskBatch(plan, tasks, []), null);
+});
+
+test("shared-tree: serial admitted-solo keeps the F11 dirty-tree guard", () => {
+  const source = readFileSync(ORCH_SRC, "utf8");
+  const once = source.slice(
+    source.indexOf("async function runChainTaskOnce"),
+    source.indexOf("\nasync function runFeatureChain"),
+  );
+  assert.match(once, /const wave = opts\.batch\?\.wave === true/);
+  assert.match(
+    once,
+    /const dirtyFirst = wave\s*\?\s*undefined\s*:\s*firstTaskBlockedByDirtyTree/,
+    "only a genuine wave may skip the pre-existing dirty-tree stop",
+  );
+  const serial = source.slice(source.indexOf("const serialWriteSet"));
+  assert.match(serial, /provisionalId: serialProvisionalId, wave: false/);
+});
+
+test("shared-tree: an empty admission blocks instead of reporting a successful wave", () => {
+  const source = readFileSync(ORCH_SRC, "utf8");
+  const start = source.indexOf("async function runTaskBatch");
+  const end = source.indexOf("\nasync function runChainTaskOnce", start);
+  const batch = source.slice(start, end);
+  const empty = batch.indexOf("if (admitted.length === 0)");
+  const spawn = batch.indexOf("Promise.all", empty);
+  assert.ok(empty >= 0, "runTaskBatch must handle no authoritative admissions");
+  assert.ok(spawn > empty, "the empty-admission branch must precede spawning");
+  assert.match(batch.slice(empty, spawn), /phase: "blocked"/);
+  assert.match(batch.slice(empty, spawn), /return false/);
+});
+
+test("shared-tree: task settlement releases both provisional and settled slot ids", () => {
+  const source = readFileSync(ORCH_SRC, "utf8");
+  const start = source.indexOf("async function runChainTaskOnce");
+  const end = source.indexOf("\nasync function runFeatureChain", start);
+  const once = source.slice(start, end);
+  const cleanup = once.slice(once.lastIndexOf("} finally"));
+  assert.match(cleanup, /opts\.batch\.provisionalId/);
+  assert.match(cleanup, /settledId/);
+  assert.match(cleanup, /for \(const runId of releaseIds\)/);
 });
 
 test("shared-tree: updatePlanFile keeps concurrent Task settlements", async () => {
