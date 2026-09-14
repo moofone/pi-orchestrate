@@ -4655,13 +4655,18 @@ export function planFixLanes(
   return lanes;
 }
 
-interface FixLaneResult {
+export interface FixLaneResult {
   key: string;
   handoff: string;
   outcome: ChildOutcome;
 }
 
-async function runFixLane(
+export interface FixLaneDeps {
+  runChildInPhase: typeof runChildInPhase;
+  ensureWriterCommit: typeof ensureWriterCommit;
+}
+
+export async function runFixLane(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   paths: Paths,
@@ -4671,12 +4676,21 @@ async function runFixLane(
   spawn: number,
   lane: FixLane,
   provisionalId: string | null,
+  deps: Partial<FixLaneDeps> = {},
 ): Promise<FixLaneResult> {
+  const runLaneChild = deps.runChildInPhase ?? runChildInPhase;
+  const closeLaneGate = deps.ensureWriterCommit ?? ensureWriterCommit;
   let settledId: string | null = null;
-  let outcome: ChildOutcome;
-  let gate: Awaited<ReturnType<typeof ensureWriterCommit>>;
+  // A spawn or commit-gate failure must become lane data, not escape after the
+  // finally releases the reservation. Initializing both values also keeps the
+  // failure path valid when neither awaited operation reaches its assignment.
+  let outcome: ChildOutcome = { ok: false, reason: "fixer lane did not settle" };
+  let gate: Awaited<ReturnType<typeof ensureWriterCommit>> = {
+    state: "dirty",
+    reason: "fixer lane did not reach its commit gate",
+  };
   try {
-    outcome = await runChildInPhase(
+    outcome = await runLaneChild(
       pi,
       ctx,
       "implement",
@@ -4693,13 +4707,17 @@ async function runFixLane(
     );
     // Keep the slot live through the scoped gate: another resume must not start
     // overlapping work while this lane is still staging and committing.
-    gate = await ensureWriterCommit(
+    gate = await closeLaneGate(
       pi,
       worktree,
       `fix: review round ${spawn} (${lane.key})`,
       process.platform,
       lane.writeSet.length > 0 ? lane.writeSet : undefined,
     );
+  } catch (error) {
+    const reason = String(error);
+    outcome = { ok: false, reason };
+    gate = { state: "dirty", reason };
   } finally {
     const releaseIds = new Set(
       [provisionalId, settledId].filter(
@@ -5605,7 +5623,7 @@ export function selectTaskBatch(
     if (task.status !== "pending") continue;
     const writeSet = parseFilesScalar(taskSection(plan, task.id));
     if (writeSet.length === 0) continue;
-    if (!admitWriteSlot(claimed, { writeSet }, cap).ok) continue;
+    if (!admitWriteSlot(claimed, { agent: "tdd-worker", writeSet }, cap).ok) continue;
     claimed.push({ runId: `pending-${task.id}`, runDir: "", agent: "tdd-worker", writeSet, claimedAt: 0 });
     batch.push({ task, writeSet });
   }
@@ -5846,7 +5864,12 @@ async function runChainTaskOnce(
     workerRunDir: "none",
   });
   let settledId: string | null = null;
-  let outcome: ChildOutcome;
+  try {
+  // Keep transport and commit-gate failures as a failed Task outcome. In
+  // particular, do not let a thrown child escape after the slot finally has
+  // released the reservation while the plan still says in_progress.
+  let outcome: ChildOutcome = { ok: false, reason: "Task worker did not settle" };
+  let childError: unknown;
   try {
     outcome = await runChildInPhase(
       pi,
@@ -5865,7 +5888,11 @@ async function runChainTaskOnce(
         upsertStatusFile(paths, { workerRunId: runId, workerRunDir: asyncRunDir(runId) });
       },
     );
-    const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
+  } catch (error) {
+    childError = error;
+    outcome = { ok: false, reason: String(error) };
+  }
+  const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
   // A child this extension stopped (`/orchestrate pause now`) is not a
   // failed Task. Leaving it `blocked` would make `/orchestrate resume`
   // hit the blocked guard above and refuse forever.
@@ -5893,13 +5920,23 @@ async function runChainTaskOnce(
   // so code commits it here or the Task blocks. Committing also changes
   // HEAD, which is what makes the fingerprint below evidence of a *land*
   // rather than of an unstaged edit.
-  let gate = await ensureWriterCommit(
-    pi,
-    writerCwd,
-    `Task ${task.id} — ${task.title}`,
-    process.platform,
-    scope?.length ? scope : undefined,
-  );
+  let gate: Awaited<ReturnType<typeof ensureWriterCommit>> = childError
+    ? { state: "dirty", reason: outcome.reason ?? String(childError) }
+    : { state: "dirty", reason: "Task did not reach its commit gate" };
+  if (!childError) {
+    try {
+      gate = await ensureWriterCommit(
+        pi,
+        writerCwd,
+        `Task ${task.id} — ${task.title}`,
+        process.platform,
+        scope?.length ? scope : undefined,
+      );
+    } catch (error) {
+      outcome = { ok: false, reason: String(error) };
+      gate = { state: "dirty", reason: String(error) };
+    }
+  }
   // A scoped admitted-solo Task has no sibling to leave ownership of
   // out-of-scope edits. Waves intentionally keep the scoped-only gate, but a
   // solo writer must block rather than silently strand another path.

@@ -94,13 +94,19 @@ export type AdmitRefusal = "cap" | "overlap";
 /**
  * Pure admission: cap first (cheap, stable reason), then overlap against
  * every live slot. Empty candidate or empty live sets overlap by definition.
+ *
+ * Capacity is per agent class. The sidecar is shared by fixers and
+ * tdd-workers, so counting every slot against the candidate's cap would let
+ * one class starve the other even when their write-sets are disjoint.
  */
 export function admitWriteSlot(
   live: readonly WriterSlot[],
-  candidate: Pick<WriterSlot, "writeSet">,
+  candidate: Pick<WriterSlot, "writeSet"> & Partial<Pick<WriterSlot, "agent">>,
   cap: number,
 ): { ok: true } | { ok: false; reason: AdmitRefusal; conflictsWith?: string } {
-  if (live.length >= cap) return { ok: false, reason: "cap" };
+  const agent = candidate.agent?.trim() || "default";
+  const counted = live.filter((slot) => (slot.agent.trim() || "default") === agent);
+  if (counted.length >= cap) return { ok: false, reason: "cap" };
   for (const slot of live) {
     if (writeSetsOverlap(slot.writeSet, candidate.writeSet)) {
       return { ok: false, reason: "overlap", conflictsWith: slot.runId };

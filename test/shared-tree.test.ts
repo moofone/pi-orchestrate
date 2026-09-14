@@ -416,6 +416,64 @@ test("shared-tree: terminal snapshot does not release an unreleased writer slot"
   assert.equal(swept.swept, false, "only explicit release may free a terminal writer slot");
 });
 
+test("shared-tree: throwing fixer spawn or gate returns failure and releases its slot", async () => {
+  const { dir, paths } = prFixture(0);
+  const pi = makeFakePi();
+  const ctx = { ui: { notify: () => {} }, isIdle: () => true } as never;
+  const lane = {
+    key: "src/pay.ts",
+    writeSet: ["src/pay.ts"],
+    findingsText: "brief_finding path=src/pay.ts sev=P1 title=overflow",
+    handoff: join(paths.handoffsDir, "lane.md"),
+  };
+  const cases = [
+    {
+      label: "spawn",
+      runChildInPhase: async () => { throw new Error("test spawn failure"); },
+      ensureWriterCommit: async () => { throw new Error("test gate failure"); },
+      reason: "test spawn failure",
+    },
+    {
+      label: "gate",
+      runChildInPhase: async () => ({ ok: true as const }),
+      ensureWriterCommit: async () => { throw new Error("test gate failure"); },
+      reason: "test gate failure",
+    },
+  ];
+  for (const [index, failure] of cases.entries()) {
+    const provisionalId = `lane-${failure.label}-pending`;
+    updateWriterSlots(paths.handoffsDir, () => true, () => ({
+      slots: [{
+        runId: provisionalId,
+        runDir: "",
+        agent: "fixer",
+        writeSet: lane.writeSet,
+        claimedAt: Date.now(),
+      }],
+      result: undefined,
+    }));
+    let settled: Awaited<ReturnType<typeof orch.runFixLane>> | undefined;
+    await assert.doesNotReject(async () => {
+      settled = await orch.runFixLane(
+        pi as never,
+        ctx,
+        paths as never,
+        "99",
+        dir,
+        { next: "read_comments_and_fix", output: lane.findingsText, round: "3" },
+        index + 1,
+        lane,
+        provisionalId,
+        failure,
+      );
+    });
+    assert.ok(settled, `${failure.label} lane must return a result`);
+    assert.equal(settled.outcome.ok, false, `${failure.label} failure must be recorded as failed`);
+    assert.match(settled.outcome.reason ?? "", new RegExp(failure.reason));
+    assert.deepEqual(readWriterSlots(paths.handoffsDir), [], `${failure.label} failure must release its slot`);
+  }
+});
+
 test("shared-tree: one verdict with two paths dispatches two fixers, one pr-await", async () => {
   const { dir, paths } = prFixture(0);
   const execs: string[] = [];

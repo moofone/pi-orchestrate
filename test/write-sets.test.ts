@@ -80,9 +80,33 @@ test("write-sets: admitWriteSlot refuses overlap and cap, unknown runs solo", ()
   assert.equal(admitWriteSlot(unknownLive, { writeSet: ["src/z.ts"] }, 4).ok, false);
   // Cap binds before overlap is even consulted.
   const full = [slot({ runId: "1" }), slot({ runId: "2" }), slot({ runId: "3" }), slot({ runId: "4" })];
-  const capped = admitWriteSlot(full, { writeSet: ["other/x.ts"] }, 4);
+  const capped = admitWriteSlot(full, { agent: "fixer", writeSet: ["other/x.ts"] }, 4);
   assert.equal(capped.ok, false);
   if (!capped.ok) assert.equal(capped.reason, "cap");
+});
+
+test("write-sets: admission caps are per agent and disjoint classes cannot starve each other", () => {
+  const fixers = Array.from({ length: 4 }, (_, i) => slot({
+    runId: `fixer-${i}`,
+    agent: "fixer",
+    writeSet: [`src/fixer-${i}.ts`],
+  }));
+  const workers = Array.from({ length: 8 }, (_, i) => slot({
+    runId: `worker-${i}`,
+    agent: "tdd-worker",
+    writeSet: [`src/worker-${i}.ts`],
+  }));
+
+  assert.deepEqual(
+    admitWriteSlot(fixers, { agent: "tdd-worker", writeSet: ["src/new-worker.ts"] }, 8),
+    { ok: true },
+    "four live fixers must not consume the tdd-worker capacity",
+  );
+  assert.deepEqual(
+    admitWriteSlot(workers, { agent: "fixer", writeSet: ["src/new-fixer.ts"] }, 4),
+    { ok: true },
+    "eight live tdd-workers must not consume the fixer capacity",
+  );
 });
 
 test("write-sets: groupFindingsByPath also reads already-parsed findings", () => {
