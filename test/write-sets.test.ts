@@ -6,9 +6,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   admitWriteSlot,
@@ -21,6 +23,7 @@ import {
   readWriterSlots,
   releaseWriterSlot,
   sweepWriterSlots,
+  updateWriterSlots,
   type WriterSlot,
 } from "../src/lib/write-sets.ts";
 
@@ -140,3 +143,72 @@ test("write-sets: sidecar claim/sweep/release round-trips on disk", () => {
   releaseWriterSlot(dir, "run-2");
   assert.deepEqual(readWriterSlots(dir), []);
 });
+
+const WRITE_SETS_URL = pathToFileURL(join(process.cwd(), "src/lib/write-sets.ts")).href;
+
+function sidecarChild(script: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "-e", script, ...args],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`sidecar child exited ${code}: ${stderr}`));
+    });
+  });
+}
+
+test("write-sets: concurrent claims admit no overlapping duplicate", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "writers-race-"));
+  const script = `
+    import { claimWriterSlot } from ${JSON.stringify(WRITE_SETS_URL)};
+    const [dir, runId] = process.argv.slice(1);
+    const result = claimWriterSlot(dir, {
+      runId, runDir: '', agent: 'fixer', writeSet: ['src/race.ts'], claimedAt: Date.now()
+    }, () => true, 4);
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const results = await Promise.all(
+    Array.from({ length: 8 }, (_, i) => sidecarChild(script, [dir, `race-${i}`])),
+  );
+  const admittedIds = results
+    .map((result) => JSON.parse(result) as { ok?: boolean })
+    .filter((result) => result.ok === true);
+  assert.equal(admittedIds.length, 1, "the lock must serialize read/compute/persist claims");
+  assert.equal(readWriterSlots(dir).length, 1, "only one overlapping claim may be persisted");
+});
+
+test("write-sets: concurrent swap and release preserve the sibling slot", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "writers-swap-race-"));
+  persistWriterSlotsForTest(dir, [
+    slot({ runId: "provisional", writeSet: ["src/a.ts"] }),
+    slot({ runId: "sibling", writeSet: ["src/b.ts"] }),
+  ]);
+  const script = `
+    import { updateWriterSlots } from ${JSON.stringify(WRITE_SETS_URL)};
+    const [dir, operation] = process.argv.slice(1);
+    updateWriterSlots(dir, () => true, (slots) => {
+      if (operation === 'swap') {
+        const old = slots.find((entry) => entry.runId === 'provisional');
+        return { slots: [...slots.filter((entry) => entry.runId !== 'provisional'), {
+          ...(old ?? { runDir: '', agent: 'fixer', writeSet: ['src/a.ts'], claimedAt: Date.now() }),
+          runId: 'real'
+        }], result: undefined };
+      }
+      return { slots: slots.filter((entry) => entry.runId !== 'sibling'), result: undefined };
+    });
+  `;
+  await Promise.all([sidecarChild(script, [dir, "swap"]), sidecarChild(script, [dir, "release"])]);
+  assert.deepEqual(readWriterSlots(dir).map((entry) => entry.runId).sort(), ["real"]);
+});
+
+function persistWriterSlotsForTest(dir: string, slots: WriterSlot[]): void {
+  updateWriterSlots(dir, () => true, () => ({ slots, result: undefined }));
+}

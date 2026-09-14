@@ -17,7 +17,17 @@
  * Run: node --experimental-strip-types --test test/write-sets.test.ts
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 /** Max concurrent fixers sharing one worktree (disjoint write-sets). */
@@ -159,9 +169,93 @@ export function parseFilesScalar(body: string): string[] {
 }
 
 export const WRITERS_SIDECAR = "writers.json";
+const WRITERS_LOCK = ".writers.lock";
+const WRITER_LOCK_STALE_MS = 30_000;
+const WRITER_LOCK_WAIT_MS = 10;
+const WRITER_LOCK_TIMEOUT_MS = 30_000;
 
 function sidecarPath(dir: string): string {
   return join(dir, WRITERS_SIDECAR);
+}
+
+/**
+ * Cross-process advisory lock for the sidecar. Node has no portable flock
+ * binding, so the lock is an atomic exclusive-create lockfile with an owner
+ * record: creation is the acquisition operation, and a dead owner can never
+ * strand the sidecar. The callback stays inside the lock for the complete
+ * read/sweep/compute/persist transaction.
+ */
+function waitSync(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function staleWriterLock(lockPath: string): boolean {
+  let owner: { pid?: unknown } = {};
+  try {
+    owner = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown };
+  } catch {
+    // An owner record may not have made it to disk before a process died.
+  }
+  const pid = typeof owner.pid === "number" ? owner.pid : 0;
+  if (pid > 0) return !processIsAlive(pid);
+  try {
+    return Date.now() - statSync(lockPath).mtimeMs >= WRITER_LOCK_STALE_MS;
+  } catch {
+    return true;
+  }
+}
+
+function acquireWriterLock(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const lockPath = join(dir, WRITERS_LOCK);
+  const deadline = Date.now() + WRITER_LOCK_TIMEOUT_MS;
+  for (;;) {
+    let fd: number | undefined;
+    try {
+      fd = openSync(lockPath, "wx", 0o600);
+      writeFileSync(
+        fd,
+        `${JSON.stringify({ pid: process.pid, token: randomUUID() })}\n`,
+        "utf8",
+      );
+      closeSync(fd);
+      return lockPath;
+    } catch (error) {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* incomplete owner record */ }
+        rmSync(lockPath, { force: true });
+        throw error;
+      }
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (staleWriterLock(lockPath)) {
+        rmSync(lockPath, { force: true });
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`timed out waiting for ${WRITERS_LOCK}`);
+      }
+      waitSync(WRITER_LOCK_WAIT_MS);
+    }
+  }
+}
+
+function withWriterLock<T>(dir: string, action: () => T): T {
+  const lockPath = acquireWriterLock(dir);
+  try {
+    return action();
+  } finally {
+    rmSync(lockPath, { recursive: true, force: true });
+  }
 }
 
 /** Read recorded slots. Unreadable/corrupt sidecar reads as empty, never throws. */
@@ -192,22 +286,23 @@ export function readWriterSlots(dir: string): WriterSlot[] {
   return out;
 }
 
-/** Persist slots atomically (tmp + rename). Exported for sweep-and-persist callers. */
+/** Persist slots atomically (tmp + rename). The write itself is lock-protected. */
 export function persistWriterSlots(dir: string, slots: WriterSlot[]): void {
-  mkdirSync(dir, { recursive: true });
-  const tmp = join(dir, `${WRITERS_SIDECAR}.${process.pid}.tmp`);
-  writeFileSync(tmp, `${JSON.stringify(slots, null, "\t")}\n`, "utf-8");
-  renameSync(tmp, sidecarPath(dir));
-}
-function writeWriterSlots(dir: string, slots: WriterSlot[]): void {
-  persistWriterSlots(dir, slots);
+  withWriterLock(dir, () => persistWriterSlotsUnlocked(dir, slots));
 }
 
-/**
- * Drop slots whose runs are terminal. Returns the live set and whether
- * anything was swept (callers persist only when swept to avoid chatter).
- */
-export function sweepWriterSlots(
+function persistWriterSlotsUnlocked(dir: string, slots: WriterSlot[]): void {
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `${WRITERS_SIDECAR}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmp, `${JSON.stringify(slots, null, "\t")}\n`, "utf-8");
+    renameSync(tmp, sidecarPath(dir));
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function sweepWriterSlotsUnlocked(
   dir: string,
   isLive: (runDir: string, runId: string, slot?: WriterSlot) => boolean,
 ): { slots: WriterSlot[]; swept: boolean } {
@@ -222,6 +317,39 @@ export function sweepWriterSlots(
   return { slots: live, swept: live.length !== recorded.length };
 }
 
+/**
+ * Drop slots whose runs are terminal. Sweeping and its persistence happen
+ * under one lock, so this is safe to use before another read-modify-write.
+ */
+export function sweepWriterSlots(
+  dir: string,
+  isLive: (runDir: string, runId: string, slot?: WriterSlot) => boolean,
+): { slots: WriterSlot[]; swept: boolean } {
+  return withWriterLock(dir, () => {
+    const result = sweepWriterSlotsUnlocked(dir, isLive);
+    if (result.swept) persistWriterSlotsUnlocked(dir, result.slots);
+    return result;
+  });
+}
+
+/**
+ * Run one arbitrary sidecar mutation while holding the same lock as claims,
+ * swaps, releases, and sweeps. Callers receive a freshly swept snapshot and
+ * must return the replacement slots together with their result.
+ */
+export function updateWriterSlots<T>(
+  dir: string,
+  isLive: (runDir: string, runId: string, slot?: WriterSlot) => boolean,
+  mutate: (slots: WriterSlot[]) => { slots: WriterSlot[]; result: T },
+): T {
+  return withWriterLock(dir, () => {
+    const swept = sweepWriterSlotsUnlocked(dir, isLive);
+    const updated = mutate(swept.slots);
+    persistWriterSlotsUnlocked(dir, updated.slots);
+    return updated.result;
+  });
+}
+
 /** Sweep, admit, and persist one claim. Admission reason doubles as the refuse notice. */
 export function claimWriterSlot(
   dir: string,
@@ -229,21 +357,25 @@ export function claimWriterSlot(
   isLive: (runDir: string, runId: string, slot?: WriterSlot) => boolean,
   cap: number,
 ): { ok: true } | { ok: false; reason: AdmitRefusal; conflictsWith?: string } {
-  const { slots } = sweepWriterSlots(dir, isLive);
-  const admitted = admitWriteSlot(slots, slot, cap);
-  if (!admitted.ok) {
-    if (slots.length !== readWriterSlots(dir).length) writeWriterSlots(dir, slots);
+  return withWriterLock(dir, () => {
+    const swept = sweepWriterSlotsUnlocked(dir, isLive);
+    const admitted = admitWriteSlot(swept.slots, slot, cap);
+    if (admitted.ok) {
+      persistWriterSlotsUnlocked(dir, [...swept.slots, slot]);
+    } else if (swept.swept) {
+      persistWriterSlotsUnlocked(dir, swept.slots);
+    }
     return admitted;
-  }
-  writeWriterSlots(dir, [...slots, slot]);
-  return { ok: true };
+  });
 }
 
 /** Release one run's slot. Missing sidecar or missing run still resolves. */
 export function releaseWriterSlot(dir: string, runId: string): void {
-  const slots = readWriterSlots(dir).filter((slot) => slot.runId !== runId);
   try {
-    writeWriterSlots(dir, slots);
+    updateWriterSlots(dir, () => true, (slots) => ({
+      slots: slots.filter((slot) => slot.runId !== runId),
+      result: undefined,
+    }));
   } catch {
     /* bookkeeping must never take down the settler */
   }

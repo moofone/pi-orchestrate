@@ -6016,6 +6016,28 @@ test("P3 F11: an already-clean tree runs no commit at all", async () => {
   );
 });
 
+test("P3 F11: an empty scope uses the whole-tree commit gate", async () => {
+  let dirty = " M src/a.ts";
+  const calls: string[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    const a = args ?? [];
+    calls.push([cmd, ...a].join(" "));
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "add") {
+      assert.deepEqual(a, ["add", "-A"], "empty scope must retain the old whole-tree add");
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "commit") {
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x", "linux", []);
+  assert.equal(gate.state, "committed");
+  assert.ok(calls.some((call) => call === "git add -A"));
+});
+
 test("P3 F11: git that cannot answer is inconclusive, never a silent land", async () => {
   const pi = makeFakePi(async () => ({ code: 128, stdout: "", stderr: "not a git repository" }));
   const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
