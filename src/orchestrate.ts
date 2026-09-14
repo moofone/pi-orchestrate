@@ -4610,10 +4610,13 @@ const WRITER_SLOT_WAIT_TIMEOUT_MS = WRITER_SLOT_TTL_MS;
 const WRITER_SLOT_POLL_MS = 250;
 
 /** Live writer slots for this Feature, swept and persisted. See write-sets.ts. */
-function liveWriterSlots(paths: Paths): WriterSlot[] {
+async function liveWriterSlots(paths: Paths): Promise<WriterSlot[]> {
+  // sweepWriterSlots may queue behind an in-process async holder; await the
+  // sync-compatible wrapper before reading its snapshot.
+  const swept = await sweepWriterSlots(paths.handoffsDir, writerSlotIsLive);
   // sweepWriterSlots performs the read/filter/persist transaction under the
   // sidecar lock; do not persist its snapshot separately.
-  return sweepWriterSlots(paths.handoffsDir, writerSlotIsLive).slots;
+  return swept.slots;
 }
 
 export function writerSlotIsLive(_runDir: string, _runId: string, slot?: WriterSlot): boolean {

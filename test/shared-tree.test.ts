@@ -14,7 +14,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
-import { readWriterSlots, sweepWriterSlots, updateWriterSlots } from "../src/lib/write-sets.ts";
+import {
+  readWriterSlots,
+  sweepWriterSlots,
+  updateWriterSlots,
+  withWriterLockAsync,
+} from "../src/lib/write-sets.ts";
 
 const RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 const RPC_REPLY_PREFIX = "subagents:rpc:v1:reply:";
@@ -362,6 +367,31 @@ test("shared-tree: updatePlanFile keeps concurrent Task settlements", async () =
   const text = readFileSync(paths.planFile, "utf8");
   assert.match(text, /Task 1[\s\S]*- Status: done/);
   assert.match(text, /Task 2[\s\S]*- Status: done/);
+});
+
+test("shared-tree: live writer sweep awaits a queued sidecar transaction", async () => {
+  const { dir, paths } = prFixture(0);
+  const ready = join(dir, "writer-lock-ready");
+  const holder = withWriterLockAsync(paths.handoffsDir, async () => {
+    writeFileSync(ready, "held");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+  for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(existsSync(ready), true, "the async sidecar holder must acquire first");
+  const pi = makeFakePi();
+  const ctx = { ui: { notify: () => {} }, isIdle: () => true } as never;
+  const dispatch = (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+    pi,
+    ctx,
+    paths,
+    "99",
+    dir,
+    { next: "yield", output: "" },
+  );
+  await assert.doesNotReject(async () => dispatch);
+  await holder;
 });
 
 test("shared-tree: updatePlanFile serializes contending processes under the sidecar lock", async () => {
