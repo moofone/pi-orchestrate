@@ -296,7 +296,7 @@ async function acquireWriterLockAsync(dir: string): Promise<string> {
   }
 }
 
-/** Hold the same sidecar lock across an asynchronous writer operation. */
+/** Run one asynchronous sidecar transaction under the cross-process lock. */
 export async function withWriterLockAsync<T>(dir: string, action: () => Promise<T>): Promise<T> {
   const requested = writerLockPath(dir);
   if (HELD_WRITER_LOCKS.has(requested)) return action();
@@ -452,8 +452,8 @@ function sweepWriterSlotsUnlocked(
 }
 
 /**
- * Drop slots whose runs are terminal. Sweeping and its persistence happen
- * under one lock, so this is safe to use before another read-modify-write.
+ * Drop expired reservations. Sweeping and its persistence happen under one
+ * lock, so this is safe to use before another read-modify-write.
  */
 export function sweepWriterSlots(
   dir: string,

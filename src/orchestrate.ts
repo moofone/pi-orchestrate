@@ -3649,7 +3649,6 @@ export async function ensureWriterCommit(
   message: string,
   platform: NodeJS.Platform = process.platform,
   onlyPaths?: readonly string[],
-  writerLockDir?: string,
 ): Promise<{ state: CommitGateState; reason: string }> {
   // Scoped gate for shared-tree waves: commit ONLY the writer's assigned
   // paths. A tree-wide `git add -A` here would sweep a sibling writer's
@@ -3709,9 +3708,11 @@ export async function ensureWriterCommit(
     }
     return { state: "committed", reason: "" };
   };
-  return withWriterCommitLock(() =>
-    writerLockDir ? withWriterLockAsync(writerLockDir, gate) : gate(),
-  );
+  // The slot reservation, not the sidecar lock, protects this writer while
+  // git stages and commits. The sidecar lock is only for short metadata
+  // transactions; holding it across porcelain/add/commit would block other
+  // processes for longer than their lock budget.
+  return withWriterCommitLock(gate);
 }
 
 /**
@@ -4518,9 +4519,16 @@ export async function recordFeatureDisagreement(
   );
 }
 
-/** Fresh provisional claims remain live while the child run id is being assigned. */
-const PROVISIONAL_WRITER_SLOT_TTL_MS = 15 * 60_000;
-/** Deferred lanes poll snapshots rather than bypassing writer admission. */
+/**
+ * A slot is a reservation, not a snapshot liveness hint. Keep it through the
+ * child's commit gate and only free it on explicit release. A crashed session
+ * eventually becomes reclaimable after the child timeout plus a small gate
+ * allowance, rather than being swept as soon as its snapshot turns terminal.
+ */
+const WRITER_SLOT_TTL_MS = CHILD_TIMEOUT_MS + 5 * 60_000;
+/** A waiting lane covers the full child plus commit-gate reservation window. */
+const WRITER_SLOT_WAIT_TIMEOUT_MS = WRITER_SLOT_TTL_MS;
+/** Deferred lanes poll reservations rather than bypassing writer admission. */
 const WRITER_SLOT_POLL_MS = 250;
 
 /** Live writer slots for this Feature, swept and persisted. See write-sets.ts. */
@@ -4530,25 +4538,12 @@ function liveWriterSlots(paths: Paths): WriterSlot[] {
   return sweepWriterSlots(paths.handoffsDir, writerSlotIsLive).slots;
 }
 
-export function writerSlotIsLive(runDir: string, runId: string, slot?: WriterSlot): boolean {
-  // A pre-claim has no snapshot yet. Keep it live for a bounded window so a
-  // replacement session cannot sweep it and admit an overlapping writer.
-  if (!runDir && runId.endsWith("-pending")) {
-    const age = Date.now() - (slot?.claimedAt ?? 0);
-    return Number.isFinite(age) && age >= 0 && age < PROVISIONAL_WRITER_SLOT_TTL_MS;
-  }
-  const dir = runDir && !isPendingToken(runDir) ? runDir : asyncRunDir(runId);
-  try {
-    const snapshot = readRunSnapshot(dir);
-    // A swapped slot is live until its run writes a terminal snapshot. A
-    // missing or unreadable snapshot is still live inside the claim TTL: the
-    // run may be between spawn and its first status.json write.
-    if (snapshot) return !snapshot.terminal;
-  } catch {
-    // The TTL below is the outer backstop for an unreadable run artifact.
-  }
+export function writerSlotIsLive(_runDir: string, _runId: string, slot?: WriterSlot): boolean {
+  // Snapshot state is deliberately ignored: the reservation remains live
+  // while the child settles and ensureWriterCommit closes the gate. Only the
+  // age backstop handles a process that crashed before explicit release.
   const age = Date.now() - (slot?.claimedAt ?? 0);
-  return Number.isFinite(age) && age >= 0 && age < PROVISIONAL_WRITER_SLOT_TTL_MS;
+  return Number.isFinite(age) && age >= 0 && age < WRITER_SLOT_TTL_MS;
 }
 
 /** Swap a pre-claimed provisional slot for the real run id (construction already admitted it). */
@@ -4704,7 +4699,6 @@ async function runFixLane(
       `fix: review round ${spawn} (${lane.key})`,
       process.platform,
       lane.writeSet.length > 0 ? lane.writeSet : undefined,
-      paths.handoffsDir,
     );
   } finally {
     const releaseIds = new Set(
@@ -4741,11 +4735,11 @@ async function claimFixerLane(
   wait: boolean,
   notify?: (message: string) => void,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const deadline = Date.now() + CHILD_TIMEOUT_MS;
+  const deadline = Date.now() + WRITER_SLOT_WAIT_TIMEOUT_MS;
   let noticeSent = false;
   for (;;) {
-    // This sweep is also the snapshot poll: terminal run artifacts are
-    // removed before the atomic claim attempts admission.
+    // Sweep only expires old reservations; terminal snapshots do not release
+    // a slot while the child may still be closing its commit gate.
     try {
       liveWriterSlots(paths);
     } catch (error) {
@@ -4937,7 +4931,6 @@ async function runReviewFixWriter(
     `fix: review round ${spawn}`,
     process.platform,
     roundPaths,
-    paths.handoffsDir,
   );
   const afterGate = await porcelainStatus(pi, worktree);
   if (afterGate === undefined) {
@@ -5538,20 +5531,23 @@ export interface ChainTaskBatch {
 
 /**
  * Serializes plan.md read-modify-write across concurrent same-tree writers so
- * two Tasks settling at once cannot lose each other's status lines. Returns
- * the plan text after the mutation. Uncontended (the serial path) it is just
- * a fresh read, a pure transform, and a write.
+ * two Tasks settling at once cannot lose each other's status lines. The
+ * in-process tail is the fast path; the sidecar lock extends the same
+ * read/transform/write transaction across session processes. Returns the plan
+ * text after the mutation.
  */
 let planMutationTail: Promise<void> = Promise.resolve();
 export async function updatePlanFile(
   paths: Paths,
   mutate: (plan: string) => string,
 ): Promise<string> {
-  const run = planMutationTail.then(() => {
-    const next = mutate(readText(paths.planFile));
-    writeText(paths.planFile, next);
-    return next;
-  });
+  const run = planMutationTail.then(() =>
+    withWriterLockAsync(paths.handoffsDir, async () => {
+      const next = mutate(readText(paths.planFile));
+      writeText(paths.planFile, next);
+      return next;
+    }),
+  );
   planMutationTail = run.then(
     () => undefined,
     () => undefined,
@@ -5903,7 +5899,6 @@ async function runChainTaskOnce(
     `Task ${task.id} — ${task.title}`,
     process.platform,
     scope?.length ? scope : undefined,
-    paths.handoffsDir,
   );
   // A scoped admitted-solo Task has no sibling to leave ownership of
   // out-of-scope edits. Waves intentionally keep the scoped-only gate, but a

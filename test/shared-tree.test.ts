@@ -7,10 +7,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
 import { readWriterSlots, sweepWriterSlots, updateWriterSlots } from "../src/lib/write-sets.ts";
@@ -75,6 +76,25 @@ function prFixture(prRound: number) {
     ].join("\n"),
   );
   return { dir, paths };
+}
+
+function orchestrateChild(script: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "-e", script, ...args],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`orchestrate child exited ${code}: ${stderr}`));
+    });
+  });
 }
 
 /** Settle every spawn RPC, collecting each spawn's params. */
@@ -326,6 +346,74 @@ test("shared-tree: updatePlanFile keeps concurrent Task settlements", async () =
   const text = readFileSync(paths.planFile, "utf8");
   assert.match(text, /Task 1[\s\S]*- Status: done/);
   assert.match(text, /Task 2[\s\S]*- Status: done/);
+});
+
+test("shared-tree: updatePlanFile serializes contending processes under the sidecar lock", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-plan-cross-process-"));
+  const ready = join(dir, "ready");
+  writeFileSync(
+    join(dir, "plan.md"),
+    "### Task 1 — a\n- Status: pending\n\n### Task 2 — b\n- Status: pending\n",
+  );
+  const source = pathToFileURL(ORCH_SRC).href;
+  const script = `
+    import { writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    import { withWriterLockAsync } from ${JSON.stringify(pathToFileURL(join(process.cwd(), "src/lib/write-sets.ts")).href)};
+    import { updatePlanFile } from ${JSON.stringify(source)};
+    const [dir, id, ready] = process.argv.slice(1);
+    const paths = { planFile: join(dir, 'plan.md'), handoffsDir: dir };
+    const mutate = (plan) => {
+      if (id === '1') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+      return plan.replace(new RegExp('(### Task ' + id + '[^\\\\n]*\\\\n- Status: )pending'), '$1done');
+    };
+    if (id === '1') {
+      await withWriterLockAsync(dir, async () => {
+        writeFileSync(ready, 'held');
+        await updatePlanFile(paths, mutate);
+      });
+    } else {
+      await updatePlanFile(paths, mutate);
+    }
+  `;
+  const first = orchestrateChild(script, [dir, "1", ready]);
+  for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(existsSync(ready), true, "the first process must hold the sidecar lock");
+  const second = orchestrateChild(script, [dir, "2", ""]);
+  await Promise.all([first, second]);
+  const text = readFileSync(join(dir, "plan.md"), "utf8");
+  assert.match(text, /Task 1[\s\S]*- Status: done/);
+  assert.match(text, /Task 2[\s\S]*- Status: done/);
+});
+
+test("shared-tree: terminal snapshot does not release an unreleased writer slot", () => {
+  const { paths } = prFixture(0);
+  const runDir = mkdtempSync(join(tmpdir(), "orch-terminal-writer-"));
+  writeFileSync(
+    join(runDir, "status.json"),
+    JSON.stringify({
+      state: "complete",
+      startedAt: Date.now(),
+      endedAt: Date.now(),
+      pid: process.pid,
+      steps: [{ status: "complete" }],
+    }),
+  );
+  updateWriterSlots(paths.handoffsDir, () => true, () => ({
+    slots: [{
+      runId: "writer-terminal",
+      runDir,
+      agent: "fixer",
+      writeSet: ["src/a.ts"],
+      claimedAt: Date.now(),
+    }],
+    result: undefined,
+  }));
+  const swept = sweepWriterSlots(paths.handoffsDir, orch.writerSlotIsLive);
+  assert.deepEqual(swept.slots.map((slot) => slot.runId), ["writer-terminal"]);
+  assert.equal(swept.swept, false, "only explicit release may free a terminal writer slot");
 });
 
 test("shared-tree: one verdict with two paths dispatches two fixers, one pr-await", async () => {
