@@ -239,6 +239,7 @@ test("write-sets: keyed Task run sidecar preserves siblings and sweeps settled i
   const swept = sweepTaskRuns(dir, ["2"]);
   assert.equal(swept.swept, true);
   assert.deepEqual(swept.runs.map((entry) => entry.taskId), ["2"]);
+  assert.deepEqual(swept.removed.map((entry) => entry.taskId), ["1"]);
   releaseTaskRun(dir, "2");
   assert.deepEqual(readTaskRuns(dir), []);
 });

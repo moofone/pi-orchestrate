@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
 import { registerLatchArm, registerLatchWake } from "../src/lib/pr-await-core.ts";
-import { readTaskRuns, upsertTaskRun } from "../src/lib/write-sets.ts";
+import { claimWriterSlot, readTaskRuns, readWriterSlots, upsertTaskRun } from "../src/lib/write-sets.ts";
 
 const ORCH_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/orchestrate.ts");
 const LIFECYCLE_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/lib/lifecycle.ts");
@@ -2340,6 +2340,18 @@ test("R6: an orphaned Task whose worker finished is recorded done, not re-run", 
     endedAt: 2,
     steps: [{ status: "complete" }],
   });
+  claimWriterSlot(
+    paths.handoffsDir,
+    {
+      runId: "6cbcaaf5-83f0-46b5-b7b4-f89347763413",
+      runDir: "/tmp/orphan-run",
+      agent: "tdd-worker",
+      writeSet: [],
+      claimedAt: Date.now(),
+    },
+    () => true,
+    8,
+  );
   const { ctx, notices } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(
     movedHeadPi() as never,
@@ -2356,6 +2368,7 @@ test("R6: an orphaned Task whose worker finished is recorded done, not re-run", 
   assert.match(status, /^active_task: none$/m);
   assert.match(status, /^worker_run_id: none$/m);
   assert.match(status, /^task_base: none$/m);
+  assert.deepEqual(readWriterSlots(paths.handoffsDir), [], "orphan recovery releases its writer slot");
   assert.match(notices.join("\n"), /recovered/i);
 });
 
@@ -2386,6 +2399,25 @@ test("R6: an orphaned Task that produced nothing is re-run, not blocked", async 
 
 test("R6: a Task with no in-flight record leaves the plan alone", async () => {
   const { paths } = orphanFixture("pending", undefined);
+  claimWriterSlot(
+    paths.handoffsDir,
+    {
+      runId: "run-5",
+      runDir: "/tmp/run-5",
+      agent: "tdd-worker",
+      writeSet: [],
+      claimedAt: Date.now(),
+    },
+    () => true,
+    8,
+  );
+  upsertTaskRun(paths.handoffsDir, {
+    taskId: "5",
+    runId: "run-5",
+    runDir: "/tmp/run-5",
+    baseTag: "base",
+    baseHead: "head",
+  });
   const { ctx } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(
     movedHeadPi() as never,
@@ -2396,6 +2428,8 @@ test("R6: a Task with no in-flight record leaves the plan alone", async () => {
   );
   assert.equal(proceed, true);
   assert.match(readFileSync(paths.planFile, "utf8"), /- Status: pending/);
+  assert.deepEqual(readTaskRuns(paths.handoffsDir), [], "settled Task rows are swept");
+  assert.deepEqual(readWriterSlots(paths.handoffsDir), [], "sweeping a Task row releases its writer slot");
 });
 
 test("R6: a live orphan run is waited on, never started a second time", async () => {
@@ -3505,7 +3539,9 @@ test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and
   assert.equal(params.skill, undefined, "no skill override for a writer child");
   assert.equal(params.skills, undefined, "no skills override for a writer child");
   assert.equal(params.reads, undefined, "no defaultReads pulling SKILL.md into the child");
-  assert.match(task, /commit/i, "the writer commits");
+  assert.match(task, /commit/i, "the host commit gate owns the writer commit");
+  assert.match(task, /Do NOT `git add`, `git commit`, or `git stash`/, "the lane must not touch the shared index");
+  assert.match(task, /Code commits ONLY your assigned paths/, "the host gate commits only the lane scope");
   assert.match(task, /[Dd]o NOT `git push`/, "code pushes, one push per round");
   assert.match(task, /do NOT `gh pr comment`/, "code — not the child — speaks on the PR");
   assertNoStalePoller("reviewFixLaunchParams", task);
@@ -3782,7 +3818,7 @@ test("runChildInPhase still launches an agent inside the phase allowlist", async
   assert.equal(outcome.ok, true);
 });
 
-test("P2 F7: the tdd-worker contract commits and never pushes", () => {
+test("P2 F7: the tdd-worker leaves staging to the host and never pushes", () => {
   const paths = promptContractPaths();
   const plan = "# Feature: t\n\n### Task 1 — do the thing\n\n- Command: `npm test`\n";
   const params = orch.workerLaunchParams(
@@ -3792,7 +3828,8 @@ test("P2 F7: the tdd-worker contract commits and never pushes", () => {
     plan,
   ) as Record<string, unknown>;
   const task = String(params.task);
-  assert.match(task, /commit/i, "a Task that edits and does not commit is not done (F11)");
+  assert.match(task, /commit/i, "the host commit gate owns the Task commit (F11)");
+  assert.match(task, /Do NOT `git add`, `git commit`, or `git stash`/, "the child must not touch the shared index");
   assert.match(task, /[Dd]o NOT `git push`/, "the branch is pushed once, by code");
   assert.equal(params.skill, undefined, "no solo skill on a writer child");
   assert.equal(params.skills, undefined);

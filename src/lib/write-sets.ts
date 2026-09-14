@@ -392,17 +392,18 @@ export function updateTaskRuns<T>(
   });
 }
 
-/** Drop records for Tasks no longer in progress, retaining orphan evidence. */
+/** Drop records for Tasks no longer in progress and return them to release owners. */
 export function sweepTaskRuns(
   dir: string,
   inProgressTaskIds: readonly string[],
-): { runs: TaskRunRecord[]; swept: boolean } {
+): { runs: TaskRunRecord[]; swept: boolean; removed: TaskRunRecord[] } {
   return withWriterLock(dir, () => {
     const recorded = readTaskRuns(dir);
     const keep = new Set(inProgressTaskIds);
     const runs = recorded.filter((run) => keep.has(run.taskId));
-    if (runs.length !== recorded.length) persistTaskRunsUnlocked(dir, runs);
-    return { runs, swept: runs.length !== recorded.length };
+    const removed = recorded.filter((run) => !keep.has(run.taskId));
+    if (removed.length > 0) persistTaskRunsUnlocked(dir, runs);
+    return { runs, swept: removed.length > 0, removed };
   });
 }
 

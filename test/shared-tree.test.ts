@@ -212,7 +212,7 @@ test("shared-tree: wave F11 blocks dirt outside the wave scope", () => {
   assert.match(source.slice(start, end), /firstWaveTaskBlockedByDirtyTree/);
 });
 
-test("shared-tree: wave checks for unassigned dirt after all lanes settle", () => {
+test("shared-tree: wave dirt backstop blocks a Task before resume can reach QA", () => {
   const source = readFileSync(ORCH_SRC, "utf8");
   const start = source.indexOf("async function runTaskBatch");
   const end = source.indexOf("\nasync function runChainTaskOnce", start);
@@ -220,9 +220,25 @@ test("shared-tree: wave checks for unassigned dirt after all lanes settle", () =
   const settled = batch.indexOf("const results = await Promise.all");
   assert.ok(settled >= 0, "the wave must settle all lanes together");
   const backstop = batch.slice(settled);
-  assert.match(backstop, /const afterWave = await porcelainStatus/);
+  const afterWave = backstop.indexOf("const afterWave = await porcelainStatus");
+  assert.ok(afterWave >= 0, "the wave must inspect dirt after all lanes settle");
   assert.match(backstop, /unassigned paths remain dirty after the Task wave/);
-  assert.ok(backstop.indexOf("return results.every(Boolean)") > backstop.indexOf("const afterWave"));
+  const blocked = backstop.indexOf('setTaskStatusInPlan(freshPlan, blockedItem.task.id, "blocked")');
+  assert.ok(blocked > afterWave, "out-of-union dirt must block a held in-progress Task");
+  const done = backstop.indexOf('setTaskStatusInPlan(nextPlan, item.task.id, "done")');
+  assert.ok(done > afterWave, "wave Tasks may be marked done only after the dirt backstop passes");
+  assert.ok(backstop.indexOf("return false") > blocked, "the dirt failure must stop resume");
+  const once = source.slice(
+    source.indexOf("async function runChainTaskOnce"),
+    source.indexOf("\nasync function runFeatureChain"),
+  );
+  const held = once.indexOf("if (wave) {");
+  const taskDone = once.indexOf('setTaskStatusInPlan(freshPlan, task.id, "done")');
+  assert.ok(held >= 0 && held < taskDone, "wave settlement must hold done until runTaskBatch validates the union");
+  const chain = source.slice(source.indexOf("async function runFeatureChain"));
+  const blockedGuard = chain.indexOf('t.status === "blocked"');
+  const qa = chain.indexOf("needsFeatureQa(status)");
+  assert.ok(blockedGuard >= 0 && blockedGuard < qa, "resume checks blocked Tasks before QA");
 });
 
 test("shared-tree: selectTaskBatch takes disjoint scoped Tasks, skips the rest", () => {

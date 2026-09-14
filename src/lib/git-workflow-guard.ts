@@ -4,7 +4,8 @@
  * Prompt skills are not a guard: GLM-5.3-flash read nothing and polled
  * `git fetch` + `gh pr view` 1,127 times (624M tokens). This is the mechanical
  * allowlist for wait/worktree/land. Ordinary git (status/diff/log/add/commit/
- * push/fetch-alone) is untouched.
+ * push/fetch-alone) is untouched for ordinary sessions; writer children have
+ * the stricter child contract below.
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -426,10 +427,11 @@ export function classifyGitWorkflowCommand(command: string): GuardVerdict {
 /* ------------------------------------------------------------------ *
  * Writer children
  *
- * `/orchestrate` children write code and commit it. Everything else on the
- * Feature — the worktree, the push, the PR, the wait, the land, the review
- * comment — belongs to code in the parent, so that "exactly one waiter per PR"
- * and "one push per round" are structural facts rather than prompt requests.
+ * `/orchestrate` children write code and leave it unstaged. Everything else
+ * on the Feature — the shared index, commit gate, push, PR, wait, land, and
+ * review comment — belongs to code in the parent, so that "exactly one waiter
+ * per PR" and "one push per round" are structural facts rather than prompt
+ * requests.
  *
  * The fixer used to be handed the solo git-workflow skill, whose `next=` table
  * says "fix …, one push, then `git pr-await` once". The allowlist above let
@@ -460,7 +462,8 @@ function writerBlock(command: string): GuardVerdict | undefined {
 	const rawWorktree = git.some(isRawWorktreeMutation);
 	if (rawWorktree || git.some(invocation => invocation.verb === "wt" || invocation.verb === "wt-rm") || hasGhlToken(segments, "ghl-wt", "ghl-wt-rm")) return { block: true, reason: "a writer child never creates or removes a worktree. You were given one; work in it." };
 	if (["create", "comment", "edit", "close", "reopen", "ready"].some(action => hasGhSequence(segments, ["pr", action]))) return { block: true, reason: "a writer child never speaks on the PR. Put it in your handoff; code opens the PR and posts on it." };
-	if (git.some(invocation => invocation.verb === "push")) return { block: true, reason: "a writer child commits; code pushes. Commit your work and settle — the push is one per round, from the parent." };
+	if (git.some(invocation => ["add", "commit", "stash"].includes(invocation.verb ?? ""))) return { block: true, reason: "a writer child never stages, commits, or stashes. Leave work unstaged; code owns the scoped commit gate." };
+	if (git.some(invocation => invocation.verb === "push")) return { block: true, reason: "a writer child leaves work unstaged; code commits and pushes once per round from the parent." };
 	return undefined;
 }
 

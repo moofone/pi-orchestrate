@@ -3347,11 +3347,12 @@ async function committedInScope(
 /* ------------------------------------------------------------------ *
  * The commit gate (F11)
  *
- * A writer's only git operation is `git commit`. It is also the one the
- * models skip most: `worktreeFingerprint` counts unstaged edits as a land, so
- * a Task that edited and never committed used to be marked `done`. The next
- * worker then started on a dirty tree, feature-qa reviewed uncommitted code,
- * and `openFeaturePr` pushed HEAD — which did not contain the work.
+ * A writer child does not run index-mutating git operations. The host-side
+ * gate is also the one the models skip most: `worktreeFingerprint` counts
+ * unstaged edits as a land, so a Task that edited and never reached the gate
+ * used to be marked `done`. The next worker then started on a dirty tree,
+ * feature-qa reviewed uncommitted code, and `openFeaturePr` pushed HEAD —
+ * which did not contain the work.
  *
  * So code closes the gate itself after every writer: if the tree is dirty,
  * code commits it deterministically; if it cannot, the Task blocks with a
@@ -3637,9 +3638,9 @@ export function firstWaveTaskBlockedByDirtyTree(
 /**
  * Close the commit gate for one writer.
  *
- * `git add -A` is deliberate: a writer's untracked new files are as much of
- * the Task as its edits, and leaving them behind would push a half-Task.
- * The commit itself is pathspec'd to actionable files so an already-staged
+ * The host-side `git add -A` is deliberate: a writer's untracked new files
+ * are as much of the Task as its edits, and leaving them behind would push a
+ * half-Task. The commit itself is pathspec'd to actionable files so an already-staged
  * Darwin Cargo.lock is not included (Mac pre-commit refuses that lock; we
  * cannot `git reset`/`git restore` it). Leftover lock dirt is not a block.
  */
@@ -3725,11 +3726,11 @@ export async function ensureWriterCommit(
  * next to the work; `lib/git-workflow-guard.ts` is what actually enforces it.
  */
 const WRITER_CONTRACT = [
-  "You write code and commit it. Nothing else on this Feature is yours.",
+  "You write code and leave it unstaged. Nothing else on this Feature is yours.",
   "Work only in the worktree named below, never in a reference checkout.",
-  "Commit what you finish. Do NOT `git push` — code pushes once per round.",
-  "Commit ONLY your assigned paths (`git add -- <paths>`), never `git add -A`: siblings share this tree and a sweep would commit their half-done work.",
-  "Do NOT open a PR, do NOT `gh pr comment`, do NOT `gh pr merge`, do NOT `git wt`, do NOT `git pr-await`, do NOT `git pr-land`.",
+  "Do NOT `git add`, `git commit`, or `git stash`; leave work uncommitted for code's scoped commit gate.",
+  "Code commits ONLY your assigned paths (`git add -- <paths>`), never `git add -A`: siblings share this tree and a sweep would commit their half-done work.",
+  "Do NOT `git push` — code pushes once per round. Do NOT open a PR, do NOT `gh pr comment`, do NOT `gh pr merge`, do NOT `git wt`, do NOT `git pr-await`, do NOT `git pr-land`.",
   "Anything you cannot do goes in your handoff. Then settle; code takes it from there.",
 ];
 
@@ -4142,9 +4143,10 @@ export function quoteUntrustedVerdict(body: string): string {
 /**
  * The `fixer` contract for one review-fix round.
  *
- * Same agent and same forbids as a Task: the writer fixes and pushes, and code
- * — not the child — runs the single `git pr-await` afterwards. The waiter's own
- * output is the body, so nothing paraphrases a review into a contract.
+ * Same agent and same forbids as a Task: the writer fixes and leaves its work
+ * unstaged, and code — not the child — owns the scoped commit and runs the
+ * single `git pr-await` afterwards. The waiter's own output is the body, so
+ * nothing paraphrases a review into a contract.
  */
 export function reviewFixLaunchParams(
   paths: Paths,
@@ -4163,7 +4165,7 @@ export function reviewFixLaunchParams(
     task: [
       `Review-fix round ${spawn} on PR ${pr}.`,
       conflict
-        ? `PR ${pr} conflicts with origin/main. Merge origin/main (do not rebase), resolve every conflict, and commit. Do not hunt review comments.`
+        ? `PR ${pr} conflicts with origin/main. Merge origin/main (do not rebase), resolve every conflict, and leave the result unstaged for code's commit gate. Do not hunt review comments.`
         : `Fix the review findings on PR ${pr} and nothing else.`,
       ...WRITER_CONTRACT,
       ...(writeSet.length > 0
@@ -4179,7 +4181,7 @@ export function reviewFixLaunchParams(
         ? []
         : [
             "",
-            `Fix only findings against the current head of this PR. Red test first for critical or money-moving behaviour, then commit in ${worktree} only — never in a reference checkout.`,
+            `Fix only findings against the current head of this PR. Red test first for critical or money-moving behaviour, then leave the result unstaged in ${worktree} only — never in a reference checkout; code commits it.`,
             `A comment marked 👀 is still being written: leave the current head alone and report it in your handoff instead of changing it.`,
             `A finding against an older head is already answered — say so; do not re-fix it.`,
             "",
@@ -4224,14 +4226,14 @@ export function sessionFixLaunchParams(intent: LaunchIntent): Record<string, unk
       `Review-fix on ${pr}.`,
       ...(conflict
         ? [
-            `${pr} conflicts with origin/main. Merge origin/main (do not rebase), resolve every conflict, and commit. Do not hunt review comments.`,
+            `${pr} conflicts with origin/main. Merge origin/main (do not rebase), resolve every conflict, and leave the result unstaged for the controller's commit gate. Do not hunt review comments.`,
           ]
         : []),
       `Expected head: ${intent.expectedHead}`,
       `Owner generation: ${intent.owner.generation}`,
       `Verdict ids: ${intent.verdictIds.join(", ") || "none"}`,
       ...WRITER_CONTRACT,
-      "Validate and commit in the named worktree. Do not push, wait, or land.",
+      "Validate in the named worktree and leave the result unstaged. The controller commits it; do not push, wait, or land.",
       ...(conflict
         ? []
         : [
@@ -5633,6 +5635,7 @@ export function selectTaskBatch(
 /**
  * Run one shared-tree wave: pre-claim provisional slots in a single persist
  * (the sets are disjoint by construction), settle every Task concurrently,
+ * hold successful lanes in_progress through the union dirt backstop, then
  * release everything. A false from any lane stops the chain — that lane
  * already recorded its paused/blocked state and notified.
  */
@@ -5737,10 +5740,25 @@ async function runTaskBatch(
       const reason = afterWave === undefined
         ? "could not verify paths outside the Task wave"
         : "unassigned paths remain dirty after the Task wave";
+      // Wave lanes deliberately remain in_progress until this point. Block
+      // one held lane on failure so the next resume hits the normal blocked
+      // guard before it can fall through to feature-qa.
+      const currentTasks = parseTasks(readText(paths.planFile));
+      const blockedItem = admitted.find((item) =>
+        currentTasks.some((current) => current.id === item.task.id && current.status === "in_progress"),
+      ) ?? admitted[0]!;
+      const handoff = join(paths.handoffsDir, `task-${blockedItem.task.id}.md`);
+      await updatePlanFile(paths, (freshPlan) =>
+        setTaskHandoffInPlan(
+          setTaskStatusInPlan(freshPlan, blockedItem.task.id, "blocked"),
+          blockedItem.task.id,
+          handoff,
+        ),
+      );
       const nextAction = `Task wave on ${name} blocked: ${reason}; /orchestrate resume.`;
       upsertStatusFile(paths, {
         phase: "blocked",
-        activeTask: "none",
+        activeTask: blockedItem.task.id,
         worktree,
         nextAction,
         tasks: parseTasks(readText(paths.planFile)),
@@ -5748,7 +5766,26 @@ async function runTaskBatch(
       uiNotify(ctx, `${name}: ${nextAction}\nChain stopped, no PR opened.`, "error");
       return false;
     }
-    return results.every(Boolean);
+    if (!results.every(Boolean)) return false;
+    await updatePlanFile(paths, (freshPlan) =>
+      admitted.reduce(
+        (nextPlan, item) => setTaskHandoffInPlan(
+          setTaskStatusInPlan(nextPlan, item.task.id, "done"),
+          item.task.id,
+          join(paths.handoffsDir, `task-${item.task.id}.md`),
+        ),
+        freshPlan,
+      ),
+    );
+    upsertStatusFile(paths, {
+      workerRunId: "none",
+      workerRunDir: "none",
+      taskBase: "none",
+      taskBaseHead: "none",
+      activeTask: "none",
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+    return true;
   } finally {
     // A guard or spawn failure can happen before a per-task settler exists.
     // Release every provisional here, including any run whose swap no-op'd.
@@ -5835,7 +5872,7 @@ async function runChainTaskOnce(
     nextAction: `tdd-worker Task ${task.id} (${worker.short})`,
     tasks: parseTasks(planNow),
   });
-  uiNotify(ctx, 
+  uiNotify(ctx,
     `Task ${task.id} — ${task.title}\n${worker.short} · ${task.complexity ?? "simple (default)"}\ncwd ${writerCwd}`,
     "info",
   );
@@ -5893,6 +5930,32 @@ async function runChainTaskOnce(
     outcome = { ok: false, reason: String(error) };
   }
   const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
+  const settleDone = async (handoffLine: string): Promise<void> => {
+    if (wave) {
+      // A shared-tree lane stays in_progress until runTaskBatch verifies the
+      // whole union. Marking it done here would let a dirt backstop failure
+      // fall through to feature-qa on the next resume.
+      upsertStatusFile(paths, {
+        workerRunId: "none",
+        workerRunDir: "none",
+        taskBase: "none",
+        taskBaseHead: "none",
+        tasks: parseTasks(readText(paths.planFile)),
+      });
+      return;
+    }
+    await updatePlanFile(paths, (freshPlan) =>
+      setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoffLine),
+    );
+    upsertStatusFile(paths, {
+      workerRunId: "none",
+      workerRunDir: "none",
+      taskBase: "none",
+      taskBaseHead: "none",
+      activeTask: "none",
+      tasks: parseTasks(readText(paths.planFile)),
+    });
+  };
   // A child this extension stopped (`/orchestrate pause now`) is not a
   // failed Task. Leaving it `blocked` would make `/orchestrate resume`
   // hit the blocked guard above and refuse forever.
@@ -5909,7 +5972,7 @@ async function runChainTaskOnce(
       nextAction: "/orchestrate resume",
       tasks: parseTasks(readText(paths.planFile)),
     });
-    uiNotify(ctx, 
+    uiNotify(ctx,
       `Task ${task.id} stopped and left pending on ${name}.\n/orchestrate resume re-runs it from the start.`,
       "info",
     );
@@ -6002,19 +6065,9 @@ async function runChainTaskOnce(
       gated,
     });
     if (failSettle.action === "done_continue") {
-      await updatePlanFile(paths, (freshPlan) =>
-        setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoffLine),
-      );
-      upsertStatusFile(paths, {
-        workerRunId: "none",
-        workerRunDir: "none",
-        taskBase: "none",
-        taskBaseHead: "none",
-        activeTask: "none",
-        tasks: parseTasks(readText(paths.planFile)),
-      });
-      uiNotify(ctx, 
-        `Task ${task.id} succeeded; harness reported failed. Work landed — continuing.\n` +
+      await settleDone(handoffLine);
+      uiNotify(ctx,
+        `Task ${task.id} succeeded; harness reported failed. Work landed — ${wave ? "awaiting the wave dirt backstop" : "continuing"}.\n` +
           `Handoff: ${handoff}`,
         "info",
       );
@@ -6067,19 +6120,9 @@ async function runChainTaskOnce(
   // `settleTaskOutcome` advances to the next Task instead. It never QA/PRs
   // or starts another Feature — that is the loop below, after Tasks end.
   if (settle.action === "done_continue" && settle.reason === "ok_unchanged") {
-    await updatePlanFile(paths, (freshPlan) =>
-      setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoffLine),
-    );
-    upsertStatusFile(paths, {
-      workerRunId: "none",
-      workerRunDir: "none",
-      taskBase: "none",
-      taskBaseHead: "none",
-      activeTask: "none",
-      tasks: parseTasks(readText(paths.planFile))
-    });
-    uiNotify(ctx, 
-      `Task ${task.id} done (worktree unchanged — host-side edits still count). Next Task.\n` +
+    await settleDone(handoffLine);
+    uiNotify(ctx,
+      `Task ${task.id} done (worktree unchanged — host-side edits still count). ${wave ? "Awaiting the wave dirt backstop." : "Next Task."}\n` +
         `Handoff: ${handoff}`,
       "info",
     );
@@ -6091,20 +6134,12 @@ async function runChainTaskOnce(
     return true;
   }
 
-  await updatePlanFile(paths, (freshPlan) =>
-    setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoffLine),
-  );
-  upsertStatusFile(paths, {
-    workerRunId: "none",
-    workerRunDir: "none",
-    taskBase: "none",
-    taskBaseHead: "none",
-    activeTask: "none",
-    tasks: parseTasks(readText(paths.planFile)),
-  });
+  await settleDone(handoffLine);
   uiNotify(
     ctx,
-    formatTodoProgress(paths, `Task ${task.id} done (gate: ${gateResult}).`),
+    wave
+      ? `Task ${task.id} settled; awaiting the wave dirt backstop.`
+      : formatTodoProgress(paths, `Task ${task.id} done (gate: ${gateResult}).`),
     "info",
   );
 
@@ -6297,6 +6332,19 @@ async function runFeatureChain(
 /** How often a still-live orphan run is re-read while the chain waits. */
 const ORPHAN_POLL_MS = 15_000;
 
+/** Release both a real orphan run and any pre-spawn slot it may have left. */
+function releaseTaskWriterSlots(paths: Paths, taskId: string, runId: string): void {
+  const ids = new Set([
+    runId,
+    `task-${taskId}-pending`,
+    `task-${taskId}-serial-pending`,
+  ]);
+  for (const id of ids) {
+    if (!id || isPendingToken(id)) continue;
+    releaseWriterSlot(paths.handoffsDir, id);
+  }
+}
+
 /**
  * Settle a Task left `in_progress` by a session that is no longer running.
  *
@@ -6319,7 +6367,14 @@ export async function reconcileOrphanTask(
     // Keep records for every orphaned Task while dropping settled Tasks. A
     // dead run must remain available here: its snapshot is the evidence we
     // are about to reconcile, not a reason to sweep the record first.
-    records = sweepTaskRuns(paths.handoffsDir, inFlight.map((task) => task.id)).runs;
+    const swept = sweepTaskRuns(paths.handoffsDir, inFlight.map((task) => task.id));
+    records = swept.runs;
+    // Sweeping a settled Task row must also release its writer slot. The
+    // task-run sidecar and writers sidecar are separate ledgers, so dropping
+    // one without this step leaves an admission reservation until TTL.
+    for (const record of swept.removed) {
+      releaseTaskWriterSlots(paths, record.taskId, record.runId);
+    }
   } catch {
     records = readTaskRuns(paths.handoffsDir);
   }
@@ -6399,6 +6454,7 @@ export async function reconcileOrphanTask(
     }
 
     releaseTaskRun(paths.handoffsDir, task.id);
+    releaseTaskWriterSlots(paths, task.id, runId);
     if (decision === "done") {
       await updatePlanFile(paths, (freshPlan) =>
         setTaskHandoffInPlan(setTaskStatusInPlan(freshPlan, task.id, "done"), task.id, handoff),
