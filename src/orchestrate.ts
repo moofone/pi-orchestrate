@@ -828,7 +828,7 @@ export function unwrapJsonFences(markdown: string): string {
     }
   }
 
-  return next.replace(/\n{3,}/g, "\n\n");
+  return next;
 }
 
 /** Assistant markdown as shown in `/o`: approve cards, not fence chrome. */

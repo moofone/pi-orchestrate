@@ -1744,6 +1744,29 @@ test("L5: unwrapJsonFences does not close on triple backticks inside a JSON stri
   assert.equal(parsed.async, true);
 });
 
+test("L5: unwrapJsonFences preserves blank lines outside transformed JSON fences", () => {
+  const gap = "\n\n\n\n";
+  const fence = "```";
+  const src = [
+    "Before" + gap + fence + "bash",
+    `echo one${gap}echo two`,
+    fence + gap + fence + "json",
+    '{"async":true}',
+    fence + gap + "After",
+  ].join("\n");
+  const out = orch.unwrapJsonFences(src);
+  assert.equal(
+    out,
+    [
+      "Before" + gap + fence + "bash",
+      `echo one${gap}echo two`,
+      fence + gap + "{",
+      '  "async": true',
+      "}" + gap + "After",
+    ].join("\n"),
+  );
+});
+
 test("L5: unwrapJsonFences pretty-prints fenced JSON so Pi does not draw literal backticks", () => {
   const src = [
     "I'll launch the scouts with the exact paths you provided.",
