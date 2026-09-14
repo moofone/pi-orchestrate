@@ -3734,6 +3734,48 @@ function phaseAgentViolationFn() {
   return fn as (phase: string, params: Record<string, unknown>) => string;
 }
 
+test("session fixer settles through the host commit gate", async () => {
+  const calls: string[] = [];
+  let statusReads = 0;
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    if (cmd === "git" && args[0] === "status") {
+      return { code: 0, stdout: statusReads++ === 0 ? " M src/fix.ts\\n" : "", stderr: "" };
+    }
+    if (cmd === "git" && (args[0] === "add" || args[0] === "commit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const spawn = captureSpawn(pi);
+  const { ctx } = makeFakeCtx();
+  const intent = {
+    v: 1,
+    idempotencyKey: "k-session-gate",
+    pr: { host: "github.com", owner: "moofone", repo: "icemining", number: "99" },
+    owner: { kind: "session", id: "s1", generation: "g1" },
+    worktree: "/tmp/session-gate-wt",
+    expectedHead: "abc",
+    verdictIds: ["v1"],
+    next: "read_comments_and_fix",
+    body: "next=read_comments_and_fix\\nhead=abc",
+    validation: "commit-only",
+    publication: "controller",
+  };
+  const launch = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, intent);
+  await Promise.resolve();
+  pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
+    success: true,
+    data: { details: { runId: "run-session-gate" } },
+  });
+  const result = (await withDeadline(launch, 500)) as { runId?: string; settled?: Promise<unknown> };
+  assert.equal(result.runId, "run-session-gate");
+  pi.events.emit(ASYNC_COMPLETE_EVENT, { runId: result.runId, success: true });
+  const gate = (await withDeadline(result.settled!, 1000)) as { state?: string };
+  assert.equal(gate.state, "committed", "dirty session-fix work must reach the host commit gate");
+  assert.ok(calls.some((call) => call.startsWith("git commit -m fix: review session")));
+});
+
 test("phase allowlist: every legacy launch's own agent sits inside its phase", () => {
   const violation = phaseAgentViolationFn();
   const paths = promptContractPaths();

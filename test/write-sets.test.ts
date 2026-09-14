@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -28,6 +28,7 @@ import {
   sweepWriterSlots,
   updateWriterSlots,
   upsertTaskRun,
+  withWriterLockAsync,
   type TaskRunRecord,
   type WriterSlot,
 } from "../src/lib/write-sets.ts";
@@ -222,6 +223,40 @@ test("write-sets: async sidecar lock covers the whole held operation", async () 
     "second:enter",
     "second:exit",
   ]);
+});
+
+test("write-sets: async holder and sync RMW sibling serialize in one process", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "writers-local-race-"));
+  const ready = join(dir, "ready");
+  const append = (runId: string) => updateWriterSlots(dir, () => true, (slots) => ({
+    slots: [...slots, slot({ runId })],
+    result: undefined,
+  }));
+  const holder = withWriterLockAsync(dir, async () => {
+    writeFileSync(ready, "held");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    append("async-holder");
+  });
+  for (let attempt = 0; attempt < 100 && !existsSync(ready); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(existsSync(ready), true, "the async holder must acquire first");
+  const sibling = append("sync-sibling");
+  await Promise.all([holder, sibling]);
+  assert.deepEqual(readWriterSlots(dir).map((entry) => entry.runId).sort(), ["async-holder", "sync-sibling"]);
+});
+
+test("write-sets: genuine nested async lock calls do not deadlock", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "writers-nested-lock-"));
+  await withWriterLockAsync(dir, async () => {
+    await withWriterLockAsync(dir, async () => {
+      updateWriterSlots(dir, () => true, (slots) => ({
+        slots: [...slots, slot({ runId: "nested" })],
+        result: undefined,
+      }));
+    });
+  });
+  assert.deepEqual(readWriterSlots(dir).map((entry) => entry.runId), ["nested"]);
 });
 
 test("write-sets: keyed Task run sidecar preserves siblings and sweeps settled ids", () => {

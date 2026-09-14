@@ -122,7 +122,13 @@ import {
   type TaskRunRecord,
   type WriterSlot,
 } from "./lib/write-sets.ts";
-import { registerReviewLaunch, requestExecutionController, type LaunchIntent, type LaunchResult } from "./lib/pr-review-events.ts";
+import {
+  registerReviewLaunch,
+  requestExecutionController,
+  type LaunchIntent,
+  type LaunchResult,
+  type SessionFixerSettlement,
+} from "./lib/pr-review-events.ts";
 import {
   featureTitle,
   isApproved,
@@ -4263,7 +4269,7 @@ export function sessionFixLaunchParams(intent: LaunchIntent): Record<string, unk
  */
 export async function launchSessionFixer(
   pi: ExtensionAPI,
-  _ctx: ExtensionCommandContext,
+  ctx: ExtensionCommandContext,
   intent: LaunchIntent,
 ): Promise<LaunchResult> {
   const params = sessionFixLaunchParams(intent);
@@ -4275,13 +4281,83 @@ export async function launchSessionFixer(
   if (policy.action === "reject") {
     throw new Error(policy.reason ?? "spawn rejected");
   }
-  const reply = await rpcCall(pi, "spawn", params);
-  if (!reply.success) throw new Error(rpcErrorText(reply));
-  const runId = reply.data?.details?.runId;
-  if (typeof runId !== "string" || !runId) {
+
+  // The session fixer is spawned directly rather than through runChildInPhase,
+  // because the review controller must receive its runId immediately. Keep a
+  // completion listener alongside that launch so the same host-side commit
+  // gate Feature rounds use runs after this child settles too.
+  let runId = "";
+  let settled = false;
+  let offCompletion: (() => void) | undefined;
+  let resolveSettlement: (result: SessionFixerSettlement) => void = () => {};
+  const settlement = new Promise<SessionFixerSettlement>((resolve) => {
+    resolveSettlement = resolve;
+  });
+  const settle = (data: unknown): void => {
+    const row = (data ?? {}) as { runId?: unknown };
+    if (settled || !runId || row.runId !== runId) return;
+    settled = true;
+    try {
+      offCompletion?.();
+    } catch {
+      /* bus already tore down */
+    }
+    void (async () => {
+      let gate: SessionFixerSettlement;
+      try {
+        gate = await ensureWriterCommit(
+          pi,
+          intent.worktree,
+          `fix: review session ${intent.pr.owner}/${intent.pr.repo}#${intent.pr.number}`,
+        );
+      } catch (error) {
+        gate = { state: "dirty", reason: `commit gate error: ${String(error)}` };
+      }
+      try {
+        if (gate.state === "committed") {
+          uiNotify(ctx, `Session fixer for ${intent.pr.owner}/${intent.pr.repo}#${intent.pr.number} left uncommitted work; code committed it.`, "info");
+        } else if (gate.state === "dirty" || gate.state === "unknown") {
+          uiNotify(
+            ctx,
+            `Session fixer for ${intent.pr.owner}/${intent.pr.repo}#${intent.pr.number} is blocked by its commit gate: ${gate.reason}`,
+            "error",
+          );
+        }
+      } catch {
+        /* a stale session context must not strand the settlement promise */
+      } finally {
+        resolveSettlement(gate);
+      }
+    })();
+  };
+  const early: unknown[] = [];
+  offCompletion = pi.events.on(ASYNC_COMPLETE_EVENT, (data: unknown) => {
+    if (!runId) {
+      if (early.length < EARLY_COMPLETION_CAP) early.push(data);
+      return;
+    }
+    settle(data);
+  });
+
+  let reply: Awaited<ReturnType<typeof rpcCall>>;
+  try {
+    reply = await rpcCall(pi, "spawn", params);
+  } catch (error) {
+    offCompletion?.();
+    throw error;
+  }
+  if (!reply.success) {
+    offCompletion?.();
+    throw new Error(rpcErrorText(reply));
+  }
+  const spawnedId = reply.data?.details?.runId;
+  if (typeof spawnedId !== "string" || !spawnedId) {
+    offCompletion?.();
     throw new Error("spawn reply carried no runId");
   }
-  return { runId, recovered: false };
+  runId = spawnedId;
+  for (const data of early.splice(0)) settle(data);
+  return { runId, recovered: false, settled: settlement };
 }
 
 /**
@@ -4576,9 +4652,9 @@ export function swapWriterSlot(paths: Paths, provisionalId: string, runId: strin
 }
 
 /** Any writer this Feature still owns, single-record or slotted. */
-function featureWritersLive(paths: Paths, status: string): boolean {
+async function featureWritersLive(paths: Paths, status: string): Promise<boolean> {
   if (featureWorkerLive(status)) return true;
-  return liveWriterSlots(paths).length > 0;
+  return (await liveWriterSlots(paths)).length > 0;
 }
 
 export interface FixLane {
@@ -4761,7 +4837,7 @@ async function claimFixerLane(
     // Sweep only expires old reservations; terminal snapshots do not release
     // a slot while the child may still be closing its commit gate.
     try {
-      liveWriterSlots(paths);
+      await liveWriterSlots(paths);
     } catch (error) {
       if (!wait) return { ok: false, reason: `sidecar sweep failed: ${String(error)}` };
       if (!noticeSent) {
@@ -4774,7 +4850,7 @@ async function claimFixerLane(
     }
     let decision: ReturnType<typeof claimWriterSlot>;
     try {
-      decision = claimWriterSlot(
+      decision = await claimWriterSlot(
         paths.handoffsDir,
         {
           runId: provisionalId,
@@ -5099,7 +5175,7 @@ export async function dispatchFeaturePrVerdict(
     prRound: statusField(status, "pr_round"),
     chainLocked: opts.holdsChainLock ? false : RUNNING_CHAINS.has(paths.featureDir),
     // Single-record writers and slotted shared-tree writers both hold the Feature.
-    workerLive: featureWritersLive(paths, status),
+    workerLive: await featureWritersLive(paths, status),
     findingsRepeated,
   });
 
@@ -5671,7 +5747,7 @@ async function runTaskBatch(
   // Each claim performs its own fresh sweep and admission under the
   // cross-process sidecar lock. The selector is only an optimization; this
   // is the authoritative admission at spawn time.
-  liveWriterSlots(paths);
+  await liveWriterSlots(paths);
   const provisionals = new Map<string, string>();
   // A wave owns both the provisional reservation and the real child slot until
   // every lane has been recorded and the union dirt backstop has passed.
@@ -5681,7 +5757,7 @@ async function runTaskBatch(
       const provisionalId = `task-${item.task.id}-pending`;
       let claim: ReturnType<typeof claimWriterSlot>;
       try {
-        claim = claimWriterSlot(
+        claim = await claimWriterSlot(
           paths.handoffsDir,
           {
             runId: provisionalId,
@@ -6246,7 +6322,7 @@ async function runFeatureChain(
       // Task without a scope — keeps the admitted-solo path below, including
       // its dirty-tree and unassigned-dirt guards.
       if (!inFlight) {
-        const batch = selectTaskBatch(plan, tasks, liveWriterSlots(paths));
+        const batch = selectTaskBatch(plan, tasks, await liveWriterSlots(paths));
         if (batch) {
           if (!(await runTaskBatch(pi, ctx, paths, name, worktree, plan, batch))) return;
           continue;
@@ -6258,7 +6334,7 @@ async function runFeatureChain(
       const serialProvisionalId = `task-${task.id}-serial-pending`;
       let serialClaim: ReturnType<typeof claimWriterSlot>;
       try {
-        serialClaim = claimWriterSlot(
+        serialClaim = await claimWriterSlot(
           paths.handoffsDir,
           {
             runId: serialProvisionalId,
@@ -6406,7 +6482,7 @@ export async function reconcileOrphanTask(
     // Keep records for every orphaned Task while dropping settled Tasks. A
     // dead run must remain available here: its snapshot is the evidence we
     // are about to reconcile, not a reason to sweep the record first.
-    const swept = sweepTaskRuns(paths.handoffsDir, inFlight.map((task) => task.id));
+    const swept = await sweepTaskRuns(paths.handoffsDir, inFlight.map((task) => task.id));
     records = swept.runs;
     // Sweeping a settled Task row must also release its writer slot. The
     // task-run sidecar and writers sidecar are separate ledgers, so dropping
@@ -6423,7 +6499,7 @@ export async function reconcileOrphanTask(
   // sibling Tasks in_progress through its shared settlement tail. A terminal
   // orphan may also retain a slot until recovery, but without its keyed run
   // record it must keep the historical recovery path below.
-  const liveSlotIds = new Set(liveWriterSlots(paths).map((slot) => slot.runId));
+  const liveSlotIds = new Set((await liveWriterSlots(paths)).map((slot) => slot.runId));
   const activeTaskSlot = inFlight.some((task) => {
     const record = records.find((run) => run.taskId === task.id);
     return liveSlotIds.has(`task-${task.id}-pending`) ||

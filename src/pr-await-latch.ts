@@ -753,7 +753,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	let reviewCtrl: ReviewController | undefined = hooks.reviewController;
-	const sessionRuns = new Map<string, RunSnapshot & { key: string }>();
+	const sessionRuns = new Map<string, RunSnapshot & { key: string; settled?: Promise<unknown> }>();
 	function getController(): ReviewController {
 		if (reviewCtrl) return reviewCtrl;
 		const store = createReviewStore(stateDir());
@@ -824,11 +824,12 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 							if (!events) throw new Error("pr-review launch handler is not registered in this runtime");
 							return await requestReviewLaunch(events, intent);
 					  })();
-				const rec: RunSnapshot & { key: string } = {
+				const rec: RunSnapshot & { key: string; settled?: Promise<unknown> } = {
 					runId: launched.runId,
 					status: "running",
 					key: intent.idempotencyKey,
 					worktree: intent.worktree,
+					...(launched.settled ? { settled: launched.settled } : {}),
 				};
 				sessionRuns.set(launched.runId, rec);
 				sessionRuns.set(intent.idempotencyKey, rec);
@@ -852,6 +853,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 						);
 					const runId = mem?.runId || stored?.launch?.runId || key;
 					const snap = readPiRunDisk(runId);
+					// launchSessionFixer returns before the child exits, so wait for its
+					// host-side commit gate before sampling HEAD for publication.
+					if (snap?.terminal) await mem?.settled;
 					let head: string | undefined;
 					// HEAD is the fixer's worktree, not the live latch cwd. A later
 					// `git pr-await` on another PR would otherwise publish the wrong SHA.

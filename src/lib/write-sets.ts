@@ -17,6 +17,7 @@
  * Run: node --experimental-strip-types --test test/write-sets.test.ts
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -190,7 +191,12 @@ const WRITERS_LOCK = ".writers.lock";
 const WRITER_LOCK_STALE_MS = 30_000;
 const WRITER_LOCK_WAIT_MS = 10;
 const WRITER_LOCK_TIMEOUT_MS = 30_000;
-const HELD_WRITER_LOCKS = new Set<string>();
+
+type WriterLockContext = { held: Set<string> };
+/** Reentrancy belongs to one async execution context, never this process. */
+const WRITER_LOCK_CONTEXT = new AsyncLocalStorage<WriterLockContext | undefined>();
+/** Local waiters also keep sync RMW calls from blocking the event loop. */
+const LOCAL_WRITER_LOCK_TAILS = new Map<string, Promise<void>>();
 
 function writerLockPath(dir: string): string {
   return join(dir, WRITERS_LOCK);
@@ -279,10 +285,20 @@ function acquireWriterLock(dir: string): string {
 
 function withWriterLock<T>(dir: string, action: () => T): T {
   const requested = writerLockPath(dir);
-  if (HELD_WRITER_LOCKS.has(requested)) return action();
+  const owner = WRITER_LOCK_CONTEXT.getStore();
+  if (owner?.held.has(requested)) return action();
+  // A synchronous caller cannot wait on an async holder without freezing the
+  // event loop that must release it. Queue the transaction instead; callers
+  // that can wait use `await` (the uncontended path remains synchronous for
+  // the existing sidecar API).
+  if (LOCAL_WRITER_LOCK_TAILS.has(requested)) {
+    return WRITER_LOCK_CONTEXT.run(undefined, () =>
+      withWriterLockAsync(dir, async () => action()),
+    ) as unknown as T;
+  }
   const lockPath = acquireWriterLock(dir);
   try {
-    return action();
+    return WRITER_LOCK_CONTEXT.run({ held: new Set([requested]) }, action);
   } finally {
     rmSync(lockPath, { recursive: true, force: true });
   }
@@ -305,15 +321,40 @@ async function acquireWriterLockAsync(dir: string): Promise<string> {
 /** Run one asynchronous sidecar transaction under the cross-process lock. */
 export async function withWriterLockAsync<T>(dir: string, action: () => Promise<T>): Promise<T> {
   const requested = writerLockPath(dir);
-  if (HELD_WRITER_LOCKS.has(requested)) return action();
-  const lockPath = await acquireWriterLockAsync(dir);
-  HELD_WRITER_LOCKS.add(lockPath);
-  try {
-    return await action();
-  } finally {
-    HELD_WRITER_LOCKS.delete(lockPath);
-    rmSync(lockPath, { recursive: true, force: true });
-  }
+  const owner = WRITER_LOCK_CONTEXT.getStore();
+  if (owner?.held.has(requested)) return action();
+
+  // Serialize this process's async holders before touching the lockfile. This
+  // both preserves ordering and lets a synchronous sibling queue rather than
+  // block the event loop while this holder is awaiting.
+  const previous = LOCAL_WRITER_LOCK_TAILS.get(requested) ?? Promise.resolve();
+  let releaseTail!: () => void;
+  const currentTail = new Promise<void>((resolve) => { releaseTail = resolve; });
+  const turn = previous.then(async () => {
+    const lockPath = await acquireWriterLockAsync(dir);
+    try {
+      const held = new Set(owner?.held ?? []);
+      held.add(requested);
+      return await WRITER_LOCK_CONTEXT.run({ held }, action);
+    } finally {
+      rmSync(lockPath, { recursive: true, force: true });
+    }
+  });
+  const tail = turn.then(
+    () => {
+      releaseTail();
+    },
+    () => {
+      releaseTail();
+    },
+  );
+  LOCAL_WRITER_LOCK_TAILS.set(requested, currentTail);
+  void tail.then(() => {
+    if (LOCAL_WRITER_LOCK_TAILS.get(requested) === currentTail) {
+      LOCAL_WRITER_LOCK_TAILS.delete(requested);
+    }
+  });
+  return turn;
 }
 
 /** Read recorded slots. Unreadable/corrupt sidecar reads as empty, never throws. */
