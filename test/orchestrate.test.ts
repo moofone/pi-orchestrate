@@ -1729,10 +1729,13 @@ test("L5: stripApproveFences also drops a nameless /orchestrate approve fence", 
 });
 
 test("L5: unwrapJsonFences does not close on triple backticks inside a JSON string", () => {
+  // U+2028 is valid inside a JSON string and is also a regex line boundary,
+  // letting the fixture contain a closer-shaped line without invalid JSON.
+  const jsonLineSeparator = "\u2028";
   const src = [
     "```json",
     "{",
-    '  "script": "const fence = ```;\\nreturn fence;",',
+    '  "script": "const fence = ' + jsonLineSeparator + '```' + jsonLineSeparator + 'return fence;",',
     '  "async": true',
     "}",
     "```",
@@ -1740,7 +1743,7 @@ test("L5: unwrapJsonFences does not close on triple backticks inside a JSON stri
   ].join("\n");
   const out = orch.unwrapJsonFences(src);
   const parsed = JSON.parse(out.trim()) as { script: string; async: boolean };
-  assert.equal(parsed.script, ["const fence = ```;", "return fence;"].join("\n"));
+  assert.equal(parsed.script, ["const fence = ", "```", "return fence;"].join(jsonLineSeparator));
   assert.equal(parsed.async, true);
 });
 
