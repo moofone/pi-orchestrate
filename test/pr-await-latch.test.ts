@@ -60,7 +60,7 @@ const {
 	parseField,
 	trailingCd,
 } = await import("../src/pr-await-latch.ts");
-const { parsePrKey } = await import("../src/lib/pr-review-identity.ts");
+const { parsePrKey, parseVerdictHead, verdictIdentity } = await import("../src/lib/pr-review-identity.ts");
 const { createReviewStore, emptyObligation } = await import("../src/lib/pr-review-store.ts");
 const {
 	actionableFingerprint,
@@ -1763,6 +1763,66 @@ test("already-consumed waiter verdict is marked delivered on recovery", async ()
 			assert.equal(h2.sessionFixes.length, 0, "receipt means the fixer already launched");
 			const state = JSON.parse(readFileSync(waiterState(h2.dir), "utf8"));
 			assert.equal(state.verdictDelivered, true, "duplicate consumption must spend the waiter verdict");
+		} finally {
+			h2.cleanup();
+		}
+	} finally {
+		h1.cleanup();
+	}
+});
+
+test("controller-owned Feature latch replay does not duplicate fixer, push, or waiter", async () => {
+	const owner = {
+		dir: join(tmpdir(), "feature-controller-replay"),
+		statusFile: join(tmpdir(), "feature-controller-replay", "status.md"),
+		repo: "icemining",
+		name: "feature-controller-replay",
+		pr: "2142",
+		worktree: REPO,
+	};
+	let controllerActions = 0;
+	const featureHooks = {
+		featureOwnedPr: () => owner,
+		onFeatureActionable: () => {
+			controllerActions += 1;
+			return "spawn_writer";
+		},
+	};
+	const h1 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, featureHooks);
+	try {
+		await h1.start();
+		await h1.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h1.dir, h1.sessionId);
+		await h1.settle();
+		await sleep(80);
+		assert.equal(controllerActions, 1, "the controller acknowledges one Feature verdict");
+		assert.equal(h1.sessionFixes.length, 0, "the Feature latch must not start a parent fixer");
+		assert.equal(h1.spawns.length, 0, "the Feature controller owns the waiter");
+
+		const key = parsePrKey({ pr: "2142", slug: "moofone/icemining" })!;
+		const body = ACTIONABLE_VERDICT;
+		const identity = verdictIdentity({
+			pr: key,
+			head: parseVerdictHead(body),
+			next: "read_comments_and_fix",
+			body,
+		});
+		assert.equal(createReviewStore(h1.dir).hasReceipt(identity), true, "controller acknowledgement is durable");
+
+		const h2 = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, featureHooks);
+		try {
+			await h2.start();
+			await h2.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+			// A reload/replay uses a fresh latch instance but retains the controller's
+			// durable receipt. Re-emit the same waiter event as undelivered.
+			cpSync(join(h1.dir, "review"), join(h2.dir, "review"), { recursive: true });
+			writeActionable(h2.dir, h2.sessionId);
+			await h2.settle();
+			await sleep(80);
+			assert.equal(controllerActions, 1, "replayed Feature verdict must not start a second fixer");
+			assert.equal(h2.sessionFixes.length, 0, "replay must not fall back to a parent fixer");
+			assert.equal(h2.spawns.length, 0, "replay must not start a second waiter");
+			assert.equal(JSON.parse(readFileSync(waiterState(h2.dir), "utf8")).verdictDelivered, true);
 		} finally {
 			h2.cleanup();
 		}
