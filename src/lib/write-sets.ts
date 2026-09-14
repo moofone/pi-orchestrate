@@ -172,6 +172,10 @@ export function parseFilesScalar(body: string): string[] {
   const raw = (String(body ?? "").match(/^-\s*Files:\s*(.+?)\s*$/im)?.[1] ?? "").trim();
   if (!raw || /^(pending|none|tbd|todo)$/i.test(raw)) return [];
   const parts = raw.split(/[\s,;]+/).filter(Boolean);
+  // A partially usable declaration is not a scope: admitting the normalized
+  // subset would let the writer run concurrently while its malformed path is
+  // still unguarded. Treat the whole declaration as unknown/solo instead.
+  if (parts.some((part) => normalizeWritePath(part) === null)) return [];
   return normalizeWriteSet(parts);
 }
 

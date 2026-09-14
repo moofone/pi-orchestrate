@@ -246,6 +246,28 @@ test("shared-tree: wave dirt backstop blocks a Task before resume can reach QA",
   assert.ok(blockedGuard >= 0 && blockedGuard < qa, "resume checks blocked Tasks before QA");
 });
 
+test("shared-tree: a successful paused wave lane is done before the paused return", () => {
+  const source = readFileSync(ORCH_SRC, "utf8");
+  const batchStart = source.indexOf("async function runTaskBatch");
+  const batchEnd = source.indexOf("\nasync function runChainTaskOnce", batchStart);
+  const batch = source.slice(batchStart, batchEnd);
+  const planDone = batch.indexOf('setTaskStatusInPlan(nextPlan, item.task.id, "done")');
+  const pausedResult = batch.indexOf('result === "paused"');
+  const pausedPhase = batch.indexOf('phase: "paused"', pausedResult);
+  assert.ok(planDone >= 0 && pausedResult >= 0 && planDone < pausedPhase,
+    "a paused successful lane must be recorded done before the wave returns paused");
+  assert.ok(batch.slice(pausedPhase).includes('nextAction: "/orchestrate resume"'));
+
+  const onceStart = source.indexOf("async function runChainTaskOnce");
+  const onceEnd = source.indexOf("\nasync function runFeatureChain", onceStart);
+  const once = source.slice(onceStart, onceEnd);
+  assert.match(once, /return wave \? "paused" : false/,
+    "wave pause must be distinct from a failed boolean result");
+  const chain = source.slice(source.indexOf("async function runFeatureChain"));
+  assert.ok(chain.indexOf('t.status === "blocked"') >= 0,
+    "resume must retain the blocked-task guard for genuine failures");
+});
+
 test("shared-tree: selectTaskBatch takes disjoint scoped Tasks, skips the rest", () => {
   const plan = [
     "# Feature: t",

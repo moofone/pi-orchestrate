@@ -149,6 +149,10 @@ test("write-sets: parseFilesScalar reads - Files:, absent means solo", () => {
   assert.deepEqual(parseFilesScalar("- Files: none"), []);
 });
 
+test("write-sets: malformed Files declarations become unknown instead of a partial scope", () => {
+  assert.deepEqual(parseFilesScalar("### Task 1\n- Files: src/a.ts ../shared.ts\n"), []);
+});
+
 test("write-sets: sidecar claim/sweep/release round-trips on disk", () => {
   const dir = mkdtempSync(join(tmpdir(), "writers-"));
   const live = new Set(["run-1"]);

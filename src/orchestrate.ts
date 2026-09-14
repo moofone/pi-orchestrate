@@ -5630,6 +5630,9 @@ export interface ChainTaskBatch {
   onRunId?: (runId: string) => void;
 }
 
+/** A wave lane can finish successfully while pausing the Feature. */
+type ChainTaskResult = boolean | "paused";
+
 /**
  * Serializes plan.md read-modify-write across concurrent same-tree writers so
  * two Tasks settling at once cannot lose each other's status lines. The
@@ -5717,8 +5720,8 @@ export function selectTaskBatch(
  * Run one shared-tree wave: pre-claim provisional slots in a single persist
  * (the sets are disjoint by construction), settle every Task concurrently,
  * hold successful lanes in_progress through the union dirt backstop, then
- * release everything. A false from any lane stops the chain — that lane
- * already recorded its paused/blocked state and notified.
+ * release everything. A failed lane stops the chain; a paused successful lane
+ * is recorded done after the backstop and returns the paused path.
  */
 async function runTaskBatch(
   pi: ExtensionAPI,
@@ -5854,7 +5857,7 @@ async function runTaskBatch(
         : freshPlan;
       return admitted.reduce((nextPlan, item, index) => {
         if (item.task.id === blockedItem?.task.id) return nextPlan;
-        if (results[index]) {
+        if (results[index] === true || results[index] === "paused") {
           return setTaskHandoffInPlan(
             setTaskStatusInPlan(nextPlan, item.task.id, "done"),
             item.task.id,
@@ -5889,7 +5892,16 @@ async function runTaskBatch(
       uiNotify(ctx, `${name}: ${nextAction}\nChain stopped, no PR opened.`, "error");
       return false;
     }
-    if (!results.every(Boolean)) return false;
+    if (results.some((result) => result === false)) return false;
+    if (results.some((result) => result === "paused") || isPaused(readText(paths.statusFile))) {
+      upsertStatusFile(paths, {
+        phase: "paused",
+        activeTask: "none",
+        nextAction: "/orchestrate resume",
+        tasks: parseTasks(readText(paths.planFile)),
+      });
+      return false;
+    }
     upsertStatusFile(paths, {
       workerRunId: "none",
       workerRunDir: "none",
@@ -5924,7 +5936,7 @@ async function runChainTaskOnce(
   tasks: Task[],
   inFlight: Task | undefined,
   opts: { batch?: ChainTaskBatch } = {},
-): Promise<boolean> {
+): Promise<ChainTaskResult> {
   const statusNow = readText(paths.statusFile);
   const wave = opts.batch?.wave === true;
   const blockedByReview = writerBlockedByPlanReview(statusNow);
@@ -6189,7 +6201,7 @@ async function runChainTaskOnce(
       if (isPaused(readText(paths.statusFile))) {
         upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
         uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
-        return false;
+        return wave ? "paused" : false;
       }
       return true;
     }
@@ -6244,7 +6256,7 @@ async function runChainTaskOnce(
     if (isPaused(readText(paths.statusFile))) {
       upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
       uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
-      return false;
+      return wave ? "paused" : false;
     }
     return true;
   }
@@ -6261,7 +6273,7 @@ async function runChainTaskOnce(
   if (isPaused(readText(paths.statusFile))) {
     upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
     uiNotify(ctx, `Paused after Task ${task.id}. /orchestrate resume to continue.`, "info");
-    return false;
+    return wave ? "paused" : false;
   }
   return true;
   } finally {
