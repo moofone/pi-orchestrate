@@ -3709,7 +3709,7 @@ export async function ensureWriterCommit(
       const touched = porcelainEntryPaths(line).filter(
         (path) => !isCommitGateIgnoredPath(path, platform),
       );
-      return touched.length > 0 && writeSetsOverlap(scope, touched);
+      return touched.length > 0 && touched.every((path) => writeSetsOverlap(scope, [path]));
     };
     const paths = [
       ...new Set(
@@ -3798,7 +3798,8 @@ export async function ensureSessionFixerCommitGate(
     .split("\n")
     .filter((line) => line.trim())
     .filter((line) => porcelainEntryPaths(line).some(
-      (path) => !isCommitGateIgnoredPath(path, platform) && !writeSetsOverlap(touched, [path]),
+      (path) => !isCommitGateIgnoredPath(path, platform) &&
+        (touched.length === 0 || !writeSetsOverlap(touched, [path])),
     ));
   if (outside.length > 0) {
     const reason = "unrelated pre-existing paths remain dirty after the session fixer";
@@ -5136,7 +5137,11 @@ async function runReviewFixWriter(
         (path) => !writeSetsOverlap(roundPaths, [path]),
       ));
     if (outside.length > 0) {
-      gate = { state: "dirty", reason: "unassigned paths remain dirty after the review-fix gate" };
+      const entries = outside.slice(0, 8).map((line) => line.trim()).join("; ");
+      gate = {
+        state: "dirty",
+        reason: `unassigned paths remain dirty after the review-fix gate: ${entries}`,
+      };
     }
   }
   if (gate.state === "dirty") {

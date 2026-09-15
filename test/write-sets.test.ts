@@ -153,6 +153,22 @@ test("write-sets: malformed Files declarations become unknown instead of a parti
   assert.deepEqual(parseFilesScalar("### Task 1\n- Files: src/a.ts ../shared.ts\n"), []);
 });
 
+test("write-sets: malformed persisted paths become unknown and block admission", () => {
+  const dir = mkdtempSync(join(tmpdir(), "writers-corrupt-"));
+  writeFileSync(join(dir, "writers.json"), JSON.stringify([{
+    runId: "corrupt",
+    runDir: "/tmp/corrupt",
+    agent: "fixer",
+    writeSet: ["src/a.ts", "../outside"],
+    claimedAt: 1,
+  }]));
+  const slots = readWriterSlots(dir);
+  assert.deepEqual(slots[0]?.writeSet, []);
+  const admission = admitWriteSlot(slots, { agent: "fixer", writeSet: ["src/b.ts"] }, 4);
+  assert.equal(admission.ok, false);
+  if (!admission.ok) assert.equal(admission.reason, "overlap");
+});
+
 test("write-sets: sidecar claim/sweep/release round-trips on disk", () => {
   const dir = mkdtempSync(join(tmpdir(), "writers-"));
   const live = new Set(["run-1"]);

@@ -375,13 +375,17 @@ export function readWriterSlots(dir: string): WriterSlot[] {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const slot = entry as Partial<WriterSlot>;
     if (typeof slot.runId !== "string" || !slot.runId) continue;
+    const writeSet = Array.isArray(slot.writeSet) &&
+      slot.writeSet.every((path): path is string =>
+        typeof path === "string" && normalizeWritePath(path) !== null,
+      )
+      ? normalizeWriteSet(slot.writeSet)
+      : [];
     out.push({
       runId: slot.runId,
       runDir: typeof slot.runDir === "string" ? slot.runDir : "",
       agent: typeof slot.agent === "string" ? slot.agent : "",
-      writeSet: Array.isArray(slot.writeSet)
-        ? normalizeWriteSet(slot.writeSet.filter((p): p is string => typeof p === "string"))
-        : [],
+      writeSet,
       claimedAt: typeof slot.claimedAt === "number" ? slot.claimedAt : 0,
       ...(typeof slot.label === "string" ? { label: slot.label } : {}),
     });

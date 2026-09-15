@@ -3817,6 +3817,22 @@ test("session fixer gate leaves pre-existing unrelated dirt uncommitted", async 
   assert.ok(mutation.every((call) => !call.includes("unrelated.ts")), mutation.join(" | "));
 });
 
+test("session fixer gate treats no fixer changes as outside dirt", async () => {
+  const dirty = " M unrelated.ts\n";
+  const pi = makeFakePi(async (cmd, args) => {
+    if (cmd === "git" && args[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureSessionFixerCommitGate(
+    pi as never,
+    "/tmp/session-gate-wt",
+    "fix: review session moofone/pi-orchestrate#21",
+    dirty,
+  );
+  assert.equal(gate.state, "dirty");
+  assert.match(gate.reason, /unrelated pre-existing/);
+});
+
 test("session fixer gate leaves baseline-dirty touched paths ambiguous while committing clean paths", async () => {
   const calls: string[] = [];
   let committed = false;
@@ -6188,7 +6204,7 @@ test("P3 F11: staged rename commits both source and destination", async () => {
   assert.equal(gate.state, "committed");
 });
 
-test("P3 F11: scoped rename stages both endpoints when the source is in scope", async () => {
+test("P3 F11: scoped rename stages both endpoints when both are in scope", async () => {
   let dirty = "R  src/a.ts -> src/b.ts";
   const calls: string[][] = [];
   const pi = makeFakePi(async (_cmd, args) => {
@@ -6206,12 +6222,33 @@ test("P3 F11: scoped rename stages both endpoints when the source is in scope", 
     "/wt",
     "Task 1 — x",
     "linux",
-    ["src/a.ts"],
+    ["src"],
   );
   assert.equal(gate.state, "committed");
   const staged = calls.filter((args) => args[0] === "add" || args[0] === "commit").flat();
   assert.ok(staged.includes(":(literal)src/a.ts"));
   assert.ok(staged.includes(":(literal)src/b.ts"), "a rename destination must stay with its source");
+});
+
+test("P3 F11: scoped straddling rename stays out of the commit pathspec", async () => {
+  const dirty = "R  src/a.ts -> sibling.ts";
+  const calls: string[][] = [];
+  const pi = makeFakePi(async (_cmd, args) => {
+    const actual = [...(args ?? [])];
+    calls.push(actual);
+    if (actual[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(
+    pi as never,
+    "/wt",
+    "Task 1 — x",
+    "linux",
+    ["src/a.ts"],
+  );
+  assert.equal(gate.state, "clean", "the scoped gate leaves the straddling entry for the dirt backstop");
+  assert.deepEqual(calls.filter((args) => args[0] === "add" || args[0] === "commit"), []);
+  assert.match(orch.porcelainOutsideWriteSet(dirty, ["src/a.ts"]), /sibling\.ts/);
 });
 
 test("P3 F11: quoted porcelain paths are committed decoded, not still-escaped", async () => {
