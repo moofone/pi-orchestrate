@@ -1873,6 +1873,7 @@ test("queryRun rev-parses the fixer worktree, not a later latch cwd", async () =
 	const published: string[] = [];
 	const revParseCwds: string[] = [];
 	let childComplete = false;
+	let fixerCommitted = false;
 	const otherOut = [
 		"status=reviewer_active",
 		"next=poll_again",
@@ -1883,6 +1884,13 @@ test("queryRun rev-parses the fixer worktree, not a later latch cwd", async () =
 	const h = harness(
 		(cmd, args, opts) => {
 			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "status") {
+				return ok(!childComplete || fixerCommitted ? "" : " M src/fix.ts\n");
+			}
+			if (cmd === "git" && args?.[0] === "commit") {
+				fixerCommitted = true;
+				return ok("");
+			}
 			if (cmd === "git" && args?.[0] === "rev-parse") {
 				revParseCwds.push(String(opts?.cwd ?? ""));
 				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
@@ -1939,6 +1947,7 @@ test("reawait after publish targets the obligation PR, not a later latch", async
 	const runId = `session-reawait-pr-${process.pid}`;
 	const published: string[] = [];
 	let childComplete = false;
+	let fixerCommitted = false;
 	const otherOut = [
 		"status=reviewer_active",
 		"next=poll_again",
@@ -1949,6 +1958,13 @@ test("reawait after publish targets the obligation PR, not a later latch", async
 	const h = harness(
 		(cmd, args, opts) => {
 			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "status") {
+				return ok(!childComplete || fixerCommitted ? "" : " M src/fix.ts\n");
+			}
+			if (cmd === "git" && args?.[0] === "commit") {
+				fixerCommitted = true;
+				return ok("");
+			}
 			if (cmd === "git" && args?.[0] === "rev-parse") {
 				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
 				if (opts?.cwd === PI_SUB) return ok(otherHead);
@@ -2126,6 +2142,7 @@ test("ensureWaiter targets the obligation PR, not a later latch", async () => {
 	const otherHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 	const runId = `session-ensure-pr-${process.pid}`;
 	let childComplete = false;
+	let fixerCommitted = false;
 	const otherOut = [
 		"status=reviewer_active",
 		"next=poll_again",
@@ -2136,6 +2153,13 @@ test("ensureWaiter targets the obligation PR, not a later latch", async () => {
 	const h = harness(
 		(cmd, args, opts) => {
 			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "status") {
+				return ok(!childComplete || fixerCommitted ? "" : " M src/fix.ts\n");
+			}
+			if (cmd === "git" && args?.[0] === "commit") {
+				fixerCommitted = true;
+				return ok("");
+			}
 			if (cmd === "git" && args?.[0] === "rev-parse") {
 				if (opts?.cwd === REPO) return ok(childComplete ? fixerHead : originalHead);
 				if (opts?.cwd === PI_SUB) return ok(otherHead);
