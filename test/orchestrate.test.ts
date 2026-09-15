@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 
 import * as orch from "../src/orchestrate.ts";
 import { registerLatchArm, registerLatchWake } from "../src/lib/pr-await-core.ts";
+import { claimWriterSlot, readTaskRuns, readWriterSlots, upsertTaskRun } from "../src/lib/write-sets.ts";
 
 const ORCH_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/orchestrate.ts");
 const LIFECYCLE_SRC = join(dirname(fileURLToPath(import.meta.url)), "../src/lib/lifecycle.ts");
@@ -1546,14 +1547,19 @@ test("W2: applySpawnPolicy pins every parallel writer task", () => {
       { agent: "tdd-worker", model: "grok-4.6" },
       { agent: "tdd-worker", model: "cursor/composer-2.5-fast:high" },
     ],
-    concurrency: 7,
+    concurrency: 9,
   };
   apply(params);
   for (const task of params.parallel) {
     assert.equal(task.model, "xai/grok-4.6:medium");
   }
   assert.equal(orch.WRITER_MAX_CONCURRENCY, 4);
-  assert.equal(params.concurrency, orch.WRITER_MAX_CONCURRENCY, "writer fanout must not keep concurrency 7");
+  assert.equal(orch.WRITER_CONCURRENCY_CAP["tdd-worker"], 8);
+  assert.equal(orch.WRITER_CONCURRENCY_CAP["fixer"], 4);
+  assert.equal(params.concurrency, 8, "tdd-worker fanout must clamp to its cap of 8, not keep 9");
+  const fixer = { agent: "fixer", model: "xai/grok-4.6:high", concurrency: 7 };
+  apply(fixer);
+  assert.equal(fixer.concurrency, 4, "fixer fanout must clamp to its cap of 4, not keep 7");
 });
 
 test("W2: subagentToolGuard blocks unknown cursor billing and mutates writer input", () => {
@@ -2334,6 +2340,18 @@ test("R6: an orphaned Task whose worker finished is recorded done, not re-run", 
     endedAt: 2,
     steps: [{ status: "complete" }],
   });
+  claimWriterSlot(
+    paths.handoffsDir,
+    {
+      runId: "6cbcaaf5-83f0-46b5-b7b4-f89347763413",
+      runDir: "/tmp/orphan-run",
+      agent: "tdd-worker",
+      writeSet: [],
+      claimedAt: Date.now(),
+    },
+    () => true,
+    8,
+  );
   const { ctx, notices } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(
     movedHeadPi() as never,
@@ -2350,6 +2368,7 @@ test("R6: an orphaned Task whose worker finished is recorded done, not re-run", 
   assert.match(status, /^active_task: none$/m);
   assert.match(status, /^worker_run_id: none$/m);
   assert.match(status, /^task_base: none$/m);
+  assert.deepEqual(readWriterSlots(paths.handoffsDir), [], "orphan recovery releases its writer slot");
   assert.match(notices.join("\n"), /recovered/i);
 });
 
@@ -2380,6 +2399,25 @@ test("R6: an orphaned Task that produced nothing is re-run, not blocked", async 
 
 test("R6: a Task with no in-flight record leaves the plan alone", async () => {
   const { paths } = orphanFixture("pending", undefined);
+  claimWriterSlot(
+    paths.handoffsDir,
+    {
+      runId: "run-5",
+      runDir: "/tmp/run-5",
+      agent: "tdd-worker",
+      writeSet: [],
+      claimedAt: Date.now(),
+    },
+    () => true,
+    8,
+  );
+  upsertTaskRun(paths.handoffsDir, {
+    taskId: "5",
+    runId: "run-5",
+    runDir: "/tmp/run-5",
+    baseTag: "base",
+    baseHead: "head",
+  });
   const { ctx } = makeFakeCtx();
   const proceed = await orch.reconcileOrphanTask(
     movedHeadPi() as never,
@@ -2390,6 +2428,8 @@ test("R6: a Task with no in-flight record leaves the plan alone", async () => {
   );
   assert.equal(proceed, true);
   assert.match(readFileSync(paths.planFile, "utf8"), /- Status: pending/);
+  assert.deepEqual(readTaskRuns(paths.handoffsDir), [], "settled Task rows are swept");
+  assert.deepEqual(readWriterSlots(paths.handoffsDir), [], "sweeping a Task row releases its writer slot");
 });
 
 test("R6: a live orphan run is waited on, never started a second time", async () => {
@@ -2415,6 +2455,96 @@ test("R6: a live orphan run is waited on, never started a second time", async ()
   assert.equal(proceed, false, "one writer per worktree: do not spawn over a live worker");
   assert.match(readFileSync(paths.planFile, "utf8"), /- Status: in_progress/);
   assert.match(notices.join("\n"), /still (running|being written)/i);
+});
+
+test("R6: wave orphan recovery uses each Task's own run and base metadata", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-wave-orphan-"));
+  const paths = {
+    repo: "icemining",
+    gitRoot: dir,
+    repoDir: dir,
+    featureDir: dir,
+    planFile: join(dir, "plan.md"),
+    statusFile: join(dir, "status.md"),
+    handoffsDir: join(dir, "handoffs"),
+    archiveDir: join(dir, "archive"),
+  };
+  writeFileSync(
+    paths.planFile,
+    [
+      "# Feature: wave recovery",
+      "",
+      "### Task 1 — a",
+      "- Status: in_progress",
+      "- Files: src/a.ts",
+      "",
+      "### Task 2 — b",
+      "- Status: in_progress",
+      "- Files: src/b.ts",
+      "",
+    ].join("\n"),
+  );
+  const runA = join(dir, "run-a");
+  const runB = join(dir, "run-b");
+  mkdirSync(runA, { recursive: true });
+  mkdirSync(runB, { recursive: true });
+  const completed = { state: "complete", startedAt: 1, endedAt: 2, steps: [{ status: "complete" }] };
+  const failed = { state: "failed", startedAt: 1, endedAt: 2, steps: [{ status: "failed" }] };
+  writeFileSync(join(runA, "status.json"), JSON.stringify(completed));
+  writeFileSync(join(runB, "status.json"), JSON.stringify(failed));
+  const runBBase = orch.fingerprintTag(" M src/a.ts");
+  writeFileSync(
+    paths.statusFile,
+    [
+      "# Status",
+      "",
+      "phase: implementing",
+      "active_task: 1+2",
+      "worker_run_id: run-b",
+      `worker_run_dir: ${runB}`,
+      `task_base: ${runBBase}`,
+      "task_base_head: none",
+      "pause: off",
+      "",
+    ].join("\n"),
+  );
+  upsertTaskRun(paths.handoffsDir, {
+    taskId: "1",
+    runId: "run-a",
+    runDir: runA,
+    baseTag: "base-a",
+    baseHead: "none",
+  });
+  upsertTaskRun(paths.handoffsDir, {
+    taskId: "2",
+    runId: "run-b",
+    runDir: runB,
+    baseTag: runBBase,
+    baseHead: "none",
+  });
+  assert.deepEqual(
+    readTaskRuns(paths.handoffsDir).map(({ taskId, runId, baseTag }) => ({ taskId, runId, baseTag })),
+    [
+      { taskId: "1", runId: "run-a", baseTag: "base-a" },
+      { taskId: "2", runId: "run-b", baseTag: runBBase },
+    ],
+    "each orphaned Task must have its own run and base record before recovery",
+  );
+  const pi = makeFakePi(async (_cmd, args) =>
+    args[0] === "status"
+      ? { code: 0, stdout: " M src/a.ts", stderr: "" }
+      : { code: 0, stdout: "", stderr: "" },
+  );
+  const { ctx, notices } = makeFakeCtx();
+  const proceed = await orch.reconcileOrphanTask(pi as never, ctx, paths as never, "wave recovery", dir);
+  assert.equal(proceed, false, "a differentiated failed wave Task must stop recovery after its sibling settles");
+  const plan = readFileSync(paths.planFile, "utf8");
+  assert.match(plan, /### Task 1 — a[\s\S]*?- Status: done/);
+  assert.match(plan, /### Task 2 — b[\s\S]*?- Status: blocked/);
+  assert.match(notices.find((notice) => notice.startsWith("Task 1 recovered")) ?? "", /finished \(complete\)/);
+  assert.match(notices.find((notice) => notice.startsWith("Task 2 was orphaned")) ?? "", /\(failed, worktree unchanged\)/);
+  assert.deepEqual(readTaskRuns(paths.handoffsDir), [], "settled Task metadata is swept");
+  assert.match(readFileSync(paths.statusFile, "utf8"), /^worker_run_id: none$/m);
 });
 
 /* ------------------------------------------------------------------ *
@@ -3409,7 +3539,9 @@ test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and
   assert.equal(params.skill, undefined, "no skill override for a writer child");
   assert.equal(params.skills, undefined, "no skills override for a writer child");
   assert.equal(params.reads, undefined, "no defaultReads pulling SKILL.md into the child");
-  assert.match(task, /commit/i, "the writer commits");
+  assert.match(task, /commit/i, "the host commit gate owns the writer commit");
+  assert.match(task, /Do NOT `git add`, `git commit`, or `git stash`/, "the lane must not touch the shared index");
+  assert.match(task, /Code commits ONLY your assigned paths/, "the host gate commits only the lane scope");
   assert.match(task, /[Dd]o NOT `git push`/, "code pushes, one push per round");
   assert.match(task, /do NOT `gh pr comment`/, "code — not the child — speaks on the PR");
   assertNoStalePoller("reviewFixLaunchParams", task);
@@ -3556,7 +3688,7 @@ test("session fixer launch returns when the child is spawned, not when it exits"
     publication: "controller",
   };
   const p = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, intent);
-  await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
     success: true,
     data: { details: { runId: "run-session-1" } },
@@ -3601,6 +3733,138 @@ function phaseAgentViolationFn() {
   );
   return fn as (phase: string, params: Record<string, unknown>) => string;
 }
+
+test("session fixer settles through the host commit gate", async () => {
+  const calls: string[] = [];
+  let committed = false;
+  let statusReads = 0;
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    if (cmd === "git" && args[0] === "status") {
+      const stdout = statusReads++ === 0 || committed ? "" : " M src/fix.ts\n";
+      return { code: 0, stdout, stderr: "" };
+    }
+    if (cmd === "git" && args[0] === "commit") committed = true;
+    if (cmd === "git" && (args[0] === "add" || args[0] === "commit")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const spawn = captureSpawn(pi);
+  const { ctx } = makeFakeCtx();
+  const intent = {
+    v: 1,
+    idempotencyKey: "k-session-gate",
+    pr: { host: "github.com", owner: "moofone", repo: "icemining", number: "99" },
+    owner: { kind: "session", id: "s1", generation: "g1" },
+    worktree: "/tmp/session-gate-wt",
+    expectedHead: "abc",
+    verdictIds: ["v1"],
+    next: "read_comments_and_fix",
+    body: "next=read_comments_and_fix\\nhead=abc",
+    validation: "commit-only",
+    publication: "controller",
+  };
+  const launch = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, intent);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
+    success: true,
+    data: { details: { runId: "run-session-gate" } },
+  });
+  const result = (await withDeadline(launch, 500)) as { runId?: string; settled?: Promise<unknown> };
+  assert.equal(result.runId, "run-session-gate");
+  pi.events.emit(ASYNC_COMPLETE_EVENT, { runId: result.runId, success: true });
+  const gate = (await withDeadline(result.settled!, 1000)) as { state?: string };
+  assert.equal(gate.state, "committed", "dirty session-fix work must reach the host commit gate");
+  assert.ok(calls.some((call) => call.startsWith("git commit -m fix: review session")));
+});
+
+test("session fixer gate leaves pre-existing unrelated dirt uncommitted", async () => {
+  const calls: string[] = [];
+  let statusReads = 0;
+  let committed = false;
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    if (cmd === "git" && args[0] === "status") {
+      const stdout = statusReads++ === 0
+        ? " M unrelated.ts\n"
+        : committed
+          ? " M unrelated.ts\n"
+          : " M unrelated.ts\n M src/fix.ts\n";
+      return { code: 0, stdout, stderr: "" };
+    }
+    if (cmd === "git" && args[0] === "commit") committed = true;
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const spawn = captureSpawn(pi);
+  const { ctx } = makeFakeCtx();
+  const launch = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, {
+    ...SESSION_FIX_INTENT,
+    idempotencyKey: "k-session-unrelated-dirt",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
+    success: true,
+    data: { details: { runId: "run-session-unrelated-dirt" } },
+  });
+  const result = (await withDeadline(launch, 1000)) as { runId: string; settled: Promise<unknown> };
+  assert.equal(result.runId, "run-session-unrelated-dirt");
+  pi.events.emit(ASYNC_COMPLETE_EVENT, { runId: result.runId, success: true });
+  const gate = (await withDeadline(result.settled, 1000)) as { state?: string; reason?: string };
+  assert.equal(gate.state, "dirty");
+  assert.match(gate.reason ?? "", /unrelated pre-existing/);
+  const mutation = calls.filter((call) => call.startsWith("git add") || call.startsWith("git commit"));
+  assert.ok(mutation.every((call) => !call.includes("unrelated.ts")), mutation.join(" | "));
+});
+
+test("session fixer gate treats no fixer changes as outside dirt", async () => {
+  const dirty = " M unrelated.ts\n";
+  const pi = makeFakePi(async (cmd, args) => {
+    if (cmd === "git" && args[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureSessionFixerCommitGate(
+    pi as never,
+    "/tmp/session-gate-wt",
+    "fix: review session moofone/pi-orchestrate#21",
+    dirty,
+  );
+  assert.equal(gate.state, "dirty");
+  assert.match(gate.reason, /unrelated pre-existing/);
+});
+
+test("session fixer gate leaves baseline-dirty touched paths ambiguous while committing clean paths", async () => {
+  const calls: string[] = [];
+  let committed = false;
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    if (cmd === "git" && args[0] === "status") {
+      return {
+        code: 0,
+        stdout: committed ? " M src/pre-existing.ts\n" : "MM src/pre-existing.ts\n M src/fix.ts\n",
+        stderr: "",
+      };
+    }
+    if (cmd === "git" && args[0] === "commit") {
+      assert.ok(args.includes(":(literal)src/fix.ts"), args.join(" "));
+      assert.ok(!args.includes(":(literal)src/pre-existing.ts"), args.join(" "));
+      committed = true;
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureSessionFixerCommitGate(
+    pi as never,
+    "/tmp/session-gate-wt",
+    "fix: review session moofone/pi-orchestrate#21",
+    " M src/pre-existing.ts\n",
+  );
+  assert.equal(gate.state, "dirty");
+  assert.match(gate.reason, /ambiguous/i);
+  assert.match(gate.reason, /src\/pre-existing\.ts/);
+  const mutation = calls.filter((call) => call.startsWith("git add") || call.startsWith("git commit"));
+  assert.ok(mutation.every((call) => !call.includes("src/pre-existing.ts")), mutation.join(" | "));
+  assert.ok(mutation.some((call) => call.includes("src/fix.ts")), mutation.join(" | "));
+});
 
 test("phase allowlist: every legacy launch's own agent sits inside its phase", () => {
   const violation = phaseAgentViolationFn();
@@ -3686,7 +3950,7 @@ test("runChildInPhase still launches an agent inside the phase allowlist", async
   assert.equal(outcome.ok, true);
 });
 
-test("P2 F7: the tdd-worker contract commits and never pushes", () => {
+test("P2 F7: the tdd-worker leaves staging to the host and never pushes", () => {
   const paths = promptContractPaths();
   const plan = "# Feature: t\n\n### Task 1 — do the thing\n\n- Command: `npm test`\n";
   const params = orch.workerLaunchParams(
@@ -3696,7 +3960,8 @@ test("P2 F7: the tdd-worker contract commits and never pushes", () => {
     plan,
   ) as Record<string, unknown>;
   const task = String(params.task);
-  assert.match(task, /commit/i, "a Task that edits and does not commit is not done (F11)");
+  assert.match(task, /commit/i, "the host commit gate owns the Task commit (F11)");
+  assert.match(task, /Do NOT `git add`, `git commit`, or `git stash`/, "the child must not touch the shared index");
   assert.match(task, /[Dd]o NOT `git push`/, "the branch is pushed once, by code");
   assert.equal(params.skill, undefined, "no solo skill on a writer child");
   assert.equal(params.skills, undefined);
@@ -5479,9 +5744,11 @@ test("P2 F5: runReviewFixWriter decides from the branch and pushes what the fixe
   assert.match(body, /branchHeads\(/, "the round must record the branch heads itself");
   assert.match(body, /fixerPushState\(/, "the settle input must come from the branch");
   assert.match(body, /push_then_await/, "code owes the push when the fixer only committed");
+  // Lanes spawn inside runFixLanes (helpers above); what matters is the
+  // round reads its before-head before any lane runs.
   assert.ok(
-    body.indexOf("branchHeads(") < body.indexOf("runChildInPhase"),
-    "the before-head must be read before the fixer runs, not after",
+    body.indexOf("branchHeads(") < body.indexOf("runFixLanes("),
+    "the before-head must be read before the fixer lanes run, not after",
   );
 });
 
@@ -5937,6 +6204,53 @@ test("P3 F11: staged rename commits both source and destination", async () => {
   assert.equal(gate.state, "committed");
 });
 
+test("P3 F11: scoped rename stages both endpoints when both are in scope", async () => {
+  let dirty = "R  src/a.ts -> src/b.ts";
+  const calls: string[][] = [];
+  const pi = makeFakePi(async (_cmd, args) => {
+    const actual = [...(args ?? [])];
+    calls.push(actual);
+    if (actual[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (actual[0] === "commit") {
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(
+    pi as never,
+    "/wt",
+    "Task 1 — x",
+    "linux",
+    ["src"],
+  );
+  assert.equal(gate.state, "committed");
+  const staged = calls.filter((args) => args[0] === "add" || args[0] === "commit").flat();
+  assert.ok(staged.includes(":(literal)src/a.ts"));
+  assert.ok(staged.includes(":(literal)src/b.ts"), "a rename destination must stay with its source");
+});
+
+test("P3 F11: scoped straddling rename stays out of the commit pathspec", async () => {
+  const dirty = "R  src/a.ts -> sibling.ts";
+  const calls: string[][] = [];
+  const pi = makeFakePi(async (_cmd, args) => {
+    const actual = [...(args ?? [])];
+    calls.push(actual);
+    if (actual[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(
+    pi as never,
+    "/wt",
+    "Task 1 — x",
+    "linux",
+    ["src/a.ts"],
+  );
+  assert.equal(gate.state, "clean", "the scoped gate leaves the straddling entry for the dirt backstop");
+  assert.deepEqual(calls.filter((args) => args[0] === "add" || args[0] === "commit"), []);
+  assert.match(orch.porcelainOutsideWriteSet(dirty, ["src/a.ts"]), /sibling\.ts/);
+});
+
 test("P3 F11: quoted porcelain paths are committed decoded, not still-escaped", async () => {
   const backslash = String.fromCharCode(92);
   let dirty = ` M "foo${backslash}${backslash}bar"`;
@@ -6007,6 +6321,28 @@ test("P3 F11: an already-clean tree runs no commit at all", async () => {
     [],
     "code must not manufacture an empty commit on a clean tree",
   );
+});
+
+test("P3 F11: an empty scope uses the whole-tree commit gate", async () => {
+  let dirty = " M src/a.ts";
+  const calls: string[] = [];
+  const pi = makeFakePi(async (cmd, args) => {
+    const a = args ?? [];
+    calls.push([cmd, ...a].join(" "));
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "add") {
+      assert.deepEqual(a, ["add", "-A"], "empty scope must retain the old whole-tree add");
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "commit") {
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x", "linux", []);
+  assert.equal(gate.state, "committed");
+  assert.ok(calls.some((call) => call === "git add -A"));
 });
 
 test("P3 F11: git that cannot answer is inconclusive, never a silent land", async () => {

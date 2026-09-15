@@ -135,7 +135,19 @@ test("writer restrictions see workflow commands hidden inside substitutions", ()
 			`the block must come from the writer path, not an unparsed allow: ${command}`,
 		);
 	}
-	assert.equal(classifyForRole('git commit -m "built $(date)"', { writer: true }).block, false);
+	for (const command of [
+		"git add -- src/a.ts",
+		"git commit -m fix",
+		"git stash push -- src/a.ts",
+		"echo $(git add -- src/a.ts)",
+		"echo `git commit -m fix`",
+		"git stash pop",
+	]) {
+		const verdict = classifyForRole(command, { writer: true });
+		assert.equal(verdict.block, true, `a writer child must not run: ${command}`);
+		assert.match(String((verdict as { reason?: string }).reason ?? ""), /stage|commit|stash/i);
+	}
+	assert.equal(classifyForRole('git commit -m "built $(date)"', { writer: true }).block, true);
 });
 
 /* ---------------------------------------------------------------- *
@@ -389,11 +401,9 @@ test("P2 F7: a writer child may not wait, land, worktree, push, or touch the PR"
   }
 });
 
-test("P2 F7: a writer child still commits, reads, and runs its own gate", () => {
+test("P2 F7: a writer child leaves git staging to the host commit gate", () => {
   const allowed = [
     "git status --porcelain",
-    "git add -A",
-    "git commit -m 'Task 3 — bound the fix loop'",
     "git diff HEAD",
     "git log --oneline -5",
     "git fetch origin",
@@ -405,6 +415,13 @@ test("P2 F7: a writer child still commits, reads, and runs its own gate", () => 
       classifyForRole(command, { writer: true }).block,
       false,
       `a writer child must still be able to run: ${command}`,
+    );
+  }
+  for (const command of ["git add -A", "git commit -m fix", "git stash push"]) {
+    assert.equal(
+      classifyForRole(command, { writer: true }).block,
+      true,
+      `a writer child must leave index mutations to the host: ${command}`,
     );
   }
 });
@@ -561,14 +578,14 @@ test("registered guard keeps a parent and forged attempt identity out of a reser
     process.env.PI_SUBAGENT_RUN_ID = "run-1";
     process.env.PI_SUBAGENT_PARENT_SESSION = "owner-header-1";
     process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header-1" } });
-    const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m own" } });
-    assert.equal(own?.block ?? false, false, "a verified worker may mutate its own reserved workspace");
+    const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status --porcelain" } });
+    assert.equal(own?.block ?? false, false, "a verified worker may inspect its own reserved workspace");
     for (const [command, why] of [
       ["gh pr create --title x --body y", /never speaks on the PR/],
       ["git wt branch", /never creates or removes a worktree/],
       ["git pr-await 1", /never waits on the review/],
       ["git pr-land 1", /never lands the PR/],
-      ["git push", /writer child commits; code pushes/],
+      ["git push", /writer child leaves work unstaged; code commits and pushes/],
       ["git worktree list && git worktree add ../later -b later", /never creates or removes a worktree/],
     ] as const) {
       const worker = await handler!({ toolName: "bash", cwd: workspace, input: { command } });
@@ -680,8 +697,8 @@ test("registered guard accepts only runtime-bound attempt, run, and session-head
     let handler: ((event: any) => Promise<any>) | undefined;
     guardExtension({ on(name: string, fn: any) { if (name === "tool_call") handler = fn; } } as unknown as ExtensionAPI);
     assert.ok(handler);
-    const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: `git -C ${workspace} commit -m own` } });
-    assert.equal(own?.block ?? false, false, "the actual runtime identity may mutate its assigned workspace");
+    const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status --porcelain" } });
+    assert.equal(own?.block ?? false, false, "the actual runtime identity may inspect its assigned workspace");
     delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV];
     const missingBinding = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m missing" } });
     assert.equal(missingBinding?.block ?? false, true);
@@ -690,7 +707,7 @@ test("registered guard accepts only runtime-bound attempt, run, and session-head
     const foreignRun = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m foreign" } });
     assert.equal(foreignRun?.block ?? false, true, "a spoofed runtime run id is not worker proof");
     delete process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV]; process.env.PI_SUBAGENT_RUN_ID = "runtime-run-1";
-    const labelOnly = await handler!({ toolName: "bash", cwd: home, input: { command: `git -C ${join(home, "foreign")} commit -m label` } });
+    const labelOnly = await handler!({ toolName: "bash", cwd: home, input: { command: `git -C ${join(home, "foreign")} status --porcelain` } });
     assert.equal(labelOnly?.block ?? false, false, "an unreserved target is not an execution ownership claim");
     const reservedLabelOnly = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m label" } });
     assert.equal(reservedLabelOnly?.block ?? false, true, "writer labels cannot authorize a reserved target");
@@ -752,10 +769,10 @@ test("registered guard fails closed when identity or reservation lookup throws",
 		process.env.PI_SUBAGENT_PARENT_SESSION = "owner-header-1";
 		delete process.env.ORCHESTRATE_ROLE;
 		process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header-1" } });
-		// Positive control: with healthy lookups a verified worker may commit in
+		// Positive control: with healthy lookups a verified worker may inspect in
 		// its own reserved workspace, and read-only commands always stay allowed.
-		const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m own" } });
-		assert.equal(own?.block ?? false, false, "control: a verified worker may commit when lookups succeed");
+		const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status --porcelain" } });
+		assert.equal(own?.block ?? false, false, "control: a verified worker may inspect when lookups succeed");
 		// Break createReviewStore: GHL_LATCH_STATE_DIR is a regular file, so the
 		// store's mkdirSync throws after executionRole was already resolved.
 		process.env.GHL_LATCH_STATE_DIR = latchStateFile;
@@ -863,7 +880,7 @@ test("registered guard fails closed on a malformed coordinator.json; missing and
 		process.env.PI_SUBAGENT_RUN_ID = "run-1";
 		process.env.PI_SUBAGENT_PARENT_SESSION = "owner-header-1";
 		process.env[PI_SUBAGENT_EXTENSION_BINDINGS_ENV] = JSON.stringify({ [EXECUTION_IDENTITY_BINDING_NAMESPACE]: { attemptId: "attempt-1", workspaceId: "workspace-1", workspacePath: workspace, ownerSessionId: "owner-header-1" } });
-		const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git commit -m own" } });
+		const own = await handler!({ toolName: "bash", cwd: workspace, input: { command: "git status --porcelain" } });
 		assert.equal(own?.block ?? false, false, "a healthy reservation still authorizes its verified worker");
 	} finally {
 		for (const [key, value] of Object.entries(previous)) {

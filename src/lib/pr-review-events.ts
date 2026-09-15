@@ -63,11 +63,20 @@ export type LaunchIntent = {
 	publication: "controller";
 };
 
+export type SessionFixerSettlement = {
+	state: "clean" | "committed" | "dirty" | "unknown";
+	reason: string;
+};
+
 export type LaunchResult = {
 	runId: string;
 	recovered: boolean;
 	/** Adapter already ran publish + re-await (Feature dispatch). */
 	completeRound?: boolean;
+	/** Host-side commit gate, resolved after an ordinary-session fixer settles. */
+	settled?: Promise<SessionFixerSettlement>;
+	/** Porcelain captured before the session fixer was spawned, for restart recovery. */
+	preFixPorcelain?: string;
 };
 
 export type RunSnapshot = {

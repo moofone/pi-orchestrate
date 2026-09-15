@@ -66,6 +66,8 @@ export type LaunchJournal = {
 	acceptedAt?: number;
 	/** Worktree this run mutates. queryRun must rev-parse here, not latch.cwd. */
 	worktree?: string;
+	/** Porcelain captured before a session fixer was spawned, for restart recovery. */
+	preFixPorcelain?: string;
 };
 
 export type Obligation = {
