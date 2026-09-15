@@ -68,6 +68,35 @@ export function statusValue(text: string, key: string): string | undefined {
 	return v && v !== "none" ? v : undefined;
 }
 
+/** The Pi session that is driving this Feature. Never inferred from cwd or PR. */
+export type SessionIdentity = {
+	id?: string;
+	file?: string;
+};
+
+function sameSessionFile(a: string, b: string): boolean {
+	return a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+}
+
+/**
+ * Whether `session` is the parent recorded on this Feature.
+ *
+ * A Feature without `parent_session_id` / `parent_session_file` is unowned:
+ * no chat may claim it by sitting in the repo root or by being the newest PR.
+ * Reload keeps the session file; `/reload` may mint a new id, so either match
+ * is enough. Multiple sessions per project are the normal case.
+ */
+export function sessionOwnsFeature(status: string, session: SessionIdentity): boolean {
+	const id = statusValue(status, "parent_session_id");
+	const file = statusValue(status, "parent_session_file");
+	if (!id && !file) return false;
+	const sid = (session.id ?? "").trim();
+	const sfile = (session.file ?? "").trim();
+	if (sid && id && sid === id) return true;
+	if (sfile && file && sameSessionFile(sfile, file)) return true;
+	return false;
+}
+
 /**
  * Apply `key: value` updates to a status.md, preserving everything else.
  *
@@ -230,7 +259,7 @@ export function resumePhase(status: string): FeaturePhase | undefined {
 export const PHASE_TRANSITIONS: Readonly<Record<FeaturePhase, readonly FeaturePhase[]>> = {
 	planning: ["planning", "reviewing", "blocked", "paused"],
 	reviewing: ["reviewing", "planning", "implementing", "blocked", "paused"],
-	implementing: ["implementing", "feature-qa", "pr", "done", "blocked", "paused"],
+	implementing: ["implementing", "reviewing", "feature-qa", "pr", "done", "blocked", "paused"],
 	"feature-qa": ["feature-qa", "implementing", "pr", "done", "blocked", "paused"],
 	pr: ["pr", "done", "blocked", "paused"],
 	done: [],

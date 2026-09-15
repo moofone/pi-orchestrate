@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
-import { statusValue as sharedStatusValue } from "./feature-state.ts";
+import { statusValue } from "./feature-state.ts";
 
 export const ACTIONABLE = new Set([
 	"read_comments_and_fix",
@@ -20,6 +20,27 @@ export const ACTIONABLE = new Set([
  * to 160 chars made the second round look like the first, so orchestration
  * stopped after one or two fixers while findings remained.
  */
+const VOLATILE_VERDICT_KEYS = new Set([
+	"elapsed_seconds",
+	"cycle_start",
+	"reaction_created_at",
+	"timeout_policy",
+	"head_commit_date",
+	"dead_after_seconds",
+	"review_hold_seconds",
+]);
+
+/** Drop waiter clock fields so a poll is not a new delivery. */
+export function stabilizeVerdictBody(body: string): string {
+	return String(body ?? "")
+		.split("\n")
+		.filter((line) => {
+			const key = line.split("=")[0]?.trim() ?? "";
+			return !VOLATILE_VERDICT_KEYS.has(key);
+		})
+		.join("\n");
+}
+
 export function actionableFingerprint(input: {
 	next: string;
 	verdict?: string;
@@ -27,7 +48,7 @@ export function actionableFingerprint(input: {
 }): string {
 	const next = String(input.next ?? "").trim().toLowerCase();
 	const round = String(input.round ?? "").trim() || "none";
-	return `${next}:r${round}:${(input.verdict ?? "").slice(0, 4000)}`;
+	return `${next}:r${round}:${stabilizeVerdictBody(input.verdict ?? "").slice(0, 4000)}`;
 }
 
 export const MECHANICAL = new Set(["git_pr_land", "git_pr_land_continue"]);
@@ -44,6 +65,9 @@ export const MECHANICAL = new Set(["git_pr_land", "git_pr_land_continue"]);
  * `disagree` is an answer too: code posted the disagreement on the PR and the
  * loop is over. Leaving it undelivered would have the reconciler re-raise the
  * same disagreement every 60 seconds (F6).
+ *
+ * `ack` is leftover: same-head `read_comments_and_fix` now spawns a fixer.
+ * It is not a spawn and not a disagreement.
  */
 export const ACCEPTED_FEATURE_PR_ACTIONS = new Set([
 	"spawn_writer",
@@ -51,6 +75,7 @@ export const ACCEPTED_FEATURE_PR_ACTIONS = new Set([
 	"land",
 	"archive",
 	"disagree",
+	"ack",
 ]);
 
 export function isAcceptedFeaturePrAction(action: unknown): boolean {
@@ -162,10 +187,20 @@ export function spendWaiterVerdict(
 }
 
 /** Persist that the one model turn for this verdict has been spent. */
-export function markVerdictDelivered(path: string): void {
+export function markVerdictDelivered(path: string, expectedFingerprint?: string): void {
 	try {
 		const v = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 		if (!v || typeof v !== "object") return;
+		if (expectedFingerprint !== undefined) {
+			const verdict = typeof v.verdict === "string" ? v.verdict : undefined;
+			const round = v.round ?? v.round_number ?? (verdict ? parseField(verdict, "round") : undefined);
+			const current = actionableFingerprint({
+				next: String(v.lastNext ?? v.last_next ?? ""),
+				verdict,
+				round: round == null ? undefined : String(round),
+			});
+			if (current !== expectedFingerprint) return;
+		}
 		v.verdictDelivered = true;
 		writeFileSync(path, JSON.stringify(v));
 	} catch {
@@ -175,7 +210,6 @@ export function markVerdictDelivered(path: string): void {
 
 export const REPO_ROOT = join(homedir(), "Dev");
 
-export const MAX_WORKTREE_CANDIDATES = 5;
 export const SHORT_MS = 20_000;
 
 /** A latch older than this is stale history, not something to take over. */
@@ -233,6 +267,98 @@ export function originSlug(cwd: string): string | undefined {
 	return m?.[1]?.replace(/\.git$/i, "");
 }
 
+/** Lowercased `owner/repo` with a trailing `.git` stripped. */
+export function normalizeGithubSlug(s: string | undefined): string {
+	return (s ?? "").trim().replace(/\.git$/i, "").toLowerCase();
+}
+
+export function sameGithubSlug(a?: string, b?: string): boolean {
+	const left = normalizeGithubSlug(a);
+	const right = normalizeGithubSlug(b);
+	return Boolean(left && left === right);
+}
+
+/**
+ * `gh pr view` argv. A latch that already knows `owner/repo` must pass
+ * `--repo`: `gh` otherwise resolves the number against cwd origin.
+ */
+export function githubRepoShortName(s?: string): string {
+	const n = normalizeGithubSlug(s);
+	if (!n) return "";
+	const i = n.lastIndexOf("/");
+	return i >= 0 ? n.slice(i + 1) : n;
+}
+
+/** `icemining` and `moofone/icemining` are the same repo; `icemining-devops` is not. */
+export function sameGithubRepo(a?: string, b?: string): boolean {
+	if (sameGithubSlug(a, b)) return true;
+	const left = githubRepoShortName(a);
+	const right = githubRepoShortName(b);
+	return Boolean(left && left === right);
+}
+
+export function ghPrViewArgs(pr: string, slug?: string, jsonFields = "state,mergedAt"): string[] {
+	const args = ["pr", "view", String(pr), "--json", jsonFields];
+	const repo = normalizeGithubSlug(slug);
+	if (repo.includes("/")) args.push("--repo", repo);
+	return args;
+}
+
+/** First GitHub PR URL in `text` whose `/pull/N` is this PR. */
+export function githubPrUrlFor(
+	pr: string,
+	text: string | undefined,
+): { url: string; slug: string } | undefined {
+	if (!text) return undefined;
+	const want = String(pr);
+	for (const m of text.matchAll(/https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/pull\/(\d+)/g)) {
+		if (m[2] === want && m[1]) return { url: m[0], slug: m[1] };
+	}
+	return undefined;
+}
+
+/** GitHub `owner/repo` from `pr: https://github.com/o/r/pull/N`. */
+export function statusPrGithubRepo(text: string): string | undefined {
+	const raw = statusValue(text, "pr") ?? "";
+	const num = statusPrNumber(text);
+	if (num) {
+		const hit = githubPrUrlFor(num, raw);
+		if (hit) return normalizeGithubSlug(hit.slug);
+	}
+	const m = raw.match(/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/\d+/i);
+	return m?.[1] ? normalizeGithubSlug(m[1]) : undefined;
+}
+
+/**
+ * Every Task `- Repo:` names the same git repo. Plan header `> Repo:` is the
+ * orchestrator folder and must not win: that is how icemining-devops#500 was
+ * awaited as icemining#500.
+ */
+export function unanimousTaskRepo(plan: string): string | undefined {
+	const found = [...plan.matchAll(/^-\s*Repo:\s*([A-Za-z0-9._-]+)\s*$/gm)].map(
+		(m) => m[1] ?? "",
+	).filter(Boolean);
+	if (!found.length) return undefined;
+	const first = found[0]!;
+	return found.every((r) => r === first) ? first : undefined;
+}
+
+/** GraphQL missing-PR text. Same string is used for private/no-access. */
+export function isGraphqlPrNotFound(out: string): boolean {
+	return /Could not resolve to a PullRequest/i.test(out);
+}
+
+/**
+ * Waiter/gh text that means this pull number does not exist — REST 404 on
+ * get-a-pull-request (live `drive-pi-subagents-2150.log`) or GraphQL not-found.
+ * Rate-limit and a real `fix_command_or_environment` (fetch failed, land) stay false.
+ */
+export function waiterVerdictIsMissingPr(text: string | undefined): boolean {
+	if (!text) return false;
+	if (isGraphqlPrNotFound(text)) return true;
+	return /client error 404/i.test(text) && /get-a-pull-request/i.test(text);
+}
+
 /** GitHub PR URL from latch fields, if we have enough to form one. */
 // These four already treat every field but `pr` as optional at runtime — the
 // guards below say so. The types demanded all of them, which forced callers and
@@ -244,21 +370,58 @@ export function prUrl(s: Partial<LatchState>): string | undefined {
 	return undefined;
 }
 
-/** Compact latch chrome: `waiting icemining#2178 · r2/3 · 2m`. */
+/** Waiter `next=` → chrome phase. Empty next is still waiting for review. */
+export function waitPhaseFromNext(next: string | undefined): string {
+	const n = String(next ?? "").trim().toLowerCase();
+	if (!n || n === "yield" || n === "poll_again") return "waiting for review";
+	if (n === "read_comments_and_fix") return "fixing";
+	if (n === "investigate_dead_reviewers") return "waiting for reviewers";
+	if (n === "fix_command_or_environment") return "fixing environment";
+	if (n === "git_pr_land" || n === "git_pr_land_continue") return "landing";
+	if (n === "done") return "done";
+	if (n === "stop") return "closed";
+	return "";
+}
+
+/**
+ * Spinner phase. `read_comments_and_fix` means the review is already in.
+ * "fixing" only when a writer is live; otherwise "review in" — never go back
+ * to "waiting for review" just because the fixer has not started.
+ */
+export function waitChromePhase(input: {
+	next?: string;
+	writerLive?: boolean;
+}): string {
+	const fromNext = waitPhaseFromNext(input.next);
+	if (fromNext !== "fixing") return fromNext;
+	return input.writerLive ? "fixing" : "review in";
+}
+
+/** Legacy waiter fields count reviewers of the current head, not review/fix cycles. */
+export function formatReviewerProgress(round?: string, roundTotal?: string): string {
+	const reviewed = round && round !== "none" ? round : "";
+	const total = roundTotal && roundTotal !== "none" ? roundTotal : "";
+	return reviewed ? `reviewers ${reviewed}${total ? `/${total}` : ""}` : "";
+}
+
+/** Compact latch chrome: `waiting icemining#2178 · reviewers 2/3 · waiting for review · 2m`. */
 export function formatWaitLine(opts: {
 	label: string;
 	elapsed: string;
 	round?: string;
 	roundTotal?: string;
+	phase?: string;
 	url?: string;
 }): string {
-	const r = opts.round && opts.round !== "none" ? opts.round : "";
-	const tot = opts.roundTotal && opts.roundTotal !== "none" ? opts.roundTotal : "";
-	const roundBit = r ? (tot ? `r${r}/${tot}` : `r${r}`) : "";
+	const reviewerProgress = formatReviewerProgress(opts.round, opts.roundTotal);
+	const statusBit = (opts.phase ?? "").trim();
+	const phase = statusBit && statusBit !== "none" ? statusBit : "";
 	const label = opts.url ? osc8Link(opts.url, opts.label) : opts.label;
-	return roundBit
-		? `waiting ${label} · ${roundBit} · ${opts.elapsed}`
-		: `waiting ${label} · ${opts.elapsed}`;
+	const bits = [`waiting ${label}`];
+	if (reviewerProgress) bits.push(reviewerProgress);
+	if (phase) bits.push(phase);
+	bits.push(opts.elapsed);
+	return bits.join(" · ");
 }
 
 /**
@@ -304,7 +467,12 @@ export type LatchState = {
 	 * wait happened — not that *this* lineage of sessions deferred work on it.
 	 */
 	source?: "manual" | "session";
-	/** Waiter review cycle, from `round=` / `round_total=` on git pr-await output. */
+	/** Snapshot of who owned this wait when it was armed. Used to detect stale owners. */
+	ownerKind?: "feature" | "session" | "dependency";
+	ownerId?: string;
+	/** Fences duplicate terminal delivery across restart. */
+	generation?: string;
+	/** Current-head reviewer counts, from legacy `round=` / `round_total=` fields. */
 	round?: string;
 	roundTotal?: string;
 	/**
@@ -332,27 +500,90 @@ export type ObservedLatchSeed = {
 	url?: string;
 	slug?: string;
 	head?: string;
+	/** Pi session that should own wait chrome. Never inferred from cwd. */
+	sessionId?: string;
+	round?: string;
+	roundTotal?: string;
 };
 
 export type LatchArmFn = (ctx: unknown, seed: ObservedLatchSeed) => void;
 
-let latchArm: LatchArmFn | undefined;
+/** Pi loads extensions with separate module caches. Only the runtime bus crosses that boundary. */
+export interface PrLifecycleBus {
+	emit(channel: string, data: unknown): void;
+	on(channel: string, handler: (data: any) => void): () => void;
+}
 
-/** Latch plugin registers; tests replace. `undefined` unregisters. */
-export function registerLatchArm(fn: LatchArmFn | undefined): void {
-	latchArm = fn;
+const ARM_EVENT = "orchestrate:pr:arm:v1";
+const TERMINAL_EVENT = "orchestrate:pr:terminal:v1";
+const DISPATCH_EVENT = "orchestrate:pr:dispatch:v1";
+
+export function registerLatchArm(fn: LatchArmFn, events: PrLifecycleBus): () => void {
+	return events.on(ARM_EVENT, ({ ctx, seed }) => fn(ctx, seed));
+}
+
+export function armObservedLatch(ctx: unknown, seed: ObservedLatchSeed, events: PrLifecycleBus): void {
+	events.emit(ARM_EVENT, { ctx, seed });
 }
 
 /**
- * Arm the live session's latch from code. No-op until the latch plugin
- * registers. Never throws: a Feature chain must not die over chrome.
+ * A Feature PR just became terminal in code (reconciler or dispatcher).
+ * The latch plugin wakes the session that actually owns that wait — not
+ * whichever chat happened to run `/orchestrate` last.
  */
-export function armObservedLatch(ctx: unknown, seed: ObservedLatchSeed): void {
-	try {
-		latchArm?.(ctx, seed);
-	} catch {
-		// Never take the Feature chain down over the latch.
-	}
+export type LatchTerminalNotice = {
+	pr: string;
+	state: "merged" | "closed";
+	/** Pi session recorded on the Feature. When set, only that slot wakes. */
+	sessionId?: string;
+	slug?: string;
+};
+
+export type LatchTerminalFn = (notice: LatchTerminalNotice) => boolean;
+
+export function registerLatchTerminal(fn: LatchTerminalFn, events: PrLifecycleBus): () => void {
+	return events.on(TERMINAL_EVENT, (request) => {
+		request.delivered = fn(request.notice) || request.delivered;
+	});
+}
+
+export function notifyLatchTerminal(notice: LatchTerminalNotice, events: PrLifecycleBus): boolean {
+	const request = { notice, delivered: false };
+	events.emit(TERMINAL_EVENT, request);
+	return request.delivered;
+}
+
+export type FeaturePrDispatch = (
+	ctx: any,
+	owner: FeaturePrOwner,
+	verdict: { next: string; output: string; round?: string },
+) => Promise<string>;
+
+/** Run through the registered orchestrator, including its actual chain lock. */
+export function registerFeaturePrDispatch(fn: FeaturePrDispatch, events: PrLifecycleBus): () => void {
+	return events.on(DISPATCH_EVENT, (request) => {
+		if (request.claimed) return;
+		request.claimed = true;
+		try {
+			Promise.resolve(fn(request.ctx, request.owner, request.verdict)).then(request.resolve, request.reject);
+		} catch (error) {
+			request.reject(error);
+		}
+	});
+}
+
+export function requestFeaturePrDispatch(
+	events: PrLifecycleBus,
+	ctx: unknown,
+	owner: FeaturePrOwner,
+	verdict: { next: string; output: string; round?: string },
+): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const request = { ctx, owner, verdict, resolve, reject, claimed: false };
+		events.emit(DISPATCH_EVENT, request);
+		// No subscriber means no writer was started. Leave the durable verdict pending.
+		if (!request.claimed) reject(new Error("orchestrate PR dispatcher is not registered in this runtime"));
+	});
 }
 
 /** `moofone/icemining#2142`, else `icemining#2142`, else `PR #2142`. */
@@ -508,25 +739,15 @@ export function repoKey(cwd: string): string | undefined {
 export type FeaturePrOwner = {
 	dir: string;
 	statusFile: string;
+	/** Orchestrator folder name. Not necessarily the GitHub repo of `pr`. */
 	repo: string;
 	name: string;
 	pr: string;
 	worktree?: string;
 	phase?: string;
+	/** GitHub `owner/repo` of the pull request, when known. */
+	slug?: string;
 };
-
-/**
- * One status.md field, or `undefined` (with `none` counting as absent).
- *
- * Was a second `new RegExp` built per call, and it disagreed with
- * orchestrate's copy: case-sensitive where that one was not, and requiring a
- * non-empty value where that one returned `""`. Both now call the one parser
- * in `feature-state.ts`, so a field cannot mean two things depending on which
- * module asked.
- */
-function statusValue(text: string, key: string): string | undefined {
-	return sharedStatusValue(text, key);
-}
 
 /** `pr: 2142` and `pr: https://github.com/o/r/pull/2142` name the same PR. */
 function statusPrNumber(text: string): string | undefined {
@@ -563,6 +784,12 @@ function featureOwnerFromStatus(
 ): FeaturePrOwner | undefined {
 	const repo = statusValue(text, "repo");
 	if (!repo) return undefined;
+	const identity = featurePrIdentity(dir, text, repo);
+	const fromUrl = statusPrGithubRepo(text);
+	const slug =
+		fromUrl && fromUrl.includes("/")
+			? fromUrl
+			: originSlug(join(homedir(), "Dev", "git", githubRepoShortName(identity) || identity));
 	return {
 		dir,
 		statusFile,
@@ -571,7 +798,37 @@ function featureOwnerFromStatus(
 		pr,
 		worktree: statusValue(text, "worktree"),
 		phase: statusValue(text, "phase"),
+		slug,
 	};
+}
+
+/**
+ * Git repo the recorded PR actually lives in.
+ *
+ * `status.md` `repo:` is the orchestrator folder. A Feature hosted under
+ * `orchestrator/icemining/` can still open `icemining-devops#500`; matching
+ * on the folder name is how that PR was awaited as the unrelated
+ * icemining#500.
+ */
+export function featurePrIdentity(dir: string, text: string, orchRepo: string): string {
+	const fromUrl = statusPrGithubRepo(text);
+	if (fromUrl) return githubRepoShortName(fromUrl) || fromUrl;
+	try {
+		const fromPlan = unanimousTaskRepo(readFileSync(join(dir, "plan.md"), "utf8"));
+		if (fromPlan) return fromPlan;
+	} catch {
+		/* no plan yet is not a different repo */
+	}
+	return orchRepo;
+}
+
+function ownerMatchesLookupRepo(
+	owner: FeaturePrOwner,
+	text: string,
+	wantRepo?: string,
+): boolean {
+	if (!wantRepo) return true;
+	return sameGithubRepo(featurePrIdentity(owner.dir, text, owner.repo), wantRepo);
 }
 
 function statusBranchMatches(text: string, head: string): boolean {
@@ -588,9 +845,11 @@ function statusBranchMatches(text: string, head: string): boolean {
  *
  * Ownership decides whether a review verdict is dispatched to a writer by code
  * or handed to the session that ran `git pr-await` itself, so it is deliberately
- * narrow. Both `pr:` and `repo:` must match: `#475` in `icemining-devops` and
- * `#475` in `icemining` are different pull requests, and the `repo:` field —
- * not the folder name — is what the Feature says about itself.
+ * narrow. Both `pr:` and the GitHub repo must match: `#475` in `icemining-devops`
+ * and `#475` in `icemining` are different pull requests. The GitHub repo is the
+ * PR URL, else the unanimous Task `- Repo:`, else `status.md` `repo:` — not the
+ * orchestrator folder alone. A Feature hosted under `orchestrator/icemining/`
+ * can still own `icemining-devops#500`.
  *
  * If `pr:` was never recorded (open-child returned no schema) but this Feature
  * is already on that branch in a PR phase, `head` recovers ownership so a
@@ -623,7 +882,7 @@ export function findFeatureOwningPr(
 			const numbered = statusPrNumber(text);
 			if (numbered === want) {
 				const owner = featureOwnerFromStatus(dir, statusFile, text, want);
-				if (owner && (!opts.repo || owner.repo === opts.repo)) byNumber.push(owner);
+				if (owner && ownerMatchesLookupRepo(owner, text, opts.repo)) byNumber.push(owner);
 				continue;
 			}
 			if (numbered) continue;
@@ -632,7 +891,7 @@ export function findFeatureOwningPr(
 			if (!BRANCH_OWNER_PHASES.has(phase)) continue;
 			if (!statusBranchMatches(text, opts.head)) continue;
 			const owner = featureOwnerFromStatus(dir, statusFile, text, want);
-			if (owner && (!opts.repo || owner.repo === opts.repo)) byBranch.push(owner);
+			if (owner && ownerMatchesLookupRepo(owner, text, opts.repo)) byBranch.push(owner);
 		}
 	}
 	if (byNumber.length === 1) return byNumber[0];
@@ -673,9 +932,16 @@ export function listFeaturePrOwners(
 				continue;
 			}
 			const phase = (statusValue(text, "phase") ?? "").toLowerCase();
-			if (!phases.has(phase)) continue;
 			const pr = statusPrNumber(text);
 			if (!pr) continue;
+			// Default walk is `phase: pr`. Also recover a Feature whose status.md
+			// was reseeded to planning/reviewing after the PR was already opened:
+			// ownership-by-number still finds it (sessions watch), and skipping
+			// it here is how the fixer loop dies while chrome says "waiting".
+			if (!phases.has(phase)) {
+				if (opts.phases) continue;
+				if (phase !== "planning" && phase !== "reviewing") continue;
+			}
 			const owner = featureOwnerFromStatus(dir, statusFile, text, pr);
 			if (owner) out.push(owner);
 		}
@@ -708,10 +974,11 @@ export type UndeliveredVerdict = {
 export function undeliveredWaiterVerdicts(
 	pr: string,
 	dir = stateDir(),
+	repo?: string,
 ): UndeliveredVerdict[] {
 	const want = String(pr ?? "").trim();
 	if (!want) return [];
-	const paths: string[] = [...waiterManualFiles(want, dir)];
+	const paths: string[] = [...waiterManualFiles(want, dir, repo)];
 	let names: string[] = [];
 	try {
 		names = readdirSync(dir);
@@ -777,7 +1044,10 @@ export function spawnCwdFor(latch: Partial<LatchState> | undefined): string | un
 	// icemining#2163's waiter died: it was spawned from a directory that is not
 	// a checkout, logged the same resolve error ~40 times, and exited — leaving
 	// an open PR with nothing waiting on it and a session that never resumed.
-	return referenceCheckoutFor(latch.cwd);
+	const cwd = referenceCheckoutFor(latch.cwd);
+	if (!cwd) return undefined;
+	if (latch.slug && !sameGithubSlug(originSlug(cwd), latch.slug)) return undefined;
+	return cwd;
 }
 
 export function resolveQueryCwd(cwd: string): string {
@@ -802,16 +1072,6 @@ export function readLatchFile(path: string): LatchState | undefined {
 		return s?.pr && s?.cwd ? s : undefined;
 	} catch {
 		return undefined;
-	}
-}
-
-export function writeLatchFile(path: string, s: LatchState | undefined): void {
-	try {
-		mkdirSync(dirname(path), { recursive: true });
-		if (s) writeFileSync(path, JSON.stringify(s));
-		else rmSync(path, { force: true });
-	} catch {
-		// Never throw from persist.
 	}
 }
 
@@ -998,11 +1258,22 @@ export function waiterPaths(
  * because #2232 does would leave #232 with none at all. Repo names contain
  * digits and hyphens (`icemining-devops`), so only an exact `-<pr>` tail counts.
  */
-function waiterFilesFor(pr: string, stem: string, ext: string, dir: string): string[] {
+function waiterRepoToken(repo?: string): string {
+	return githubRepoShortName(repo);
+}
+
+function waiterFilesFor(
+	pr: string,
+	stem: string,
+	ext: string,
+	dir: string,
+	repo?: string,
+): string[] {
 	const number = String(pr ?? "").trim();
 	if (!number) return [];
 	const prefix = `${stem}-`;
 	const suffix = `.${ext}`;
+	const wantRepo = waiterRepoToken(repo);
 	let names: string[];
 	try {
 		names = readdirSync(dir);
@@ -1015,23 +1286,64 @@ function waiterFilesFor(pr: string, stem: string, ext: string, dir: string): str
 	for (const name of names) {
 		if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue;
 		const middle = name.slice(prefix.length, name.length - suffix.length);
-		if (middle === number || middle.endsWith(`-${number}`)) out.push(join(dir, name));
+		if (middle === number) {
+			// Legacy unscoped `drive-500.log`. Only when the caller has no repo:
+			// icemining#500 and icemining-devops#500 must not share that file.
+			if (!wantRepo) out.push(join(dir, name));
+			continue;
+		}
+		if (!middle.endsWith(`-${number}`)) continue;
+		const token = middle.slice(0, middle.length - number.length - 1);
+		if (!wantRepo || token === wantRepo) out.push(join(dir, name));
 	}
 	// Repo-qualified before legacy, so the current binary's file is read first.
 	return out.sort((a, b) => b.length - a.length || a.localeCompare(b));
 }
 
-export function waiterPidFiles(pr: string, dir = stateDir()): string[] {
-	return waiterFilesFor(pr, "drive", "pid", dir);
+export function waiterPidFiles(pr: string, dir = stateDir(), repo?: string): string[] {
+	return waiterFilesFor(pr, "drive", "pid", dir, repo);
 }
 
-export function waiterManualFiles(pr: string, dir = stateDir()): string[] {
-	return waiterFilesFor(pr, "manual", "json", dir);
+export function waiterLogFiles(pr: string, dir = stateDir(), repo?: string): string[] {
+	return waiterFilesFor(pr, "drive", "log", dir, repo);
 }
 
-/** Legacy spelling. Kept for callers that write nothing and know no repo. */
-export function pidFile(pr: string, dir = stateDir()): string {
-	return join(dir, `drive-${pr}.pid`);
+/**
+ * The waiter writes terminal `next=` into `drive-*.log`, not `lastNext` on the
+ * JSON `--state` file. Watching only the JSON is how a merged PR left the
+ * parent silent and status.md on `next=yield`.
+ *
+ * Distinguishes merge from close so a wake can happen from the log alone —
+ * GitHub rate-limit must not keep a landed PR silent.
+ */
+export function waiterLogTerminalState(
+	pr: string,
+	dir = stateDir(),
+	repo?: string,
+): "merged" | "closed" | undefined {
+	for (const path of waiterLogFiles(pr, dir, repo)) {
+		let text = "";
+		try {
+			text = readFileSync(path, "utf8");
+		} catch {
+			continue;
+		}
+		if (/^status=landed$/m.test(text) || /^pr_state=MERGED$/m.test(text) || /^next=done$/m.test(text)) {
+			return "merged";
+		}
+		if (/^pr_state=CLOSED$/m.test(text) || /^next=stop$/m.test(text) || waiterVerdictIsMissingPr(text)) {
+			return "closed";
+		}
+	}
+	return undefined;
+}
+
+export function waiterLogSaysTerminal(pr: string, dir = stateDir(), repo?: string): boolean {
+	return waiterLogTerminalState(pr, dir, repo) !== undefined;
+}
+
+export function waiterManualFiles(pr: string, dir = stateDir(), repo?: string): string[] {
+	return waiterFilesFor(pr, "manual", "json", dir, repo);
 }
 
 export function logFile(pr: string, dir = stateDir(), repo?: string): string {
@@ -1051,9 +1363,9 @@ export function pidAlive(pid: number): boolean {
 }
 
 /** Every pid recorded for this PR, under any spelling. */
-export function readPids(pr: string, dir = stateDir()): number[] {
+export function readPids(pr: string, dir = stateDir(), repo?: string): number[] {
 	const out: number[] = [];
-	for (const path of waiterPidFiles(pr, dir)) {
+	for (const path of waiterPidFiles(pr, dir, repo)) {
 		try {
 			const n = Number(readFileSync(path, "utf8").trim());
 			if (Number.isInteger(n) && n > 0) out.push(n);
@@ -1062,10 +1374,6 @@ export function readPids(pr: string, dir = stateDir()): number[] {
 		}
 	}
 	return out;
-}
-
-export function readPid(pr: string, dir = stateDir()): number | undefined {
-	return readPids(pr, dir)[0];
 }
 
 /**
@@ -1079,8 +1387,43 @@ export function isDriverRunning(
 	pr: string,
 	dir = stateDir(),
 	alive: (pid: number) => boolean = pidAlive,
+	repo?: string,
 ): boolean {
-	return readPids(pr, dir).some((pid) => alive(pid));
+	return readPids(pr, dir, repo).some((pid) => alive(pid));
+}
+
+/**
+ * SIGTERM every waiter for this PR and delete its pid + manual files.
+ * Logs stay: they are how a later session proves the merge happened.
+ */
+export function stopWaiterForPr(pr: string, dir = stateDir(), repo?: string): void {
+	for (const path of waiterPidFiles(pr, dir, repo)) {
+		let pid = 0;
+		try {
+			pid = Number(readFileSync(path, "utf8").trim());
+		} catch {
+			continue;
+		}
+		if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) {
+			try {
+				process.kill(pid, "SIGTERM");
+			} catch {
+				/* already gone */
+			}
+		}
+		try {
+			rmSync(path, { force: true });
+		} catch {
+			/* best-effort */
+		}
+	}
+	for (const path of waiterManualFiles(pr, dir, repo)) {
+		try {
+			rmSync(path, { force: true });
+		} catch {
+			/* best-effort */
+		}
+	}
 }
 
 /* ------------------------------------------------------------------ *

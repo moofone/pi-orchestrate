@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 /**
  * Stop-hook latch — sensor only during wait. Never in-process wait.
  * A live parent is woken once on merge/close, or on an undelivered
@@ -12,11 +13,11 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Set the driver probe before importing pr-await-latch: DRIVE_BIN is captured at
-// module evaluation, and a regression must never launch the real waiter.
+// Set the driver probe before importing pr-await-latch so a regression never
+// launches the real waiter.
 const DRIVER_PROBE_DIR = mkdtempSync(join(tmpdir(), "ghl-spawn-driver-test-"));
 const DRIVER_MARKER = join(DRIVER_PROBE_DIR, "spawned");
-const DRIVER_STUB = join(DRIVER_PROBE_DIR, "ghl-await-drive");
+const DRIVER_STUB = join(DRIVER_PROBE_DIR, "ghl-pr-await");
 writeFileSync(
 	DRIVER_STUB,
 	`#!/bin/sh
@@ -25,7 +26,6 @@ printf '%s\\n' "$PWD" > "$GHL_TEST_SPAWN_MARKER"
 );
 chmodSync(DRIVER_STUB, 0o755);
 process.env.GHL_TEST_SPAWN_MARKER = DRIVER_MARKER;
-process.env.GHL_AWAIT_DRIVE_BIN = DRIVER_STUB;
 process.env.GHL_PR_AWAIT_BIN = DRIVER_STUB;
 
 const REAL_OUTPUT = [
@@ -61,8 +61,11 @@ const {
 const {
 	actionableFingerprint,
 	armObservedLatch,
+	notifyLatchTerminal,
 	formatWaitElapsed,
 	formatWaitLine,
+	waitPhaseFromNext,
+	waitChromePhase,
 	originSlug,
 	osc8Link,
 	prLinkLabel,
@@ -75,6 +78,11 @@ const {
 	waiterStatePath,
 	waitProgressSequence,
 } = await import("../src/lib/pr-await-core.ts");
+const {
+	claimWaitDelivery,
+	WAIT_PROTOCOL_VERSION,
+	waitOutcomeIdentity,
+} = await import("../src/lib/wait-protocol.ts");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -124,7 +132,13 @@ function harness(
 	// Features a test wrote, and never a real one.
 	process.env.GHL_ORCH_ROOT = dir;
 
+	const emitter = new EventEmitter();
+	const events = {
+		emit: (name: string, data: unknown) => { emitter.emit(name, data); },
+		on: (name: string, fn: (data: any) => void) => { emitter.on(name, fn); return () => { emitter.off(name, fn); }; },
+	};
 	const pi = {
+		events,
 		on: (event: string, fn: any) => {
 			handlers[event] = fn;
 		},
@@ -203,6 +217,7 @@ function harness(
 	};
 
 	return {
+		events,
 		dir,
 		calls,
 		wakes,
@@ -228,8 +243,8 @@ function harness(
 		input: (text: string, source = "interactive") =>
 			handlers.input?.({ text, source }, ctx),
 		bash: async (command: string, output: string) => {
-			await handlers.tool_execution_start({ toolName: "bash", toolCallId: "tc", args: { command } });
-			await handlers.tool_execution_end({ toolCallId: "tc", result: { output }, isError: false });
+			await handlers.tool_execution_start({ toolName: "bash", toolCallId: "tc", args: { command } }, ctx);
+			await handlers.tool_execution_end({ toolCallId: "tc", result: { output }, isError: false }, ctx);
 		},
 		cleanup: () => {
 			handlers.session_shutdown?.({}, ctx);
@@ -520,7 +535,7 @@ test("armObservedLatch (pi.exec path) watches and wakes on merge without a bash 
 	);
 	try {
 		await h.start();
-		armObservedLatch(h.ctx, { pr: "2142", cwd: REPO, lastNext: "yield" });
+		armObservedLatch(h.ctx, { pr: "2142", cwd: REPO, lastNext: "yield" }, h.events);
 		await sleep(40);
 		assert.equal(h.wakes.length, 0, "must not wake while the PR is still open");
 		assert.equal(h.spawns.length, 1, "code-armed latch must still ensure a waiter");
@@ -726,7 +741,90 @@ test("a fresh session in the reference checkout does not inherit a worktree latc
 	}
 });
 
-test("a later user prompt cancels the deferred-work wake", async () => {
+test("a reference checkout does not steal the newest Feature PR on reload", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? { code: 0, stdout: '{"state":"OPEN"}', stderr: "" } : ok("[]")), REPO);
+	mkdirSync(join(h.dir, "icemining", "pearl-wait"), { recursive: true });
+	writeFileSync(
+		join(h.dir, "icemining", "pearl-wait", "status.md"),
+		[
+			"repo: icemining",
+			"name: pearl-wait",
+			"phase: pr",
+			"pr: 2252",
+			"worktree: /Users/greg/Dev/git/ice-wt/feat-pearl-cert-submit-gate-2",
+		].join("\n"),
+	);
+	try {
+		await h.start({ reason: "startup" });
+		await sleep(120);
+		assert.equal(
+			h.notifies.filter((n) => /2252/.test(n)).length,
+			0,
+			`unowned Feature PR must not bind this chat; got ${JSON.stringify(h.notifies)}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a session re-arms wait chrome only for a Feature it owns", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? { code: 0, stdout: '{"state":"OPEN"}', stderr: "" } : ok("[]")), REPO);
+	mkdirSync(join(h.dir, "icemining", "pearl-wait"), { recursive: true });
+	writeFileSync(
+		join(h.dir, "icemining", "pearl-wait", "status.md"),
+		[
+			"repo: icemining",
+			"name: pearl-wait",
+			"phase: pr",
+			"pr: 2252",
+			`parent_session_id: ${h.sessionId}`,
+			"worktree: /Users/greg/Dev/git/ice-wt/feat-pearl-cert-submit-gate-2",
+		].join("\n"),
+	);
+	try {
+		await h.start({ reason: "startup" });
+		await sleep(120);
+		assert.ok(
+			h.notifies.some((n) => /2252/.test(n) || /handed off/.test(n) || /pr-await/.test(n) || /pr-latch/.test(n)),
+			`owning session must re-arm its Feature PR; got ${JSON.stringify(h.notifies)}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("/reload of an owned Feature that already landed is ordinary chat, not another wait", async () => {
+	// After land, the session is done orchestrating. Re-binding a done Feature
+	// on reason=new kept injecting pr-latch / stay-idle instead of normal chat.
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), REPO);
+	mkdirSync(join(h.dir, "icemining", "readtier"), { recursive: true });
+	writeFileSync(
+		join(h.dir, "icemining", "readtier", "status.md"),
+		[
+			"repo: icemining",
+			"name: readtier",
+			"phase: done",
+			"pr: 2258",
+			"next_action: landed",
+			`parent_session_id: ${h.sessionId}`,
+			"worktree: /Users/greg/Dev/git/ice-wt/feat-readtier-nethash-publish",
+		].join("\n"),
+	);
+	try {
+		await h.start({ reason: "new" });
+		await sleep(150);
+		assert.equal(h.wakes.length, 0, `done Feature must not re-arm; got ${h.wakes.join(" | ")}`);
+		assert.equal(
+			h.notifies.filter((n) => /2258/.test(n) || /pr-latch/.test(n) || /pr-await/.test(n)).length,
+			0,
+			`got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("an observed latch still wakes on merge after a later user prompt", async () => {
 	let view = OPEN;
 	const h = harness(
 		(cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)),
@@ -743,8 +841,8 @@ test("a later user prompt cancels the deferred-work wake", async () => {
 	await sleep(80);
 	assert.equal(
 		h.wakes.length,
-		0,
-		`moved-on session must not be told it deferred this merge; got ${h.wakes.join(" | ")}`,
+		1,
+		`pasting a URL is not /pr-latch clear; got ${h.wakes.join(" | ")}`,
 	);
 	assert.ok(
 		h.notifies.some((n) => /2142/.test(n) && /merged/.test(n)),
@@ -1195,7 +1293,8 @@ test("undelivered ACTIONABLE on settle wakes the live parent once", async () => 
 	await sleep(80);
 	assert.equal(h.wakes.length, 1, `expected one ACTIONABLE wake, got ${h.wakes.length}`);
 	assert.match(h.wake(0), /next=read_comments_and_fix/);
-	assert.match(h.wake(0), /Fix current-head findings/);
+	assert.match(h.wake(0), /Dispatch a fixer child/);
+	assert.match(h.wake(0), /Do not implement it yourself/);
 	assert.match(h.wake(0), /Do not wait for another user message/);
 	assert.match(h.wake(0), /comment bot=grok/);
 	const state = JSON.parse(readFileSync(waiterState(h.dir), "utf8"));
@@ -1262,6 +1361,17 @@ test("actionableFingerprint distinguishes later rounds of the same next=", () =>
 	assert.equal(first, same);
 	assert.notEqual(first, laterRound, "a new review round must not look like the first");
 	assert.notEqual(first, laterBody, "new findings must not look like the first");
+	const t0 = actionableFingerprint({
+		next: "read_comments_and_fix",
+		verdict: `${ACTIONABLE_VERDICT}\nelapsed_seconds=10\ncycle_start=1`,
+		round: "1",
+	});
+	const t1 = actionableFingerprint({
+		next: "read_comments_and_fix",
+		verdict: `${ACTIONABLE_VERDICT}\nelapsed_seconds=999\ncycle_start=2`,
+		round: "1",
+	});
+	assert.equal(t0, t1, "waiter clock fields are not a new delivery");
 });
 
 test("same-session reload wakes on undelivered ACTIONABLE", async () => {
@@ -1350,6 +1460,8 @@ test("a Feature-owned merge dispatches next=done and still wakes the parent", as
 		await sleep(80);
 		assert.equal(h.wakes.length, 1, "merge still wakes; the no-wake exception is ACTIONABLE only");
 		assert.match(h.wake(0), /#2142 merged/);
+		assert.match(h.wake(0), /Feature .* is complete/);
+		assert.doesNotMatch(h.wake(0), /Continue the work you deferred/);
 		assert.equal(h.dispatches.length, 1, "status.md must be updated in code so yield does not stick");
 		assert.equal(h.dispatch(0).verdict.next, "done");
 		assert.equal(h.dispatch(0).owner.pr, "2142");
@@ -1478,6 +1590,31 @@ test("a refused Feature dispatch leaves the verdict on disk for a later retry", 
 	}
 });
 
+test("a completed dispatch cannot acknowledge the next review that arrived while its fixer ran", async () => {
+	let finish!: (action: string) => void;
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		featureOwnedPr: (pr: string) => ({ dir: "/tmp/feat", statusFile: "/tmp/feat/status.md", repo: "icemining", name: "feat", pr, worktree: REPO }),
+		onFeatureActionable: () => new Promise<string>((resolve) => { finish = resolve; }),
+	});
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		const settling = h.settle();
+		await sleep(40);
+		assert.equal(typeof finish, "function");
+		const file = waiterState(h.dir);
+		const next = { pr: "2142", lastNext: "read_comments_and_fix", round: "99", verdict: "head=new\nbrief_finding another failure", verdictDelivered: false };
+		writeFileSync(file, JSON.stringify(next));
+		finish("spawn_writer");
+		await settling;
+		await sleep(40);
+		assert.equal(JSON.parse(readFileSync(file, "utf8")).verdictDelivered, false, "a later round still needs its own fixer");
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("an accepted Feature dispatch spends the verdict so it is not dispatched twice", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-accepted");
 	let calls = 0;
@@ -1510,9 +1647,9 @@ test("an accepted Feature dispatch spends the verdict so it is not dispatched tw
 	}
 });
 
-test("a Feature-owned PR does not get a second waiter on settle", async () => {
-	// Three spawners raced here (F3): the handshake, this settle, and ghl-monitor.
-	// The reconciler owns Feature waiters now, so settle must not fork one.
+test("a Feature-owned PR restarts a dead waiter once, never a second", async () => {
+	// F3 was spawning while one was alive. A dead waiter with nobody restarting
+	// it is how long-running pr-await silently stopped. Pid-lock still holds.
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-owned");
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
 		featureOwnedPr: (pr: string) => ({
@@ -1529,12 +1666,10 @@ test("a Feature-owned PR does not get a second waiter on settle", async () => {
 		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
 		await h.settle();
 		await sleep(60);
-		assert.equal(
-			h.spawns.length,
-			0,
-			`a Feature waiter is the reconciler's job; got ${JSON.stringify(h.spawns)}`,
-		);
-		// The session still watches and still drains a pending verdict.
+		assert.equal(h.spawns.length, 1, "a dead Feature waiter is restarted");
+		await h.settle();
+		await sleep(60);
+		assert.equal(h.spawns.length, 1, "a live Feature waiter must not be doubled");
 		assert.ok(
 			h.notifies.some((n) => /2142/.test(n)),
 			`the session must still report the PR; got ${h.notifies.join(" | ")}`,
@@ -1645,7 +1780,7 @@ test("a Feature in another repo, or on another PR, does not swallow the solo wak
 		await sleep(80);
 		assert.equal(h.dispatches.length, 0, "neither Feature owns icemining#2142");
 		assert.equal(h.wakes.length, 1, `the solo wake must survive; got ${h.wakes.join(" | ")}`);
-		assert.match(h.wake(0), /Fix current-head findings/);
+		assert.match(h.wake(0), /Dispatch a fixer child/);
 		assert.match(h.wake(0), /Do not wait for another user message/);
 	} finally {
 		h.cleanup();
@@ -1725,14 +1860,40 @@ test("wait elapsed compact form", () => {
 	assert.equal(formatWaitElapsed(t0, t0 + 3_900_000), "1h 5m");
 });
 
-test("wait chrome includes review round when known", () => {
+test("wait chrome phase comes from waiter next=", () => {
+	assert.equal(waitPhaseFromNext("yield"), "waiting for review");
+	assert.equal(waitPhaseFromNext("poll_again"), "waiting for review");
+	assert.equal(waitPhaseFromNext(""), "waiting for review");
+	assert.equal(waitPhaseFromNext("read_comments_and_fix"), "fixing");
+	assert.equal(waitPhaseFromNext("git_pr_land"), "landing");
+	assert.equal(
+		waitChromePhase({ next: "read_comments_and_fix", writerLive: false }),
+		"review in",
+		"a review already in is not waiting for review",
+	);
+	assert.equal(
+		waitChromePhase({ next: "read_comments_and_fix", writerLive: true }),
+		"fixing",
+	);
+	assert.equal(waitChromePhase({ next: "yield" }), "waiting for review");
+});
+
+test("wait chrome labels current-head reviewer progress explicitly", () => {
+	assert.equal(
+		formatWaitLine({ label: "moofone/icanact-remote#222", elapsed: "20m", round: "1", roundTotal: "2", phase: "waiting for review" }),
+		"waiting moofone/icanact-remote#222 · reviewers 1/2 · waiting for review · 20m",
+	);
+	assert.equal(
+		formatWaitLine({ label: "moofone/icanact-remote#222", elapsed: "20m", round: "0", roundTotal: "2" }),
+		"waiting moofone/icanact-remote#222 · reviewers 0/2 · 20m",
+	);
 	assert.equal(
 		formatWaitLine({ label: "moofone/icemining#2178", elapsed: "2m" }),
 		"waiting moofone/icemining#2178 · 2m",
 	);
 	assert.equal(
 		formatWaitLine({ label: "moofone/icemining#2178", elapsed: "2m", round: "3" }),
-		"waiting moofone/icemining#2178 · r3 · 2m",
+		"waiting moofone/icemining#2178 · reviewers 3 · 2m",
 	);
 	assert.equal(
 		formatWaitLine({
@@ -1741,7 +1902,7 @@ test("wait chrome includes review round when known", () => {
 			round: "3",
 			roundTotal: "3",
 		}),
-		"waiting moofone/icemining#2178 · r3/3 · 2m",
+		"waiting moofone/icemining#2178 · reviewers 3/3 · 2m",
 	);
 	assert.equal(
 		formatWaitLine({
@@ -1750,7 +1911,27 @@ test("wait chrome includes review round when known", () => {
 			round: "2",
 			roundTotal: "5",
 		}),
-		"waiting moofone/icemining#2178 · r2/5 · 2m",
+		"waiting moofone/icemining#2178 · reviewers 2/5 · 2m",
+	);
+	assert.equal(
+		formatWaitLine({
+			label: "moofone/icemining#2178",
+			elapsed: "2m",
+			round: "1",
+			roundTotal: "3",
+			phase: "waiting for review",
+		}),
+		"waiting moofone/icemining#2178 · reviewers 1/3 · waiting for review · 2m",
+	);
+	assert.equal(
+		formatWaitLine({
+			label: "moofone/icemining#2252",
+			elapsed: "9m",
+			round: "2",
+			roundTotal: "3",
+			phase: "fixing",
+		}),
+		"waiting moofone/icemining#2252 · reviewers 2/3 · fixing · 9m",
 	);
 	const url = "https://github.com/moofone/icemining-devops/pull/485";
 	const linked = formatWaitLine({
@@ -1759,7 +1940,7 @@ test("wait chrome includes review round when known", () => {
 		round: "3",
 		url,
 	});
-	assert.equal(linked, `waiting ${osc8Link(url, "icemining-devops#485")} · r3 · 11m`);
+	assert.equal(linked, `waiting ${osc8Link(url, "icemining-devops#485")} · reviewers 3 · 11m`);
 	assert.match(linked, /\x1b\]8;;https:\/\/github.com\/moofone\/icemining-devops\/pull\/485/);
 	assert.equal(prUrl({ pr: "485", slug: "moofone/icemining-devops" }), url);
 	assert.equal(prUrl({ pr: "485", url }), url);
@@ -1835,7 +2016,7 @@ test("readLiveRound ignores verdict-embedded round from the previous cycle", () 
 	rmSync(dir, { recursive: true, force: true });
 });
 
-test("yield handoff drops the previous cycle's r3 so chrome is not stuck", async () => {
+test("yield handoff drops the previous head's reviewer progress", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(YIELD_OUTPUT)), REPO, {
 		watchMs: 20,
 		chromeMs: 20,
@@ -1869,8 +2050,8 @@ test("yield handoff drops the previous cycle's r3 so chrome is not stuck", async
 		const shown = h.titles.filter(Boolean).join(" | ");
 		assert.doesNotMatch(
 			shown,
-			/\br3\b/,
-			`stale r3 must not survive a new wait: ${shown}`,
+			/reviewers 3\b/,
+			`stale reviewer progress must not survive a new wait: ${shown}`,
 		);
 	} finally {
 		h.cleanup();
@@ -1894,7 +2075,7 @@ test("wait chrome picks up live round= from the waiter JSON", async () => {
 		writeFileSync(statePath, JSON.stringify({ ...cur, round: "1", roundTotal: "3" }));
 		await sleep(50);
 		const shown = h.titles.filter(Boolean).join(" | ");
-		assert.match(shown, /r1\/3/, `chrome must show live progress: ${shown}`);
+		assert.match(shown, /reviewers 1\/3/, `chrome must show live progress: ${shown}`);
 	} finally {
 		h.cleanup();
 	}
@@ -2113,5 +2294,330 @@ test("P5 F20: nothing in the extension writes a waiter pid file", async () => {
 			false,
 			`${name} wrote drive-<pr>.pid, which is the waiter's to write`,
 		);
+	}
+});
+
+/* ---------------------------------------------------------------- *
+ * LATCH_BUGS.md — merge wake is disk state, not chat history.
+ * ---------------------------------------------------------------- */
+
+function writeWaiterLog(dir: string, body: string, pr = "2142", repo = "icemining"): void {
+	const text = body.endsWith("\n") ? body : `${body}\n`;
+	writeFileSync(join(dir, `drive-${repo}-${pr}.log`), text);
+}
+
+const LANDED_LOG = [
+	"status=landed",
+	"next=done",
+	"pr_state=MERGED",
+	"pr=2142",
+].join("\n");
+
+test("observed Feature-owned merge wakes after a user prompt from the waiter log alone", async () => {
+	// #2242 / #2256: user pasted the PR URL, waiter wrote status=landed to the
+	// log, JSON never got lastNext=done, parent stayed silent.
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, "must not wake while open");
+		await h.input("https://github.com/moofone/icemining/pull/2142");
+		const ghBefore = h.calls.filter((c) => /^gh pr view/.test(c)).length;
+		writeWaiterLog(h.dir, LANDED_LOG);
+		await sleep(500);
+		assert.equal(h.wakes.length, 1, `log land must wake; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.match(h.wake(0), /Feature .* is complete/);
+		assert.doesNotMatch(h.wake(0), /Continue the work you deferred/);
+		assert.equal(h.dispatches.length, 1, "status.md must be archived in code");
+		assert.equal(h.dispatch(0).verdict.next, "done");
+		assert.equal(
+			h.calls.filter((c) => /^gh pr view/.test(c)).length,
+			ghBefore,
+			"a landed log is enough; GitHub must not be the wake",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("solo observed merge still wakes after an unrelated prompt from the waiter log", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		await h.input("check git-workflow, tdd-worker should not open PRs");
+		writeWaiterLog(h.dir, LANDED_LOG);
+		await sleep(500);
+		assert.equal(h.wakes.length, 1, `got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /Continue the work you deferred/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("an adopted latch does not wake on merge after a later user prompt", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFileSync(
+		join(h.dir, "pi-DEAD.latch.json"),
+		JSON.stringify({ pr: "2142", cwd: REPO, origin: "observed", pid: 999999999 }),
+	);
+	try {
+		await h.start();
+		await sleep(120);
+		await h.input("unrelated");
+		writeWaiterLog(h.dir, LANDED_LOG);
+		await sleep(500);
+		assert.equal(
+			h.wakes.length,
+			0,
+			`adopted + later prompt must not hijack; got ${h.wakes.join(" | ")}`,
+		);
+		assert.ok(
+			h.notifies.some((n) => /merged/.test(n)),
+			`toast still reports the merge; got ${h.notifies.join(" | ")}`,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a never-created waiter file is not terminal and costs no GitHub call", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		...watchOnly,
+		driverRunning: () => true,
+	});
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(existsSync(join(h.dir, "manual-icemining-2142.json")), false);
+		const ghBefore = h.calls.filter((c) => /^gh pr view/.test(c)).length;
+		writeWaiterLog(h.dir, "next=read_comments_and_fix\nround=3\n");
+		await sleep(500);
+		assert.equal(
+			h.calls.filter((c) => /^gh pr view/.test(c)).length,
+			ghBefore,
+			"a missing manual file plus an ACTIONABLE log is not a merge",
+		);
+		assert.equal(h.wakes.length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("notifyLatchTerminal wakes the observed latch even when parent session id differs", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
+	writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(
+			notifyLatchTerminal({ pr: "2142", state: "merged", sessionId: "someone-else" }, h.events),
+			true,
+			"the session that ran pr-await still wakes; parent_session_id can differ",
+		);
+		assert.equal(h.wakes.length, 1);
+		assert.match(h.wake(0), /Feature .* is complete/);
+		assert.equal(
+			notifyLatchTerminal({ pr: "2142", state: "merged", sessionId: h.sessionId }, h.events),
+			false,
+			"once-only: the latch is already spent",
+		);
+		assert.equal(h.wakes.length, 1);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("chrome tick notices status.md done without a waiter write", async () => {
+	// 2258: reconciler archived to phase: done; fs.watch is on the waiter dir,
+	// which never changed, so the overlay sat on waiting for review.
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		watchMs: 600_000,
+		chromeMs: 40,
+		driverRunning: () => true,
+	});
+	const featDir = writeFeatureStatus(h.dir, { pr: "2142" });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 0);
+		writeFileSync(
+			join(featDir, "status.md"),
+			[
+				"# Status",
+				"",
+				"repo: icemining",
+				"phase: done",
+				"pr: 2142",
+				"next_action: landed",
+				`worktree: ${join(homedir(), "Dev", "git", "ice-wt", "feat-x")}`,
+			].join("\n"),
+		);
+		await sleep(150);
+		assert.equal(h.wakes.length, 1, `status.md done must wake on chrome; got ${h.wakes.join(" | ")}`);
+		assert.match(h.wake(0), /#2142 merged/);
+		assert.equal(h.dispatches.length, 1);
+		assert.equal(h.dispatch(0).verdict.next, "done");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("duplicate terminal delivery does not buy a second model turn", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.wakes.length, 1);
+		await h.settle();
+		await sleep(40);
+		assert.equal(h.wakes.length, 1, "in-memory terminal guard plus receipt must not re-wake");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("restart replay of a claimed terminal does not infer", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchMs: 20 });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(40);
+		const latchPath = join(h.dir, `pi-${h.sessionId}.latch.json`);
+		const held = JSON.parse(readFileSync(latchPath, "utf8"));
+		assert.ok(held.generation, "armed latch must persist a delivery generation");
+		const claimed = claimWaitDelivery(h.dir, {
+			v: WAIT_PROTOCOL_VERSION,
+			owner: { kind: held.ownerKind ?? "session", id: held.ownerId ?? h.sessionId },
+			source: "pr",
+			identity: waitOutcomeIdentity("pr", `${held.slug ?? "pr"}#${held.pr}`),
+			generation: held.generation,
+			outcome: "merged",
+			deliveredAt: Date.now(),
+		});
+		assert.equal(claimed, true);
+		const viewCalls = () => h.calls.filter((c) => /^gh pr view/.test(c)).length;
+		const before = h.wakes.length;
+		writeWaiterLog(h.dir, LANDED_LOG);
+		await sleep(500);
+		assert.equal(h.wakes.length, before, "restart/receipt must suppress inference");
+		assert.ok(viewCalls() >= 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("stale Feature owner notifies without a generic parent continue", async () => {
+	let view = OPEN;
+	const h = harness(
+		(cmd) => (cmd === "gh" ? view : ok(REAL_OUTPUT)),
+		REPO,
+		{ watchMs: 20 },
+	);
+	writeFeatureStatus(h.dir, { pr: "2142", name: "feat-stale" });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(40);
+		writeFeatureStatus(h.dir, { pr: "9999", name: "feat-stale" });
+		view = MERGED;
+		await sleep(80);
+		assert.equal(h.wakes.length, 0, `stale owner must not infer; got ${h.wakes.join(" | ")}`);
+		assert.ok(
+			h.notifies.some((n) => /merged/i.test(n)),
+			"unrelated sessions may still be notified",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+/* ---------------------------------------------------------------- *
+ * mustLatch() after await on a fire-and-forget watch tick used to be
+ * uncaughtException and kill the TUI ("this session has no latch").
+ * ---------------------------------------------------------------- */
+
+test("pr-latch clear deletes the session latch file", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		const latchPath = join(h.dir, `pi-${h.sessionId}.latch.json`);
+		assert.ok(existsSync(latchPath), "settle must persist the session latch");
+		await h.commands["pr-latch"]("clear", h.ctx);
+		assert.equal(existsSync(latchPath), false, "clear must delete the session latch file");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("clearing the latch while checkTerminal awaits gh does not crash pi", async () => {
+	let blockViews = false;
+	let release = () => {};
+	let blocked = Promise.resolve();
+	let inFlight = 0;
+	const rejections: unknown[] = [];
+	const onReject = (err: unknown) => {
+		rejections.push(err);
+	};
+	process.on("unhandledRejection", onReject);
+
+	const h = harness(
+		async (cmd) => {
+			if (cmd === "gh") {
+				if (blockViews) {
+					inFlight++;
+					await blocked;
+				}
+				return OPEN;
+			}
+			return ok(REAL_OUTPUT);
+		},
+		REPO,
+		{ watchMs: 20, chromeMs: 0 },
+	);
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		await h.settle();
+		await sleep(80);
+		blocked = new Promise<void>((r) => {
+			release = r;
+		});
+		blockViews = true;
+		const start = Date.now();
+		while (inFlight === 0 && Date.now() - start < 1000) await sleep(10);
+		assert.ok(inFlight > 0, "checkTerminal must have called gh");
+		await h.commands["pr-latch"]("clear", h.ctx);
+		release();
+		await sleep(80);
+		assert.equal(
+			rejections.length,
+			0,
+			`watch tick must not unhandledReject; got ${rejections.map(String).join("; ")}`,
+		);
+	} finally {
+		process.off("unhandledRejection", onReject);
+		release();
+		h.cleanup();
 	}
 });

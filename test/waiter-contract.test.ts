@@ -13,14 +13,17 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import {
 	isAcceptedFeaturePrAction,
 	isDriverRunning,
-	readPid,
+	sameGithubRepo,
+	stopWaiterForPr,
+	waiterLogSaysTerminal,
+	waiterLogTerminalState,
 	waiterManualFiles,
 	waiterPaths,
 	waiterPidFiles,
@@ -73,7 +76,6 @@ test("isDriverRunning sees a live pid written under the repo-qualified name", ()
 		// Only the new spelling exists — exactly the live shape that made the old
 		// code spawn a second daemon on every settle.
 		writeFileSync(join(dir, "drive-icemining-2232.pid"), "4242");
-		assert.equal(readPid("2232", dir), 4242);
 		assert.equal(
 			isDriverRunning("2232", dir, (pid) => pid === 4242),
 			true,
@@ -178,7 +180,6 @@ test("reading waiter state creates nothing on disk", () => {
 		waiterPaths("icemining", "2232", dir);
 		waiterPidFiles("2232", dir);
 		waiterManualFiles("2232", dir);
-		readPid("2232", dir);
 		isDriverRunning("2232", dir, () => false);
 		assert.deepEqual(readdirSync(dir), before);
 		assert.deepEqual(before, []);
@@ -192,11 +193,59 @@ test("a missing state directory answers 'no waiter' instead of throwing", () => 
 	rmSync(dir, { recursive: true, force: true });
 	assert.deepEqual(waiterPidFiles("2232", dir), []);
 	assert.deepEqual(waiterManualFiles("2232", dir), []);
-	assert.equal(readPid("2232", dir), undefined);
 	assert.equal(
 		isDriverRunning("2232", dir, () => true),
 		false,
 	);
+});
+
+test("waiterLogSaysTerminal reads drive-*.log because lastNext is not on the JSON", () => {
+	const dir = tmpStateDir();
+	try {
+		assert.equal(waiterLogSaysTerminal("1", dir), false);
+		writeFileSync(
+			join(dir, "drive-pi-orchestrate-1.log"),
+			[
+				"status=landed",
+				"next=done",
+				"pr_state=MERGED",
+				"worktree_removed=feat-extract-orchestrate-modules",
+			].join("\n"),
+		);
+		assert.equal(waiterLogSaysTerminal("1", dir), true);
+		assert.equal(waiterLogSaysTerminal("2", dir), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("waiterLogSaysTerminal with a slug ignores a same-number PR in another repo", () => {
+	assert.equal(sameGithubRepo("icemining", "moofone/icemining"), true);
+	assert.equal(sameGithubRepo("icemining", "moofone/icemining-devops"), false);
+	const dir = tmpStateDir();
+	try {
+		writeFileSync(
+			join(dir, "drive-icemining-500.log"),
+			["status=landed", "next=done", "pr_state=MERGED"].join("\n"),
+		);
+		writeFileSync(
+			join(dir, "drive-icemining-devops-500.log"),
+			["status=action_required", "next=read_comments_and_fix"].join("\n"),
+		);
+		assert.equal(
+			waiterLogSaysTerminal("500", dir, "icemining-devops"),
+			false,
+			"devops#500 is still in review; icemining#500 landed is a different PR",
+		);
+		assert.equal(waiterLogSaysTerminal("500", dir, "moofone/icemining"), true);
+		assert.equal(
+			isDriverRunning("500", dir, () => true, "icemining-devops"),
+			false,
+			"no pid file; log-only must not look like a live waiter on the other repo",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("P2 F6: a disagreement consumes the verdict — the loop must not restart it every 60s", () => {
@@ -207,5 +256,37 @@ test("P2 F6: a disagreement consumes the verdict — the loop must not restart i
 			false,
 			`${refused} did nothing with the verdict; it stays on disk for retry`,
 		);
+	}
+});
+
+test("waiterLogTerminalState distinguishes merge from close", () => {
+	const dir = tmpStateDir();
+	try {
+		writeFileSync(join(dir, "drive-icemining-2142.log"), "status=landed\nnext=done\n");
+		assert.equal(waiterLogTerminalState("2142", dir, "icemining"), "merged");
+		writeFileSync(join(dir, "drive-icemining-2143.log"), "next=stop\npr_state=CLOSED\n");
+		assert.equal(waiterLogTerminalState("2143", dir, "icemining"), "closed");
+		writeFileSync(join(dir, "drive-icemining-2144.log"), "next=read_comments_and_fix\n");
+		assert.equal(waiterLogTerminalState("2144", dir, "icemining"), undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("stopWaiterForPr removes pid and manual files and leaves the log", () => {
+	const dir = tmpStateDir();
+	try {
+		const pid = join(dir, "drive-icemining-2142.pid");
+		const manual = join(dir, "manual-icemining-2142.json");
+		const log = join(dir, "drive-icemining-2142.log");
+		writeFileSync(pid, "999999999");
+		writeFileSync(manual, "{\"pr\":\"2142\"}");
+		writeFileSync(log, "status=landed\n");
+		stopWaiterForPr("2142", dir, "icemining");
+		assert.equal(existsSync(pid), false);
+		assert.equal(existsSync(manual), false);
+		assert.equal(existsSync(log), true, "the log is how a later session proves the merge");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });

@@ -87,7 +87,7 @@ test("resolveQueryCwd falls back when the worktree is gone", () => {
 	assert.equal(resolveQueryCwd(REF), REF);
 });
 
-test("drive trampoline targets ghl-pr-await, not a node waiter", () => {
+test("waiter starter targets ghl-pr-await, not a node waiter", () => {
 	const bin = awaitBin();
 	assert.match(bin, /ghl-pr-await$/);
 });

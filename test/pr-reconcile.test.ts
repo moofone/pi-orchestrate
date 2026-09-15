@@ -282,7 +282,7 @@ test("a listing that throws yields an empty pass instead of taking the session d
 // The production walk: which Features are listed, and which are not.
 // ---------------------------------------------------------------------------
 
-test("listFeaturePrOwners returns only live phase:pr Features with a PR number", () => {
+test("listFeaturePrOwners returns live phase:pr Features, and recovers a reseeded planning Feature that still has a PR", () => {
 	const root = tmpRoot();
 	try {
 		writeFeature(root, { name: "in-pr", pr: "2232" });
@@ -291,7 +291,11 @@ test("listFeaturePrOwners returns only live phase:pr Features with a PR number",
 		writeFeature(root, { name: "no-pr", pr: "none" });
 		writeFeature(root, { name: "archived-pr", pr: "2235", archived: true });
 		const found = listFeaturePrOwners({ root }).map((o) => o.name).sort();
-		assert.deepEqual(found, ["in-pr"]);
+		assert.deepEqual(
+			found,
+			["in-pr", "planning"],
+			"planning+pr is the reseeded-status recovery; implementing is still a Task chain",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

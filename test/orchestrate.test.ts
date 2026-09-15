@@ -13,7 +13,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -309,6 +309,72 @@ test("H2: withChainLock releases the lock when the body throws", async () => {
   });
   assert.equal(after, true, "a thrown chain must not wedge the Feature permanently");
   assert.equal(ran, 1);
+});
+
+/**
+ * Occupancy is process-wide, not per Feature. A fixer holding Feature A and a
+ * planner starting Feature B is the state the parent session actually showed
+ * (fixer + planner in Async agents). Per-dir locking lets that through.
+ */
+test("H2: a fixer chain in flight refuses a planner on a different Feature", async () => {
+  const withChainLock = (
+    orch as never as {
+      withChainLock: (k: string, fn: () => Promise<unknown>) => Promise<boolean>;
+    }
+  ).withChainLock;
+
+  let plannerRan = 0;
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => {
+    release = r;
+  });
+
+  const fixer = withChainLock("/feature/pr-2242", async () => {
+    await held;
+  });
+  const planner = await withChainLock("/feature/pending-new", async () => {
+    plannerRan += 1;
+  });
+
+  assert.equal(planner, false, "one chain in the process: fixer in flight must refuse planner");
+  assert.equal(plannerRan, 0, "the refused planner must not seed or spawn");
+
+  release();
+  assert.equal(await fixer, true);
+  const after = await withChainLock("/feature/pending-new", async () => {
+    plannerRan += 1;
+  });
+  assert.equal(after, true, "planner may start once the fixer chain releases");
+  assert.equal(plannerRan, 1);
+});
+
+test("H2: planner spawn is inside the chain lock, not before it", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const plan = src.indexOf('runChildInPhase(pi, ctx, "plan"');
+  assert.ok(plan > 0, "planner spawn exists");
+  const lock = src.lastIndexOf("withChainLock(pendingDir", plan);
+  assert.ok(
+    lock > 0 && lock < plan,
+    "planner must hold the process chain lock before runChildInPhase; otherwise a live fixer overlaps it",
+  );
+  const name = src.indexOf("ensureFeatureNamed(feat, readText(feat.planFile))", plan);
+  assert.ok(name > plan, "naming still happens after the planner child exits");
+});
+
+test("H2: a busy process, not only this Feature dir, refuses a fixer", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const call = src.slice(src.indexOf("const action = classifyFeaturePrNext("));
+  const chainLocked = call.slice(0, call.indexOf(");"));
+  assert.match(
+    chainLocked,
+    /RUNNING_CHAINS\.size\s*>\s*0/,
+    "fixer classify must see any in-flight chain, not only RUNNING_CHAINS.has(this Feature)",
+  );
+  assert.equal(
+    /RUNNING_CHAINS\.has\(paths\.featureDir\)/.test(chainLocked),
+    false,
+    "has(this Feature) is how a planner on another dir plus a fixer on this PR overlap",
+  );
 });
 
 /* ---------------------------------------------------------------- *
@@ -778,21 +844,15 @@ test("L3: next=yield arms an observed latch so merge can wake (pi.exec is not ba
   writeFileSync(paths.statusFile, ["# Status", "", "pause: off", "pr: 2197", ""].join("\n"));
 
   const armed: { pr: string; cwd: string; lastNext?: string }[] = [];
-  registerLatchArm((_ctx, seed) => {
+  const pi = makeFakePi(async () => ({
+    code: 0,
+    stdout: "status=handed_off\nnext=yield\npr=2197\nurl=https://github.com/moofone/icemining/pull/2197\n",
+    stderr: "",
+  }));
+  const unregister = registerLatchArm((_ctx, seed) => {
     armed.push({ pr: seed.pr, cwd: seed.cwd, lastNext: seed.lastNext });
-  });
+  }, pi.events);
   try {
-    const pi = makeFakePi(async (cmd) => {
-      if (cmd === "git") {
-        return {
-          code: 0,
-          stdout:
-            "status=handed_off\nnext=yield\npr=2197\nurl=https://github.com/moofone/icemining/pull/2197\n",
-          stderr: "",
-        };
-      }
-      return { code: 0, stdout: "", stderr: "" };
-    });
     const { ctx } = makeFakeCtx();
     const result = (await withDeadline(
       (orch as never as { drivePrAwait: Function }).drivePrAwait(pi, ctx, paths, "2197", dir),
@@ -805,7 +865,7 @@ test("L3: next=yield arms an observed latch so merge can wake (pi.exec is not ba
     assert.equal(armed[0]?.cwd, dir);
     assert.equal(armed[0]?.lastNext, "yield");
   } finally {
-    registerLatchArm(undefined);
+    unregister();
   }
 });
 
@@ -829,20 +889,6 @@ test("L3: normalizePrNumber / parseOpenedPr recover a PR the child opened but di
   assert.deepEqual(orch.parseOpenedPr('{ "opened": false, "pr": "2210" }'), {
     pr: "2210",
   });
-  assert.deepEqual(
-    orch.resolveOpenedPr({
-      structured: { opened: false, pr: "2210" },
-      summary: "ignored",
-    }),
-    { pr: "2210" },
-  );
-  assert.deepEqual(
-    orch.resolveOpenedPr({
-      structured: { opened: true },
-      summary: "PR 2210 created. I should update status.md?",
-    }),
-    { pr: "2210" },
-  );
   assert.equal(orch.parseOpenedPr("no pull request here"), undefined);
 });
 
@@ -878,9 +924,12 @@ test("L3: landFeaturePr never parks on resume once a PR exists; pr-await is code
   const discover = src.indexOf("discoverBranchPr", land);
   const open = src.indexOf("openFeaturePr", land);
   const awaitPr = src.indexOf("drivePrAwait", land);
+  const landFn = src.slice(land, src.indexOf("\nasync function", land + 1));
   assert.ok(land >= 0 && discover > land, "must look for an existing branch PR");
   assert.ok(open > discover, "open Feature PR in code only after discover misses");
   assert.ok(awaitPr > open, "drivePrAwait runs after a PR number exists");
+  assert.match(landFn, /featurePrDriveBlocked/, "done Features must not re-handshake");
+  assert.match(landFn, /featurePrRepo/, "PR cwd is the Task repo, not the Feature folder");
   assert.equal(
     src.includes("featurePrOpenTask"),
     false,
@@ -1124,6 +1173,27 @@ test("T1: colon headings (listing-factory-seams) are Tasks", () => {
   assert.equal(tasks[1]?.title, "Package-sourced definitions");
 });
 
+test("T1: Status todo is pending so approve does not skip to feature-qa", () => {
+  const parseTasks = (orch as never as { parseTasks: (p: string) => Array<{ status: string; id: string }> }).parseTasks;
+  const tasks = parseTasks(
+    [
+      "### Task 1 — Carry ids on register item",
+      "- Status: todo",
+      "- Complexity: critical",
+      "### Task 2 — Mining-identity resolve wire type",
+      "- Status: TBD",
+    ].join("\n"),
+  );
+  assert.equal(tasks.length, 2);
+  assert.equal(tasks[0]?.status, "pending");
+  assert.equal(tasks[1]?.status, "pending");
+  assert.equal(
+    tasks.find((t) => t.status === "pending")?.id,
+    "1",
+    "the chain must pick Task 1, not fall through to feature-qa",
+  );
+});
+
 test("T1: em dash, en dash, and hyphen headings still parse", () => {
   const parseTasks = (orch as never as { parseTasks: (p: string) => Array<{
     id: string;
@@ -1207,6 +1277,71 @@ test("W4: a blocked Task that wrote a handoff stays blocked", () => {
   assert.doesNotMatch(next, /- Status: pending/);
 });
 
+test("W4: blockedTaskReconcile continues once the blocking problem is gone", () => {
+  const reconcile = orch.blockedTaskReconcile;
+  assert.equal(typeof reconcile, "function");
+  assert.equal(
+    reconcile({ hasHandoffFile: true, treeDirty: false, handoffLine: "/tmp/task-1.md" }),
+    "done",
+    "dirty-commit block (no gate:) + clean tree → mark done and continue",
+  );
+  assert.equal(
+    reconcile({
+      hasHandoffFile: true,
+      treeDirty: false,
+      handoffLine: "/tmp/task-1.md  gate: green",
+    }),
+    "done",
+  );
+  assert.equal(
+    reconcile({
+      hasHandoffFile: true,
+      treeDirty: false,
+      handoffLine: "/tmp/task-1.md  gate: red",
+    }),
+    "keep",
+    "a red Command gate is still a problem",
+  );
+  assert.equal(
+    reconcile({ hasHandoffFile: true, treeDirty: true, handoffLine: "/tmp/task-1.md" }),
+    "keep",
+    "tree still dirty → still a problem",
+  );
+  assert.equal(
+    reconcile({ hasHandoffFile: false, treeDirty: false, handoffLine: "pending" }),
+    "pending",
+    "no handoff file → never ran",
+  );
+  assert.equal(
+    reconcile({
+      hasHandoffFile: true,
+      treeDirty: false,
+      handoffLine: "/tmp/task-1.md  gate: none",
+    }),
+    "keep",
+    "ungated worker failure stays blocked",
+  );
+});
+
+test("W4: applyBlockedReconcile marks a restored dirty-commit block done", () => {
+  const dir = mkdtempSync(join(tmpdir(), "orch-blocked-recover-"));
+  writeFileSync(join(dir, "task-1.md"), "work landed; Cargo.lock restored\n");
+  const plan = [
+    "### Task 1 — Gate Pearl difficulty hashrate",
+    "- Status: blocked",
+    "- Handoff: /tmp/task-1.md",
+    "### Task 2 — Reject zero hashrate ingest",
+    "- Status: pending",
+  ].join("\n");
+  const recovered = orch.applyBlockedReconcile(plan, dir, false);
+  assert.equal(recovered.changed, true);
+  assert.match(recovered.plan, /### Task 1[^]*?- Status: done/);
+  assert.match(recovered.plan, /### Task 2[^]*?- Status: pending/);
+  const stillDirty = orch.applyBlockedReconcile(plan, dir, true);
+  assert.equal(stillDirty.changed, false);
+  assert.match(stillDirty.plan, /### Task 1[^]*?- Status: blocked/);
+});
+
 test("T1: mixed dash then colon in one plan both parse", () => {
   const parseTasks = (orch as never as { parseTasks: (p: string) => Array<{
     id: string;
@@ -1232,7 +1367,7 @@ test("T1: mixed dash then colon in one plan both parse", () => {
  * W1 — orchestration writers must not inherit Cursor Grok / Composer
  * ---------------------------------------------------------------- */
 
-test("W1: isAllowedWriterModel allows GLM flash, cursor grok, Luna, and Anthropic Opus writers", () => {
+test("W1: isAllowedWriterModel allows luna, cursor grok, and Anthropic Opus writers", () => {
   assert.equal(
     typeof (orch as Record<string, unknown>).isAllowedWriterModel,
     "function",
@@ -1241,13 +1376,14 @@ test("W1: isAllowedWriterModel allows GLM flash, cursor grok, Luna, and Anthropi
   const allowed = (orch as never as { isAllowedWriterModel: (m: string) => boolean })
     .isAllowedWriterModel;
 
-  assert.equal(allowed("zai/glm-5.3-flash"), true);
-  assert.equal(allowed("zai/glm-5.3-flash:medium"), true);
-  assert.equal(allowed("zai/glm-5.3-flash:high"), true);
+  assert.equal(allowed("openai-codex/gpt-5.6-luna"), true);
+  assert.equal(allowed("openai-codex/gpt-5.6-luna:xhigh"), true);
+  assert.equal(allowed("zai/glm-5.3-flash"), false);
+  assert.equal(allowed("zai/glm-5.3-flash:medium"), false);
   assert.equal(allowed("cursor/grok-4.6"), true);
   assert.equal(allowed("cursor/grok-4.6:medium"), true);
-  assert.equal(allowed("cursor/gpt-5.6-luna"), true);
-  assert.equal(allowed("cursor/gpt-5.6-luna:xhigh"), true);
+  assert.equal(allowed("cursor/gpt-5.6-luna"), false);
+  assert.equal(allowed("cursor/gpt-5.6-luna:xhigh"), false);
   assert.equal(allowed("anthropic/claude-opus-5:medium"), true);
   assert.equal(allowed("cursor/claude-opus-5"), false);
   assert.equal(allowed("cursor/claude-opus-5:high"), false);
@@ -1263,54 +1399,7 @@ test("W1: isAllowedWriterModel allows GLM flash, cursor grok, Luna, and Anthropi
   assert.equal(allowed(""), false);
 });
 
-test("W1: writerSpawnRejection names the refuse for tdd-worker on cursor/grok", () => {
-  assert.equal(
-    typeof (orch as Record<string, unknown>).writerSpawnRejection,
-    "function",
-    "writerSpawnRejection must be exported",
-  );
-  const reject = (
-    orch as never as { writerSpawnRejection: (p: Record<string, unknown>) => string | undefined }
-  ).writerSpawnRejection;
-
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "zai/glm-5.3-flash:medium" }),
-    undefined,
-  );
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "cursor/grok-4.6:medium" }),
-    undefined,
-  );
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "cursor/gpt-5.6-luna:xhigh" }),
-    undefined,
-  );
-  assert.equal(
-    reject({ agent: "tdd-worker", model: "anthropic/claude-opus-5:medium" }),
-    undefined,
-  );
-  assert.equal(
-    reject({ agent: "planner", model: "xai/grok-4.6:high" }),
-    undefined,
-    "planner is not a writer; this guard does not apply",
-  );
-  // Pinning replaced hard-refuse for known writers: applySpawnPolicy rewrites
-  // composer/inherit onto GLM. writerSpawnRejection stays the allow-list check.
-  const composer = reject({ agent: "tdd-worker", model: "cursor/composer-2.5-fast:high" });
-  assert.equal(typeof composer, "string");
-  assert.match(String(composer), /composer/i);
-  assert.match(String(composer), /glm-5\.3-flash/);
-  assert.equal(typeof reject({ agent: "tdd-worker" }), "string", "missing model is inherit");
-  assert.equal(typeof reject({ agent: "feature-qa", model: "grok-4.6" }), "string");
-  assert.equal(
-    reject({ agent: "feature-qa", model: "xai/grok-4.6:high" }),
-    undefined,
-    "QA on native xai grok-4.6 high is the configured reviewer",
-  );
-  assert.equal(typeof reject({ agent: "qa-opus", model: "cursor/composer-2.5-fast" }), "string");
-});
-
-test("W1: runChild pins a tdd-worker on composer onto GLM before spawn", async () => {
+test("W1: runChild pins a tdd-worker on composer onto luna before spawn", async () => {
   const pi = makeFakePi();
   const spawn = captureSpawn(pi);
   const p = (orch as never as { runChild: Function }).runChild(pi, {
@@ -1326,14 +1415,14 @@ test("W1: runChild pins a tdd-worker on composer onto GLM before spawn", async (
   const outcome = (await withDeadline(p)) as { ok?: boolean; reason?: string };
   assert.notEqual(outcome.reason, "TEST_TIMEOUT", "pinned spawn must go out");
   assert.equal(outcome.ok, true);
-  assert.equal(spawn.params.model, "zai/glm-5.3-flash:medium");
+  assert.equal(spawn.params.model, "openai-codex/gpt-5.6-luna:xhigh");
   assert.doesNotMatch(String(spawn.params.model), /composer/);
   assert.equal(spawn.params.context, "fresh");
   assert.equal((spawn.params.turnBudget as { maxTurns: number }).maxTurns, 220);
 });
 
 const PARKED_EXCLUSION =
-  "Requested subagent model 'zai/glm-5.3-flash:medium' is excluded and cannot be replaced by a fallback (reason: Subagent produced no output (possible model cold-start or empty response).; expires: 2026-08-27T22:39:42.777Z).";
+  "Requested subagent model 'openai-codex/gpt-5.6-luna:xhigh' is excluded and cannot be replaced by a fallback (reason: Subagent produced no output (possible model cold-start or empty response).; expires: 2026-08-27T22:39:42.777Z).";
 
 test("W3: isExcludedModelFailure matches the pi-subagents parking throw", () => {
   assert.equal(
@@ -1349,7 +1438,7 @@ test("W3: isExcludedModelFailure matches the pi-subagents parking throw", () => 
   assert.equal(isExcl(undefined), false);
 });
 
-test("W3: excluded GLM tdd-worker retries onto cursor grok", async () => {
+test("W3: excluded luna tdd-worker does not retry when simple and critical share the pin", async () => {
   const pi = makeFakePi();
   const spawns: { requestId: string; params: Record<string, unknown> }[] = [];
   (pi as never as { events: { on: Function } }).events.on(
@@ -1378,15 +1467,14 @@ test("W3: excluded GLM tdd-worker retries onto cursor grok", async () => {
 
   const p = (orch as never as { runChild: Function }).runChild(pi, {
     agent: "tdd-worker",
-    model: "zai/glm-5.3-flash:medium",
+    model: "openai-codex/gpt-5.6-luna:xhigh",
     timeoutMs: 60_000,
   });
   const outcome = (await withDeadline(p, 2000)) as { ok?: boolean; reason?: string };
   assert.notEqual(outcome.reason, "TEST_TIMEOUT", "exclusion retry never settled");
-  assert.equal(outcome.ok, true);
-  assert.equal(spawns.length, 2, "simple GLM exclusion retries onto the critical writer");
-  assert.equal(spawns[0]?.params.model, "zai/glm-5.3-flash:medium");
-  assert.equal(spawns[1]?.params.model, "cursor/grok-4.6:medium");
+  assert.equal(outcome.ok, false);
+  assert.equal(spawns.length, 1, "same simple/critical pin must not retry onto itself");
+  assert.equal(spawns[0]?.params.model, "openai-codex/gpt-5.6-luna:xhigh");
 });
 
 test("W3: a non-exclusion spawn failure does not retry", async () => {
@@ -1409,16 +1497,16 @@ test("W3: a non-exclusion spawn failure does not retry", async () => {
 
   const p = (orch as never as { runChild: Function }).runChild(pi, {
     agent: "tdd-worker",
-    model: "zai/glm-5.3-flash:medium",
+    model: "openai-codex/gpt-5.6-luna:xhigh",
     timeoutMs: 60_000,
   });
   const outcome = (await withDeadline(p, 2000)) as { ok?: boolean; reason?: string };
   assert.notEqual(outcome.reason, "TEST_TIMEOUT");
   assert.equal(outcome.ok, false);
-  assert.equal(spawns.length, 1, "other spawn failures must not fan out onto grok");
+  assert.equal(spawns.length, 1, "other spawn failures must not fan out onto a second writer");
 });
 
-test("W3: an excluded critical grok writer does not retry (no loop)", async () => {
+test("W3: an excluded critical luna writer does not retry (no loop)", async () => {
   const pi = makeFakePi();
   const spawns: string[] = [];
   (pi as never as { events: { on: Function } }).events.on(
@@ -1438,7 +1526,7 @@ test("W3: an excluded critical grok writer does not retry (no loop)", async () =
 
   const p = (orch as never as { runChild: Function }).runChild(pi, {
     agent: "tdd-worker",
-    model: "cursor/grok-4.6:medium",
+    model: "openai-codex/gpt-5.6-luna:xhigh",
     timeoutMs: 60_000,
   });
   const outcome = (await withDeadline(p, 2000)) as { ok?: boolean; reason?: string };
@@ -1451,15 +1539,15 @@ test("W3: an excluded critical grok writer does not retry (no loop)", async () =
  * W2 — deterministic pins + fail-closed billing models
  * ---------------------------------------------------------------- */
 
-test("W2: isAllowedPlannerModel accepts native xai grok-4.6 high only", () => {
+test("W2: isAllowedPlannerModel accepts inherit only", () => {
   const allowed = (orch as never as { isAllowedPlannerModel: (m: string) => boolean })
     .isAllowedPlannerModel;
-  assert.equal(allowed("xai/grok-4.6:high"), true);
-  assert.equal(allowed("xai/grok-4.6"), false, "thinking high is required");
-  assert.equal(allowed("xai/grok-4.6:xhigh"), false);
-  assert.equal(allowed("grok-build/grok-4.6:high"), false, "grok-build is unregistered");
+  assert.equal(allowed("inherit"), true);
+  assert.equal(allowed("inherit:high"), true, "thinking suffix is still inherit");
+  assert.equal(allowed("xai/grok-4.6:high"), false, "do not pin planning onto xAI Grok");
+  assert.equal(allowed("xai/grok-4.6"), false);
   assert.equal(allowed("cursor/grok-4.6:high"), false);
-  assert.equal(allowed("inherit"), false);
+  assert.equal(allowed(""), false);
 });
 
 test("W2: applySpawnPolicy pins writers and planner; rejects other cursor billing", () => {
@@ -1487,44 +1575,53 @@ test("W2: applySpawnPolicy pins writers and planner; rejects other cursor billin
   const writer: SpawnParams = { agent: "tdd-worker", model: "cursor/composer-2.5-fast:high", timeoutMs: 4 * 60 * 60 * 1000 };
   const w = apply(writer);
   assert.equal(w.action, "pin");
-  assert.equal(writer.model, "zai/glm-5.3-flash:medium");
+  assert.equal(writer.model, "openai-codex/gpt-5.6-luna:xhigh");
   assert.equal(writer.context, "fresh");
   assert.ok((writer.timeoutMs as number) <= 90 * 60 * 1000, "4h writer timeout must clamp");
   assert.equal((writer.turnBudget as { maxTurns: number }).maxTurns, 220);
 
-  const already: SpawnParams = { agent: "tdd-worker", model: "zai/glm-5.3-flash:medium" };
+  const already: SpawnParams = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
   assert.equal(apply(already).action, "allow");
-  assert.equal(already.model, "zai/glm-5.3-flash:medium", "do not demote an allowed writer");
+  assert.equal(already.model, "openai-codex/gpt-5.6-luna:xhigh", "do not demote an allowed writer");
   assert.equal((already.turnBudget as { maxTurns: number }).maxTurns, 220);
 
-  const critical: SpawnParams = { agent: "tdd-worker", model: "cursor/grok-4.6:medium" };
+  const critical: SpawnParams = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
   assert.equal(apply(critical).action, "allow");
-  assert.equal(critical.model, "cursor/grok-4.6:medium", "do not demote the critical writer");
+  assert.equal(critical.model, "openai-codex/gpt-5.6-luna:xhigh", "do not demote the critical writer");
 
   const anthropicQa: SpawnParams = { agent: "feature-qa", model: "anthropic/claude-opus-5:high" };
   assert.equal(apply(anthropicQa).action, "pin");
-  assert.equal(anthropicQa.model, "xai/grok-4.6:high", "retired Opus QA pins onto native grok");
+  assert.equal(anthropicQa.model, "cursor/grok-4.6:high", "retired Opus QA pins onto feature-qa's cursor grok");
 
   const planner: SpawnParams = { agent: "planner", model: "cursor/grok-4.6:xhigh" };
   assert.equal(apply(planner).action, "pin");
-  assert.equal(planner.model, "xai/grok-4.6:high");
+  assert.equal(planner.model, "inherit");
 
   const inheritPlanner: SpawnParams = { agent: "planner" };
   assert.equal(apply(inheritPlanner).action, "pin");
-  assert.equal(inheritPlanner.model, "xai/grok-4.6:high");
+  assert.equal(inheritPlanner.model, "inherit");
 
   const demote: SpawnParams = { agent: "planner", model: "grok-build/grok-4.6:xhigh" };
   assert.equal(apply(demote).action, "pin");
-  assert.equal(demote.model, "xai/grok-4.6:high");
+  assert.equal(demote.model, "inherit");
 
   const alreadyPlanner = {
+    agent: "planner",
+    model: "inherit",
+    timeoutMs: 60_000,
+    turnBudget: { maxTurns: 80, graceTurns: 15 },
+  };
+  assert.equal(apply(alreadyPlanner).action, "allow");
+  assert.equal(alreadyPlanner.model, "inherit");
+
+  const nativeGrokPlanner = {
     agent: "planner",
     model: "xai/grok-4.6:high",
     timeoutMs: 60_000,
     turnBudget: { maxTurns: 80, graceTurns: 15 },
   };
-  assert.equal(apply(alreadyPlanner).action, "allow");
-  assert.equal(alreadyPlanner.model, "xai/grok-4.6:high");
+  assert.equal(apply(nativeGrokPlanner).action, "pin");
+  assert.equal(nativeGrokPlanner.model, "inherit", "planning follows the parent session, not xAI Grok");
 
   const scout = { agent: "worker", model: "cursor/composer-2.5-fast:high" };
   const s = apply(scout);
@@ -1554,7 +1651,7 @@ test("W2: applySpawnPolicy pins every parallel writer task", () => {
   };
   apply(params);
   for (const task of params.parallel) {
-    assert.equal(task.model, "zai/glm-5.3-flash:medium");
+    assert.equal(task.model, "openai-codex/gpt-5.6-luna:xhigh");
   }
   assert.ok((params.concurrency as number) <= 2, "writer fanout must not keep concurrency 7");
 });
@@ -1840,7 +1937,69 @@ test("L5: ensureFeatureNamed promotes pending-* to the title slug so approve has
   assert.equal(existsSync(dest), true, "pending-* must be renamed to the title slug");
   assert.match(
     readFileSync(join(dest, "status.md"), "utf8"),
-    /next_action: wait for \/orchestrate approve block-chance-honesty/,
+    /next_action: wait for plan-reviewer; do not approve yet/,
+  );
+});
+
+test("L5: ensureFeatureNamed rewrites plan-run.md and leaves a pending-* symlink for the launch path", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "orch-plan-run-"));
+  const pendingDir = join(repoDir, "pending-2026-09-02T16-23-05-632Z");
+  mkdirSync(join(pendingDir, "handoffs"), { recursive: true });
+  const plan = [
+    "# Feature: Split Orchestrate Modules",
+    "",
+    "> Status: DRAFT — awaiting approval",
+    "> Name: pending",
+    "> Branch: pending",
+    "> Repo: pi-orchestrate",
+    `> Path: ${join(pendingDir, "plan.md")}`,
+  ].join("\n");
+  writeFileSync(join(pendingDir, "plan.md"), plan);
+  writeFileSync(
+    join(pendingDir, "status.md"),
+    ["# Status", "name: pending", "phase: planning"].join("\n"),
+  );
+  writeFileSync(
+    join(pendingDir, "handoffs", "plan-run.md"),
+    [
+      "# plan-run",
+      "Name: pending",
+      "Branch: pending",
+      `Plan: ${join(pendingDir, "plan.md")}`,
+      "Next human step: `/orchestrate approve split-orchestrate-modules`",
+    ].join("\n"),
+  );
+  const paths = {
+    repo: "pi-orchestrate",
+    gitRoot: join(repoDir, "git"),
+    repoDir,
+    featureDir: pendingDir,
+    planFile: join(pendingDir, "plan.md"),
+    statusFile: join(pendingDir, "status.md"),
+    handoffsDir: join(pendingDir, "handoffs"),
+    archiveDir: join(repoDir, "archive"),
+  };
+  const named = (orch as never as { ensureFeatureNamed: Function }).ensureFeatureNamed(
+    paths,
+    plan,
+  );
+  const dest = join(repoDir, "split-orchestrate-modules");
+  assert.equal(named.name, "split-orchestrate-modules");
+  const handoff = readFileSync(join(dest, "handoffs", "plan-run.md"), "utf8");
+  assert.match(handoff, /^Name: split-orchestrate-modules$/m);
+  assert.match(handoff, /^Branch: feat\/split-orchestrate-modules$/m);
+  assert.equal(handoff.includes(`Plan: ${join(dest, "plan.md")}`), true);
+  assert.equal(handoff.includes(pendingDir), false, "plan-run.md must not keep the deleted launch path");
+  assert.doesNotMatch(
+    handoff,
+    /Next human step:.*\/orchestrate approve/,
+    "plan-run.md must not advertise approve before plan-reviewer finishes",
+  );
+  assert.equal(lstatSync(pendingDir).isSymbolicLink(), true, "stale parent reads still resolve via pending-*");
+  assert.equal(
+    readFileSync(join(pendingDir, "plan.md"), "utf8").includes("# Feature: Split Orchestrate Modules"),
+    true,
+    "read of the launch pending-*/plan.md must succeed after rename",
   );
 });
 
@@ -2280,14 +2439,13 @@ test("R6: a live orphan run is waited on, never started a second time", async ()
 /* ------------------------------------------------------------------ *
  * Q: the QA pass must be launchable
  *
- * `settings.json` scopes feature-qa / qa-opus / plan-reviewer to
- * `xai/grok-4.6`, and the extension's own contract text says the same.
- * Launching QA on a cursor-billed id is refused by modelScope before the
- * child starts, so every QA pass fails, no PR is ever opened, and the
- * Feature parks at `feature-qa failed — /orchestrate resume`.
+ * `settings.json` scopes feature-qa, qa-opus, and plan-reviewer to
+ * `cursor/grok-4.6`. Launching either on the wrong id is
+ * refused by modelScope before the child starts, so every QA pass fails,
+ * no PR is ever opened, and the Feature parks at `feature-qa failed`.
  * ------------------------------------------------------------------ */
 
-test("Q1: feature-qa launches on the native xai grok-4.6 id modelScope allows", () => {
+test("Q1: feature-qa launches on the cursor grok-4.6 id modelScope allows", () => {
   const params = orch.qaLaunchParams(
     {
       planFile: "/tmp/f/plan.md",
@@ -2299,7 +2457,7 @@ test("Q1: feature-qa launches on the native xai grok-4.6 id modelScope allows", 
     "high",
   );
   assert.equal(params.agent, "feature-qa");
-  assert.equal(params.model, "xai/grok-4.6:high");
+  assert.equal(params.model, "cursor/grok-4.6:high");
   assert.equal(params.cwd, "/tmp/wt");
   assert.equal(
     (params.turnBudget as { maxTurns: number }).maxTurns,
@@ -2308,17 +2466,17 @@ test("Q1: feature-qa launches on the native xai grok-4.6 id modelScope allows", 
   );
 });
 
-test("Q1: qa-opus launches on the same native grok id at high", () => {
+test("Q1: qa-opus launches on cursor grok-4.6 high", () => {
   const params = orch.qaLaunchParams(
     { planFile: "/tmp/f/plan.md", handoffsDir: "/tmp/f/handoffs" } as never,
     "auth-reject-analytics",
     "/tmp/wt",
     "qa-opus",
   );
-  assert.equal(params.model, "xai/grok-4.6:high");
+  assert.equal(params.model, "cursor/grok-4.6:high");
 });
 
-test("Q2: applySpawnPolicy pins a QA agent off a cursor-billed id onto native grok", () => {
+test("Q2: applySpawnPolicy pins feature-qa, qa-opus, and plan-reviewer onto cursor grok", () => {
   const apply = (
     orch as never as {
       applySpawnPolicy: (p: Record<string, unknown>) => { action: string; reason?: string };
@@ -2327,73 +2485,140 @@ test("Q2: applySpawnPolicy pins a QA agent off a cursor-billed id onto native gr
   const qa = { agent: "feature-qa", model: "cursor/claude-opus-5:high" };
   const decision = apply(qa);
   assert.equal(decision.action, "pin");
-  assert.equal(qa.model, "xai/grok-4.6:high", "cursor billing is out of QA scope");
+  assert.equal(qa.model, "cursor/grok-4.6:high", "feature-qa pins onto cursor grok, not native xai");
 
   const reviewer = { agent: "plan-reviewer", model: "cursor/claude-opus-5:xhigh" };
   assert.equal(apply(reviewer).action, "pin");
-  assert.equal(reviewer.model, "xai/grok-4.6:high");
+  assert.equal(reviewer.model, "openai-codex/gpt-5.6-luna:high", "plan-reviewer pins onto sidecar luna; xhigh is capped for QA");
 
   const alreadyXhigh = { agent: "qa-opus", model: "xai/grok-4.6:xhigh" };
   assert.equal(apply(alreadyXhigh).action, "pin");
-  assert.equal(alreadyXhigh.model, "xai/grok-4.6:high", "xhigh is capped even on the allowed QA id");
+  assert.equal(alreadyXhigh.model, "cursor/grok-4.6:high", "qa-opus pins onto cursor grok; xhigh is capped");
 
   const alreadyHigh = { agent: "feature-qa", model: "xai/grok-4.6:high" };
-  assert.equal(apply(alreadyHigh).action, "allow");
-  assert.equal(alreadyHigh.model, "xai/grok-4.6:high");
+  assert.equal(apply(alreadyHigh).action, "pin");
+  assert.equal(alreadyHigh.model, "cursor/grok-4.6:high", "native xai is not the feature-qa id");
 
   const cursorGrok = { agent: "feature-qa", model: "cursor/grok-4.6:high" };
-  assert.equal(apply(cursorGrok).action, "pin");
-  assert.equal(cursorGrok.model, "xai/grok-4.6:high", "cursor-billed grok is not the QA id");
+  assert.equal(apply(cursorGrok).action, "allow");
+  assert.equal(cursorGrok.model, "cursor/grok-4.6:high", "cursor-billed grok is the feature-qa id");
 
-  // tdd-worker keeps GLM: modelScope allows it for that agent.
-  const worker = { agent: "tdd-worker", model: "zai/glm-5.3-flash:medium" };
+  // tdd-worker keeps luna: modelScope allows it for that agent.
+  const worker = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
   assert.equal(apply(worker).action, "allow");
-  assert.equal(worker.model, "zai/glm-5.3-flash:medium");
+  assert.equal(worker.model, "openai-codex/gpt-5.6-luna:xhigh");
 
   const retiredOpus = { agent: "tdd-worker", model: "cursor/claude-opus-5:high" };
   assert.equal(apply(retiredOpus).action, "pin");
-  assert.equal(retiredOpus.model, "zai/glm-5.3-flash:medium", "retired cursor Opus pins onto GLM");
+  assert.equal(retiredOpus.model, "openai-codex/gpt-5.6-luna:xhigh", "retired cursor Opus pins onto luna");
 });
 
 /**
- * Q3: one place to change the reviewer model.
+ * Q3: one place to change reviewer and writer models.
  *
- * The QA model must be editable in `orchestrate.json` alone — not in
- * runFeatureQa, not in the spawn policy, not in each agent file.
+ * `planReviewer` is plan-reviewer. `qaReviewer` is feature-qa and qa-opus,
+ * falling back to `planReviewer`. `tddWorkerSimple` / `tddWorkerCritical`
+ * are tdd-worker. Not in runFeatureQa, not in the spawn policy, not in each
+ * agent file.
  */
 test("Q3: qaModelBase comes from the orchestrate.json sidecar", () => {
-  assert.equal(orch.qaModelBase('{"qaModel":"anthropic/claude-sonnet-9"}'), "anthropic/claude-sonnet-9");
+  assert.equal(orch.qaModelBase('{"planReviewer":"anthropic/claude-sonnet-9"}'), "anthropic/claude-sonnet-9");
   assert.equal(
-    orch.qaModelBase('{"qaModel":"openai/gpt-6:xhigh"}'),
+    orch.qaModelBase('{"planReviewer":"openai/gpt-6:xhigh"}'),
     "openai/gpt-6",
     "a thinking suffix in config is not part of the base id",
   );
-  assert.equal(orch.qaModelBase("{}"), "xai/grok-4.6", "missing key keeps the default");
-  assert.equal(orch.qaModelBase("not json"), "xai/grok-4.6");
+  assert.equal(orch.qaModelBase("{}"), "cursor/grok-4.6", "missing key keeps the default");
+  assert.equal(orch.qaModelBase("not json"), "cursor/grok-4.6");
+  assert.equal(
+    orch.qaModelBase("{}", "feature-qa"),
+    "cursor/grok-4.6",
+    "feature-qa defaults to cursor grok when the sidecar is empty",
+  );
+  assert.equal(
+    orch.qaModelBase("{}", "qa-opus"),
+    "cursor/grok-4.6",
+    "qa-opus defaults to cursor grok when the sidecar is empty",
+  );
 });
 
 test("Q3: the configured model drives launch, scope check, and pin alike", () => {
-  const cfg = '{"qaModel":"openai/gpt-6"}';
+  const cfg = '{"planReviewer":"openai/gpt-6"}';
   assert.equal(orch.qaModelFor("feature-qa", "high", cfg), "openai/gpt-6:high");
   assert.equal(orch.qaModelFor("qa-opus", undefined, cfg), "openai/gpt-6:high");
   assert.equal(orch.isAllowedQaModel("openai/gpt-6:high", cfg), true);
   assert.equal(orch.isAllowedQaModel("anthropic/claude-opus-5:high", cfg), false);
 });
 
-test("Q3: a config-level thinking suffix is the default level for that agent", () => {
-  assert.equal(orch.qaModelFor("feature-qa", undefined, '{"qaModel":"openai/gpt-6:low"}'), "openai/gpt-6:low");
+test("Q3: qaReviewer overrides planReviewer for feature-qa and qa-opus", () => {
+  const cfg = '{"planReviewer":"openai/gpt-6","qaReviewer":"cursor/grok-4.6:high"}';
+  assert.equal(orch.qaModelFor("feature-qa", undefined, cfg), "cursor/grok-4.6:high");
+  assert.equal(orch.qaModelFor("qa-opus", undefined, cfg), "cursor/grok-4.6:high");
+  assert.equal(orch.qaModelFor("plan-reviewer", "high", cfg), "openai/gpt-6:high");
+  assert.equal(orch.isAllowedQaModel("cursor/grok-4.6:high", cfg, "feature-qa"), true);
+  assert.equal(orch.isAllowedQaModel("openai/gpt-6:high", cfg, "feature-qa"), false);
+  assert.equal(orch.isAllowedQaModel("cursor/grok-4.6:high", cfg, "qa-opus"), true);
+  assert.equal(orch.isAllowedQaModel("cursor/grok-4.6:high", cfg, "plan-reviewer"), false);
+});
+
+/**
+ * Q3: tdd-worker pins live in the same sidecar as the QA models.
+ * tddWorkerSimple / tddWorkerCritical, not the DEFAULT_WORKERS table.
+ */
+test("Q3: tdd-worker pins come from tddWorkerSimple / tddWorkerCritical", () => {
+  assert.equal(orch.writerModelFor("simple", "{}"), "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(orch.writerModelFor("critical", "{}"), "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(orch.writerModelFor("simple", "not json"), "openai-codex/gpt-5.6-luna:xhigh");
   assert.equal(
-    orch.qaModelFor("feature-qa", "medium", '{"qaModel":"openai/gpt-6:low"}'),
+    orch.writerModelFor("critical", '{"tddWorkerCritical":"openai/gpt-6:low"}'),
+    "openai/gpt-6:low",
+  );
+  assert.equal(
+    orch.writerModelFor("simple", '{"tddWorkerSimple":"openai/gpt-6"}'),
+    "openai/gpt-6:xhigh",
+    "missing thinking suffix keeps the default level",
+  );
+  assert.equal(
+    orch.writerModelFor("critical", '{"tddWorkerCritical":"openai-codex/gpt-5.6-luna:xhigh"}'),
+    "openai-codex/gpt-5.6-luna:xhigh",
+    "writer xhigh is preserved",
+  );
+  assert.equal(
+    orch.writerModelBase("critical", '{"tddWorkerCritical":"OpenAI/GPT-6:high"}'),
+    "openai/gpt-6",
+  );
+  assert.equal(
+    orch.writerSpec("critical", '{"tddWorkerCritical":"openai-codex/gpt-5.6-luna:xhigh"}').short,
+    "gpt-5.6-luna xhigh",
+  );
+  assert.equal(
+    orch.writerModelFor("critical", '{"TddWorkerCritical":"openai/gpt-6:low"}'),
+    "openai/gpt-6:low",
+    "PascalCase aliases match the documented names",
+  );
+});
+
+test("Q3: live orchestrate.json pins tdd-worker to luna xhigh", () => {
+  assert.equal(orch.writerModelFor("simple"), "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(orch.writerModelFor("critical"), "openai-codex/gpt-5.6-luna:xhigh");
+  assert.equal(orch.overlayTaskAgentLabel("simple"), "simple · tdd-worker gpt-5.6-luna:xhigh");
+  assert.equal(orch.overlayTaskAgentLabel("critical"), "critical · tdd-worker gpt-5.6-luna:xhigh");
+});
+
+test("Q3: a config-level thinking suffix is the default level for that agent", () => {
+  assert.equal(orch.qaModelFor("feature-qa", undefined, '{"planReviewer":"openai/gpt-6:low"}'), "openai/gpt-6:low");
+  assert.equal(
+    orch.qaModelFor("feature-qa", "medium", '{"planReviewer":"openai/gpt-6:low"}'),
     "openai/gpt-6:medium",
     "an explicit caller level still wins",
   );
   assert.equal(
-    orch.qaModelFor("feature-qa", "xhigh", '{"qaModel":"openai/gpt-6:low"}'),
+    orch.qaModelFor("feature-qa", "xhigh", '{"planReviewer":"openai/gpt-6:low"}'),
     "openai/gpt-6:high",
-    "xhigh is capped to high",
+    "writer xhigh is preserved",
   );
   assert.equal(
-    orch.qaModelFor("qa-opus", undefined, '{"qaModel":"openai/gpt-6:xhigh"}'),
+    orch.qaModelFor("qa-opus", undefined, '{"planReviewer":"openai/gpt-6:xhigh"}'),
     "openai/gpt-6:high",
     "a config-level xhigh suffix is also capped",
   );
@@ -2449,11 +2674,8 @@ test("L4: orchestrate.ts source does not teach the retired poller", () => {
   );
 });
 
-test("L4: FORBIDDEN / gitWorkflowBlock / resume / pr-open cite the skill and never make the parent the fixer", () => {
-  const paths = promptContractPaths();
-  const wt = "/Users/greg/Dev/git/ice-wt/feat-x";
+test("L4: FORBIDDEN / resume / pr-open keep the parent out of writer work", () => {
   assert.equal(typeof orch.FORBIDDEN, "string", "FORBIDDEN must be exported");
-  assert.equal(typeof orch.gitWorkflowBlock, "function", "gitWorkflowBlock must be exported");
   assert.equal(
     (orch as Record<string, unknown>).resumePrompt,
     undefined,
@@ -2471,52 +2693,13 @@ test("L4: FORBIDDEN / gitWorkflowBlock / resume / pr-open cite the skill and nev
   );
 
   const forbidden = orch.FORBIDDEN as string;
-  const block = (orch.gitWorkflowBlock as Function)(paths, wt) as string;
-
-  for (const [label, text] of [
-    ["FORBIDDEN", forbidden],
-    ["gitWorkflowBlock", block],
-  ] as const) {
-    assertNoStalePoller(label, text);
-  }
-
-  assert.match(block, /tdd-worker and fixer must NOT `git wt`/);
-  assert.match(block, /must NOT `git pr-await`/);
-  assert.match(block, /gh pr create/);
-  assert.match(
-    block,
-    /not a tdd-worker|never a tdd-worker|tdd-worker never/i,
-    "the Feature PR is opened by code, not by tdd-worker",
-  );
-  assert.equal(block.includes(GIT_WORKFLOW_SKILL), true, "gitWorkflowBlock must cite the canonical skill path");
+  assertNoStalePoller("FORBIDDEN", forbidden);
   assert.match(forbidden, /next=yield/);
   assert.match(
     forbidden,
     /Do NOT implement product code in this parent session/,
     "the parent is still not a writer",
   );
-
-  // The Feature-PR paragraph describes a dispatcher, not a `next=` table for
-  // this session to work through itself.
-  assert.match(block, /read_comments_and_fix/, "the block still names the verdict it dispatches");
-  assert.match(block, /dispatch/i, "the Feature-PR paragraph must say code dispatches the verdict");
-  assert.match(block, /stays idle/i, "and that the parent session stays idle");
-  assert.match(
-    block,
-    /another fixer|keeps doing that|Never stop while review data/i,
-    "gitWorkflowBlock must say later review rounds still get a fixer",
-  );
-  for (const re of [
-    /fix current-head findings/i,
-    /follow the skill `next=` table/i,
-    /Then follow the skill/i,
-  ]) {
-    assert.equal(
-      re.test(block),
-      false,
-      `gitWorkflowBlock must not make the parent the fixer (matched ${re})`,
-    );
-  }
 });
 
 /**
@@ -2543,7 +2726,7 @@ function skillSection(heading: string): string {
  * rules that restated the writer contract in a file no writer is given any
  * more. A git skill is the wrong owner for orchestration policy, and a prompt
  * is the wrong enforcement for something code already owns — so the policy
- * lives in `gitWorkflowBlock` and `WRITER_CONTRACT`, which code inlines, and
+ * lives in `parentGitWorkflowAppend` and `WRITER_CONTRACT`, which code inlines, and
  * the enforcement lives in `classifyForRole`, which is mechanical.
  * ---------------------------------------------------------------- */
 
@@ -2589,23 +2772,12 @@ test("P5 F17: the duplicated paragraph is gone", () => {
 });
 
 test("P5 F17: the writer contract the skill used to carry is owned by code", () => {
-  const block = (orch.gitWorkflowBlock as Function)(
-    promptContractPaths(),
-    "/Users/greg/Dev/git/ice-wt/feat-x",
-  ) as string;
+  const block = orch.parentGitWorkflowAppend({ featureLive: true }) as string;
 
   assert.match(block, /read_comments_and_fix/, "code names the verdict the skill used to");
   assert.match(block, /dispatch/i, "and says it is dispatched, not worked by the reader");
   assert.match(block, /fixer/, "to a writer");
   assert.match(block, /stays? idle/i, "while the parent stays idle");
-  assert.match(block, /after that writer settles/i);
-  assert.match(block, /code runs `gh pr create`|code runs `git pr-await` once/i);
-  assert.match(
-    block,
-    /must NOT `git pr-await`|never `git pr-await`|not `git pr-await`/i,
-    "a writer never waits on the review",
-  );
-  assert.match(block, /keeps doing that|Never stop while review data/i);
 });
 
 test("L4: the skill still leaves a solo session its own latch, verdict, and fix", () => {
@@ -2618,8 +2790,8 @@ test("L4: the skill still leaves a solo session its own latch, verdict, and fix"
   );
   assert.match(
     src,
-    /`read_comments_and_fix` \| fix current-head findings[^|]*`git pr-await` once/,
-    "the solo `next=` table still tells that session to fix, push, and re-await",
+    /`read_comments_and_fix` \| dispatch a `fixer` child[^|]*`git pr-await` once/,
+    "the solo `next=` table still routes the fix to the fixer child, then push and re-await",
   );
 
   const harness = skillSection("Harness");
@@ -2653,6 +2825,41 @@ test("L4: parentGitWorkflowAppend forces a skill read and keeps a Feature parent
   const wake = orch.parentGitWorkflowAppend({ latchWake: true }) as string;
   assert.match(wake, /git-workflow\/SKILL\.md/);
   assert.doesNotMatch(wake, /Stay idle/, "a solo latch wake still gets to fix");
+  const reviewing = orch.parentGitWorkflowAppend({ planReviewRunning: true }) as string;
+  assert.match(reviewing, /Do NOT suggest or run \/orchestrate approve/);
+  assert.match(reviewing, /Do NOT summarize the plan as a Task table/);
+  assert.match(reviewing, /Plan draft, Plan review, and Approve/);
+  assert.doesNotMatch(reviewing, /shown only after plan_review is done/);
+  assert.doesNotMatch(reviewing, /Stay idle/, "reviewing is not a writer-owned phase");
+  const chain = orch.parentGitWorkflowAppend({ taskChain: true }) as string;
+  assert.match(chain, /rpiv-todo overlay/);
+  assert.match(chain, /Do not reprint/);
+  assert.match(chain, /Do not call the todo tool/);
+  assert.doesNotMatch(chain, /Stay idle/, "the orchestrate parent lives in the reference checkout");
+  const waiting = orch.parentGitWorkflowAppend({ awaitingApprove: true }) as string;
+  assert.match(waiting, /Waiting for the human to approve/);
+  assert.match(waiting, /Do NOT summarize the plan as a Task table/);
+  assert.match(waiting, /Do not start Tasks/);
+  const awaitingPr = orch.parentGitWorkflowAppend({ awaitingPr: true }) as string;
+  assert.match(awaitingPr, /PR is still open/);
+  assert.match(awaitingPr, /Do not report the Feature done/);
+  assert.match(awaitingPr, /pr-latch/);
+  assert.match(awaitingPr, /Do not run git pr-land/);
+  const landed = orch.parentGitWorkflowAppend({ featureLanded: true }) as string;
+  assert.match(landed, /One short confirmation/);
+  assert.match(landed, /Do not use tools/);
+  assert.doesNotMatch(landed, /SKILL\.md/);
+  assert.doesNotMatch(landed, /Stay idle/);
+  const landedNotJob = orch.parentGitWorkflowAppend({
+    featureLanded: true,
+    latchWake: true,
+    featureLive: true,
+  }) as string;
+  assert.doesNotMatch(
+    landedNotJob,
+    /read tool/,
+    "a Feature land must not send the model off to read the skill",
+  );
 });
 
 test("L4: orchestrate.ts registers resources_discover and before_agent_start for git-workflow", () => {
@@ -2676,8 +2883,28 @@ test("P5 F17: both hooks are kept deliberately, and the source says why", () => 
   assert.match(why, /settings\.json/, "and the fact that settles it");
   assert.match(
     src,
-    /liveFeatureNeedsIdleParent\(cwd\)/,
-    "the prompt append is gated on this session's own cwd, not on the repo",
+    /liveFeatureNeedsIdleParent\(cwd, undefined, session\)/,
+    "the prompt append is gated on this session, not on the repo",
+  );
+  assert.match(
+    src,
+    /planReviewRunning: liveFeaturePlanReviewRunning\(cwd, undefined, session\)/,
+    "parent must be told not to advertise approve while plan-reviewer is in flight",
+  );
+  assert.match(
+    src,
+    /taskChain: !featureLanded && liveFeatureTaskChain\(cwd, undefined, session\)/,
+    "parent that owns the Feature must show todos after each Task, not one table at the end",
+  );
+  assert.match(
+    src,
+    /featureLanded/,
+    "a Feature land must not be treated as a latchWake skill-read",
+  );
+  assert.match(
+    src,
+    /awaitingApprove: liveFeatureAwaitingApprove\(cwd, undefined, session\)/,
+    "parent must not reprint a Task table while waiting for approve",
   );
 });
 
@@ -2692,7 +2919,14 @@ test("P5 F17: both hooks are kept deliberately, and the source says why", () => 
  * ---------------------------------------------------------------- */
 
 function idleParentRoot(
-  rows: { name: string; phase: string; worktree?: string | null; pr?: string }[],
+  rows: {
+    name: string;
+    phase: string;
+    worktree?: string | null;
+    pr?: string;
+    sessionId?: string;
+    sessionFile?: string;
+  }[],
 ): string {
   const root = mkdtempSync(join(tmpdir(), "orch-idle-"));
   for (const row of rows) {
@@ -2708,10 +2942,57 @@ function idleParentRoot(
       `pr: ${row.pr ?? "none"}`,
     ];
     if (row.worktree !== null) lines.push(`worktree: ${row.worktree ?? "none"}`);
+    if (row.sessionId) lines.push(`parent_session_id: ${row.sessionId}`);
+    if (row.sessionFile) lines.push(`parent_session_file: ${row.sessionFile}`);
     writeFileSync(join(dir, "status.md"), `${lines.join("\n")}\n`);
   }
   return root;
 }
+
+test("overlay widget paint is keyed by session id, not last bind", () => {
+  const a: unknown[] = [];
+  const b: unknown[] = [];
+  orch.bindOverlayUi({
+    ui: { setWidget: (_k, v) => a.push(v) },
+    sessionManager: { getSessionId: () => "sess-A", getSessionFile: () => "/tmp/A.jsonl" },
+  });
+  orch.bindOverlayUi({
+    ui: { setWidget: (_k, v) => b.push(v) },
+    sessionManager: { getSessionId: () => "sess-B", getSessionFile: () => "/tmp/B.jsonl" },
+  });
+  const plan = "# Feature: Only A\n\n### Task 1 — x\n- Status: pending\n";
+  orch.syncOverlayTodos(plan, "parent_session_id: sess-A\nphase: implementing\n", undefined, "sess-A");
+  assert.ok(a.length > 0, "owning session A must receive the board");
+  assert.equal(b.length, 0, "session B must not inherit A's Feature board");
+});
+
+test("sessionOwnsFeature matches id or file and never infers from emptiness", () => {
+  assert.equal(orch.sessionOwnsFeature("phase: pr\n", { id: "a" }), false);
+  assert.equal(
+    orch.sessionOwnsFeature("parent_session_id: none\nparent_session_file: none\n", { id: "a" }),
+    false,
+  );
+  assert.equal(
+    orch.sessionOwnsFeature("parent_session_id: sess-a\n", { id: "sess-a" }),
+    true,
+  );
+  assert.equal(
+    orch.sessionOwnsFeature("parent_session_id: sess-a\n", { id: "sess-b" }),
+    false,
+  );
+  assert.equal(
+    orch.sessionOwnsFeature("parent_session_file: /tmp/chat.jsonl\n", { file: "/tmp/chat.jsonl" }),
+    true,
+  );
+  assert.equal(
+    orch.sessionOwnsFeature("parent_session_id: old\nparent_session_file: /tmp/chat.jsonl\n", {
+      id: "new-after-reload",
+      file: "/tmp/chat.jsonl",
+    }),
+    true,
+    "/reload may mint a new id; the session file is the stable claim",
+  );
+});
 
 test("L5: the idle gate matches the real phase names, not `implement`/`qa`", () => {
   const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-live");
@@ -2759,17 +3040,145 @@ test("L5: the reference checkout is not silenced by a Feature working in a workt
   }
 });
 
-test("L5: a Feature with no worktree yet still claims its reference checkout", () => {
-  // Host Features and pre-`git wt` phases record no worktree. The only cwd that
-  // can be theirs is the repo root, so that one still counts.
+test("L5: a Feature with no worktree does not claim every chat in the repo root", () => {
   const REF = join(homedir(), "Dev", "git", "icemining");
   const root = idleParentRoot([
-    { name: "feat-nowt", phase: "implementing", worktree: "none" },
+    { name: "feat-nowt", phase: "implementing", worktree: "none", sessionId: "sess-owner" },
   ]);
   try {
-    assert.equal(orch.liveFeatureNeedsIdleParent(REF, root), true);
+    assert.equal(
+      orch.liveFeatureNeedsIdleParent(REF, root),
+      false,
+      "without session identity the repo root is shared by every tab",
+    );
+    assert.equal(
+      orch.liveFeatureNeedsIdleParent(REF, root, { id: "sess-owner" }),
+      true,
+      "the owning session may sit in the repo root before git wt",
+    );
+    assert.equal(
+      orch.liveFeatureNeedsIdleParent(REF, root, { id: "sess-other" }),
+      false,
+      "a sibling chat in the same cwd does not inherit the Feature",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("L5: liveFeaturePlanReviewRunning is true on the reference checkout while reviewing", () => {
+  const REF = join(homedir(), "Dev", "git", "icemining");
+  const root = idleParentRoot([
+    { name: "feat-review", phase: "reviewing", worktree: "none" },
+  ]);
+  try {
+    writeFileSync(
+      join(root, "icemining", "feat-review", "status.md"),
+      [
+        "# Status",
+        "repo: icemining",
+        "name: feat-review",
+        "phase: reviewing",
+        "plan_review: running",
+        "worktree: none",
+      ].join("\n") + "\n",
+    );
+    assert.equal(typeof orch.liveFeaturePlanReviewRunning, "function");
+    assert.equal(
+      orch.liveFeaturePlanReviewRunning(REF, root),
+      false,
+      "unowned review does not silence every icemining tab",
+    );
+    writeFileSync(
+      join(root, "icemining", "feat-review", "status.md"),
+      [
+        "# Status",
+        "repo: icemining",
+        "name: feat-review",
+        "phase: reviewing",
+        "plan_review: running",
+        "worktree: none",
+        "parent_session_id: sess-review",
+      ].join("\n") + "\n",
+    );
+    assert.equal(orch.liveFeaturePlanReviewRunning(REF, root, { id: "sess-review" }), true);
+    assert.equal(
+      orch.liveFeaturePlanReviewRunning(join(homedir(), "Dev", "git", "ice-wt", "other"), root, {
+        id: "sess-review",
+      }),
+      false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("L5: liveFeatureTaskChain reaches the reference checkout so todos show after each Task", () => {
+  const REF = join(homedir(), "Dev", "git", "icemining");
+  const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-chain");
+  const root = idleParentRoot([
+    { name: "feat-chain", phase: "implementing", worktree: WT },
+  ]);
+  try {
+    assert.equal(typeof orch.liveFeatureTaskChain, "function");
+    assert.equal(
+      orch.liveFeatureTaskChain(REF, root),
+      false,
+      "without ownership the reference checkout is just another chat",
+    );
+    const owned = idleParentRoot([
+      { name: "feat-chain", phase: "implementing", worktree: WT, sessionId: "sess-chain" },
+    ]);
+    try {
+      assert.equal(
+        orch.liveFeatureTaskChain(REF, owned, { id: "sess-chain" }),
+        true,
+        "the owning session may sit in the reference checkout",
+      );
+      assert.equal(orch.liveFeatureTaskChain(WT, owned, { id: "sess-chain" }), true);
+      assert.equal(
+        orch.liveFeatureTaskChain(REF, owned, { id: "sess-other" }),
+        false,
+      );
+      assert.equal(
+        orch.liveFeatureNeedsIdleParent(REF, owned, { id: "sess-chain" }),
+        false,
+        "F8: Stay idle still does not poison the reference checkout",
+      );
+    } finally {
+      rmSync(owned, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("L5: liveFeatureTaskChain stays on while blocked or paused so the parent does not reprint todos", () => {
+  const REF = join(homedir(), "Dev", "git", "icemining");
+  const WT = join(homedir(), "Dev", "git", "ice-wt", "feat-bleed");
+  for (const phase of ["blocked", "paused", "pr"]) {
+    const root = idleParentRoot([{ name: "feat-bleed", phase, worktree: WT }]);
+    try {
+      assert.equal(
+        orch.liveFeatureTaskChain(REF, root),
+        false,
+        `${phase}: an unowned Feature does not bind every icemining tab`,
+      );
+      const owned = idleParentRoot([
+        { name: "feat-bleed", phase, worktree: WT, sessionId: "sess-bleed" },
+      ]);
+      try {
+        assert.equal(
+          orch.liveFeatureTaskChain(REF, owned, { id: "sess-bleed" }),
+          true,
+          `${phase}: owning parent must not reprint the overlay`,
+        );
+      } finally {
+        rmSync(owned, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -2889,6 +3298,65 @@ test("D1: findFeatureOwningPr binds a PR number to the live Feature that owns it
   assert.equal(orch.findFeatureOwningPr("77", { repo: "icemining", root }), undefined);
 });
 
+test("D1: a Feature hosted under icemining can own icemining-devops#500, not icemining#500", () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-owner-cross-"));
+  const dir = seedFeatureStatus(root, "icemining", "build-timing-harness", {
+    repo: "icemining",
+    pr: "https://github.com/moofone/icemining-devops/pull/500",
+    worktree: join(homedir(), "Dev/git/devops-wt/feat-build-timing-harness"),
+    phase: "pr",
+  });
+  writeFileSync(
+    join(dir, "plan.md"),
+    [
+      "> Repo: icemining",
+      "### Task 1 — Wrapper",
+      "- Repo: icemining-devops",
+    ].join("\n"),
+  );
+  assert.equal(
+    orch.findFeatureOwningPr("500", { repo: "icemining", root }),
+    undefined,
+    "icemining#500 is a different pull request than the Feature's devops PR",
+  );
+  assert.equal(
+    orch.findFeatureOwningPr("500", { repo: "icemining-devops", root })?.dir,
+    dir,
+  );
+  assert.equal(
+    orch.findFeatureOwningPr("500", { repo: "moofone/icemining-devops", root })?.name,
+    "build-timing-harness",
+  );
+});
+
+test("D1: unanimous Task Repo recovers ownership when pr: is number-only", () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-owner-plan-"));
+  const dir = seedFeatureStatus(root, "icemining", "build-timing-harness", {
+    repo: "icemining",
+    pr: "500",
+    phase: "done",
+  });
+  writeFileSync(
+    join(dir, "plan.md"),
+    [
+      "> Repo: icemining",
+      "### Task 1 — Wrapper",
+      "- Repo: icemining-devops",
+      "### Task 2 — Snapshot",
+      "- Repo: icemining-devops",
+    ].join("\n"),
+  );
+  assert.equal(
+    orch.findFeatureOwningPr("500", { repo: "icemining", root }),
+    undefined,
+    "plan Tasks all in devops → not icemining#500",
+  );
+  assert.equal(
+    orch.findFeatureOwningPr("500", { repo: "icemining-devops", root })?.dir,
+    dir,
+  );
+});
+
 test("D1: findFeatureOwningPr recovers ownership from branch when pr: none (no parent fixer)", () => {
   const root = mkdtempSync(join(tmpdir(), "orch-owner-branch-"));
   const worktree = join(homedir(), "Dev/git/ice-wt/feat-coins-chart-y-zoom");
@@ -2969,12 +3437,12 @@ test("D1: classifyFeaturePrNext routes every judgment next= without asking the p
   assert.equal(classify("done", { prRound: 0 }), "archive");
   assert.equal(classify("stop", { prRound: 0 }), "confirm");
 
-  // F6 reversed the old "no cap" rule: the loop ends at a merge or at a
-  // disagreement, and 99 rounds is neither.
+  // No round-count cap: the loop ends at merge or at repeated findings, not
+  // at a spent-round ceiling.
   assert.equal(
     classify("read_comments_and_fix", { prRound: 99 }),
-    "disagree",
-    "past the cap code stops arguing and says so on the PR",
+    "spawn_writer",
+    "a high pr_round still gets a fixer",
   );
   assert.equal(
     classify("read_comments_and_fix", { prRound: 0, chainLocked: true }),
@@ -3056,7 +3524,7 @@ test("D1: reviewFixLaunchParams is a fixer contract that carries the verdict and
   assert.equal(params.agent, "fixer", "review-fix is fixer, not tdd-worker");
   assert.equal(params.cwd, worktree, "the fixer writes in the Feature worktree only");
   assert.equal(params.context, "fresh");
-  assert.equal(params.model, "cursor/grok-4.6:medium", "review-fix is the critical writer");
+  assert.equal(params.model, "openai-codex/gpt-5.6-luna:xhigh", "review-fix is the critical writer");
   assert.equal(
     String(params.output).startsWith(paths.handoffsDir),
     true,
@@ -3821,7 +4289,7 @@ test("D3: a completed worker_run_id is swept and the next fixer may spawn", asyn
 });
 
 test("D3: a high fixer round still spawns and never lands from read_comments_and_fix", async () => {
-  const { dir, paths } = prFeatureFixture(5);
+  const { dir, paths } = prFeatureFixture(99);
   const { pi, execs } = execRecorder("status=handed_off\nnext=yield\nround=21\n");
   const spawn = autoSettleSpawn(pi, "run-nocap-1");
   const { ctx } = makeFakeCtx();
@@ -3829,7 +4297,7 @@ test("D3: a high fixer round still spawns and never lands from read_comments_and
   const action = await dispatchVerdict(pi, ctx, paths, dir, "read_comments_and_fix", FIX_VERDICT);
   assert.equal(action, "spawn_writer", "no round cap on fixers");
   assert.equal(spawn.count, 1);
-  assert.match(readFileSync(paths.statusFile, "utf8"), /^pr_round: 6$/m);
+  assert.match(readFileSync(paths.statusFile, "utf8"), /^pr_round: 100$/m);
   assert.deepEqual(prAwaitCalls(execs), ["git pr-await 99"]);
   for (const argv of execs) assert.doesNotMatch(argv, /gh pr merge|git pr-land/);
   assert.equal(parentTurns(pi).length, 0);
@@ -3912,7 +4380,7 @@ test("T1: orchestrate.ts does not sendTurn planner, review, or resume prompts", 
   );
 });
 
-test("T1: subagentToolGuard blocks every orchestrate child on the parent tool path", () => {
+test("T1: subagentToolGuard allows the shared solo fixer and blocks orchestrate-only children", () => {
   const guard = (
     orch as never as {
       subagentToolGuard: (event: {
@@ -3921,7 +4389,8 @@ test("T1: subagentToolGuard blocks every orchestrate child on the parent tool pa
       }) => { block: true; reason: string } | undefined;
     }
   ).subagentToolGuard;
-  for (const agent of ["tdd-worker", "fixer", "feature-qa", "qa-opus", "plan-reviewer", "planner"]) {
+  assert.equal(guard({ toolName: "subagent", input: { agent: "fixer" } }), undefined, "solo parent can dispatch the shared fixer");
+  for (const agent of ["tdd-worker", "feature-qa", "qa-opus", "plan-reviewer", "planner"]) {
     const blocked = guard({ toolName: "subagent", input: { agent, model: "xai/grok-4.6:high" } });
     assert.equal(blocked?.block, true, `parent must not spawn ${agent}`);
   }
@@ -3938,10 +4407,11 @@ test("T1: applySpawnPolicy still pins writers for the extension rpcCall path", (
       applySpawnPolicy: (p: Record<string, unknown>) => { action: string };
     }
   ).applySpawnPolicy;
-  const writer = { agent: "tdd-worker", model: "cursor/gpt-5.6-luna:xhigh" };
+  const writer = { agent: "tdd-worker", model: "openai-codex/gpt-5.6-luna:xhigh" };
   assert.equal(apply(writer).action, "allow");
   const planner = { agent: "planner", model: "xai/grok-4.6:high" };
   assert.notEqual(apply(planner).action, "reject");
+  assert.equal(planner.model, "inherit");
 });
 
 test("T2: pinWriterCaps is a ceiling — a smaller requested budget survives", () => {
@@ -3952,7 +4422,7 @@ test("T2: pinWriterCaps is a ceiling — a smaller requested budget survives", (
   ).applySpawnPolicy;
   const open = {
     agent: "tdd-worker",
-    model: "cursor/gpt-5.6-luna:xhigh",
+    model: "openai-codex/gpt-5.6-luna:xhigh",
     turnBudget: { maxTurns: 15, graceTurns: 5 },
   };
   apply(open);
@@ -3994,7 +4464,7 @@ test("T2: plannerLaunchParams is a planner child, not a parent prompt", () => {
     "bound objective",
   ) as Record<string, unknown>;
   assert.equal(params.agent, "planner");
-  assert.equal(params.model, "xai/grok-4.6:high");
+  assert.equal(params.model, "inherit");
   assert.equal(params.context, "fresh");
   const task = String(params.task);
   assert.match(task, /bound objective/);
@@ -4003,7 +4473,61 @@ test("T2: plannerLaunchParams is a planner child, not a parent prompt", () => {
   assert.equal((params.turnBudget as { maxTurns: number }).maxTurns, 80);
 });
 
-test("T2: planner always instructs the specific Feature name, never bare /orchestrate approve", () => {
+// The planner is `acceptanceRole: writer` and its task says "overwrite plan.md",
+// so an omitted acceptance is inferred as `checked` — whose evidence includes
+// `tests-added`. A planner forbidden from touching product code can never
+// produce that, so every planner run was rejected, `planned.ok` came back false,
+// and the plan path returned before naming the Feature or running plan-reviewer.
+test("T2: planner acceptance is off — it writes plan files, never tests", () => {
+  const params = (orch.plannerLaunchParams as Function)(
+    promptContractPaths(),
+    "bound objective",
+  ) as Record<string, unknown>;
+  const acceptance = params.acceptance as { level?: string; reason?: string } | undefined;
+  assert.ok(acceptance, "planner must declare acceptance, not inherit the inferred writer level");
+  assert.equal(acceptance.level, "none");
+  assert.ok(String(acceptance.reason ?? "").length > 0, "a none level must carry a reason");
+});
+
+// Every other launcher pins its child's cwd. The planner's was unset, so it
+// inherited whatever the session was rooted at and ran a home-directory grep
+// that timed out and lost the run.
+test("T2: planner is rooted at the repo it is planning", () => {
+  const params = (orch.plannerLaunchParams as Function)(
+    promptContractPaths(),
+    "bound objective",
+  ) as Record<string, unknown>;
+  assert.equal(params.cwd, "/Users/greg/Dev/git/icemining");
+});
+
+// Root cause of the lost run: Phase 1 ordered "read every spec referenced in
+// AGENTS.md", pi-orchestrate has no AGENTS.md (186 of 234 repos under
+// ~/Dev/git do not), and the only copy on the box is ~/AGENTS.md. With no cwd
+// and two roots whose sole common parent is the home directory, the search for
+// it widened to $HOME — where the file really is.
+test("T2: planner is bounded to two roots and never told to find AGENTS.md", () => {
+  const params = (orch.plannerLaunchParams as Function)(
+    promptContractPaths(),
+    "bound objective",
+  ) as Record<string, unknown>;
+  const task = String(params.task);
+  assert.match(task, /Search scope/, "planner must be given an explicit search boundary");
+  assert.match(task, /Never grep, find, or glob/);
+  assert.match(task, /\/Users\/greg\/Dev\/git\/icemining/, "the code root must be named");
+  assert.match(task, /\/tmp\/orch-contract/, "the durable Feature root must be named");
+  assert.doesNotMatch(
+    task,
+    /Read every spec referenced in AGENTS\.md/,
+    "an unconditional AGENTS.md read sends the planner hunting outside the repo",
+  );
+  assert.match(
+    task,
+    /Most repos have no AGENTS\.md/,
+    "the planner must be told a missing AGENTS.md is normal, not something to search for",
+  );
+});
+
+test("T2: planner does not tell anyone to /orchestrate approve — plan-reviewer runs first", () => {
   const params = (orch.plannerLaunchParams as Function)(
     promptContractPaths(),
     "bound objective",
@@ -4011,15 +4535,28 @@ test("T2: planner always instructs the specific Feature name, never bare /orches
   const task = String(params.task);
   assert.doesNotMatch(
     task,
-    /next_action: wait for \/orchestrate approve \(/,
-    "status seed must not teach a nameless approve command",
+    /next_action: wait for \/orchestrate approve/,
+    "status seed must not teach approve before plan-reviewer",
   );
-  assert.match(
+  assert.doesNotMatch(
     task,
-    /\/orchestrate approve <kebab-of-# Feature: title>/,
-    "planner must be told the named approve command shape",
+    /The next human step is/,
+    "planner must not advertise approve as the next human step",
   );
-  assert.match(task, /never a bare `\/orchestrate approve`/);
+  assert.match(task, /Do not mention `\/orchestrate approve`/);
+  assert.match(task, /plan-reviewer/);
+});
+
+test("T2: planner requires TDD red tests and verifiable Acceptance per Task", () => {
+  const params = (orch.plannerLaunchParams as Function)(
+    promptContractPaths(),
+    "bound objective",
+  ) as Record<string, unknown>;
+  const task = String(params.task);
+  assert.match(task, /- Acceptance:/);
+  assert.match(task, /TDD is mandatory/);
+  assert.match(task, /verifiable/);
+  assert.match(task, /- Red test:/);
 });
 
 test("T2: reviewLaunchParams is a plan-reviewer child", () => {
@@ -4030,23 +4567,41 @@ test("T2: reviewLaunchParams is a plan-reviewer child", () => {
     "feat-x",
   ) as Record<string, unknown>;
   assert.equal(params.agent, "plan-reviewer");
-  assert.equal(params.model, "xai/grok-4.6:high");
+  assert.equal(params.model, "openai-codex/gpt-5.6-luna:high");
   assert.equal(params.cwd, "/tmp/wt");
   assert.equal((params.turnBudget as { maxTurns: number }).maxTurns, 60);
+  const task = String(params.task);
+  assert.match(task, /TDD red test exists/);
+  assert.match(task, /in scope for this Task only/);
+  assert.match(task, /Acceptance: is present, concrete, and verifiable/);
 });
 
-test("T3: QA findings, Tasks, and qa_pass_cap are bounded", () => {
+// Same defect as the planner: `plan-reviewer` is also `acceptanceRole: writer`
+// and is told to "apply corrections to plan.md now", so an omitted acceptance
+// infers `checked` and demands `tests-added` from a child that only edits a
+// plan. `reviewPlan` would have recorded plan_review: failed on a good review.
+test("T2: plan-reviewer acceptance is off — it edits the plan, never tests", () => {
+  const params = (orch.reviewLaunchParams as Function)(
+    promptContractPaths(),
+    "/tmp/wt",
+    "feat-x",
+  ) as Record<string, unknown>;
+  const acceptance = params.acceptance as { level?: string; reason?: string } | undefined;
+  assert.ok(acceptance, "plan-reviewer must declare acceptance, not inherit the inferred level");
+  assert.equal(acceptance.level, "none");
+  assert.ok(String(acceptance.reason ?? "").length > 0, "a none level must carry a reason");
+});
+
+test("T3: QA findings and qa_pass_cap are bounded", () => {
   assert.equal(orch.MAX_QA_FINDINGS, 8);
-  assert.equal(orch.MAX_TASKS, 12);
   assert.equal(orch.MAX_QA_PASS_CAP, 2);
   assert.equal(typeof orch.clampedQaPassCap, "function");
   const clamp = orch.clampedQaPassCap as (n: number) => number;
   assert.equal(clamp(99), 2);
   assert.equal(clamp(1), 1);
   assert.equal(clamp(0), 0);
-  assert.equal(typeof orch.taskCountError, "function");
-  assert.match(String((orch.taskCountError as Function)(13)), /12/);
-  assert.equal((orch.taskCountError as Function)(12), undefined);
+  assert.equal("MAX_TASKS" in orch, false, "no Feature-wide Task cap");
+  assert.equal("taskCountError" in orch, false);
 
   const dir = mkdtempSync(join(tmpdir(), "orch-qa-cap-"));
   const planFile = join(dir, "plan.md");
@@ -4070,6 +4625,17 @@ test("T3: QA findings, Tasks, and qa_pass_cap are bounded", () => {
   assert.equal(added, 8, "QA may not append more than MAX_QA_FINDINGS Tasks");
   const plan = readFileSync(planFile, "utf8");
   assert.equal([...plan.matchAll(/^### Task /gm)].length, 9, "1 existing + 8 appended");
+  assert.match(plan, /### Task 2 — QA: finding 1/);
+  assert.match(plan, /- Acceptance: \[`true` green\]/);
+  const todos = overlayTodos(
+    plan,
+    ["phase: feature-qa", "plan_review: done", "qa_pass: 1", "qa_pass_cap: 2"].join("\n"),
+  );
+  assert.equal(
+    todos.some((t) => t.metadata?.kind === "task" && t.subject.includes("QA: finding 1") && t.status === "pending"),
+    true,
+    "remediation Tasks must appear on the overlay for the next tdd-worker",
+  );
 });
 
 test("T4: worktree farm is per-repo, not always ice-wt", () => {
@@ -4094,6 +4660,52 @@ test("T4: worktree farm is per-repo, not always ice-wt", () => {
   );
   assert.doesNotMatch(pathFor("feat/x", "pi-extensions"), /\/extensions(\/|$)/);
   assert.doesNotMatch(pathFor("feat/x", "pi-extensions"), /\/Dev\/git\//);
+});
+
+test("stray icemining-wt is relocated onto ice-wt; ice-wt itself is not stray", () => {
+  assert.equal(typeof orch.isStrayFarmCheckout, "function");
+  assert.equal(typeof orch.parseGitWtCreatedPath, "function");
+  const stray = join(homedir(), "Dev/git/icemining-wt/feat-daemon-hashrate-and-purge");
+  const canonical = join(homedir(), "Dev/git/ice-wt/feat-daemon-hashrate-and-purge");
+  assert.equal(orch.isStrayFarmCheckout(stray, "icemining"), true);
+  assert.equal(orch.isStrayFarmCheckout(canonical, "icemining"), false);
+  assert.equal(orch.isStrayFarmCheckout(join(homedir(), "Dev/git/icemining"), "icemining"), false);
+  assert.equal(
+    orch.isStrayFarmCheckout(join(homedir(), "Dev/git/devops-wt/feat-x"), "icemining-devops"),
+    false,
+  );
+  assert.equal(
+    orch.isStrayFarmCheckout(join(homedir(), ".pi/agent/worktrees/feat-x"), "pi-extensions"),
+    false,
+    "host lanes are not stray product farms",
+  );
+});
+
+test("parseGitWtCreatedPath reads ghl-wt success, already-exists, and git already-used", () => {
+  const stray = "/Users/greg/Dev/git/icemining-wt/feat-daemon-hashrate-and-purge";
+  assert.equal(
+    orch.parseGitWtCreatedPath(`→ ${stray}   (feat/daemon-hashrate-and-purge)`),
+    stray,
+  );
+  assert.equal(orch.parseGitWtCreatedPath(`ghl-wt: ${stray} already exists`), stray);
+  assert.equal(
+    orch.parseGitWtCreatedPath("fatal: already used by worktree at '/tmp/wt'"),
+    "/tmp/wt",
+  );
+  assert.equal(orch.parseGitWtCreatedPath("ghl-wt: aborted"), "");
+});
+
+test("ensureFeatureWorktree relocates a stray farm before refusing", () => {
+  const src = readFileSync(ORCH_SRC, "utf8");
+  const fn = src.slice(src.indexOf("async function ensureFeatureWorktree("));
+  const body = fn.slice(0, fn.indexOf("\nexport type FeaturePick"));
+  assert.match(body, /acceptWorktreeDir/);
+  assert.match(body, /parseGitWtCreatedPath/);
+  assert.match(
+    src,
+    /\["worktree", "move"/,
+    "a leftover icemining-wt checkout must be git worktree move'd onto ice-wt",
+  );
 });
 
 test("T4: a host Feature worktree is never the live extensions checkout", () => {
@@ -4228,6 +4840,39 @@ test("T8: taskWorkerCwd prefers plan/Task Repo farm over the Feature ice-wt", ()
   assert.equal((orch.planRepoName as (p: string) => string)(plan), "coins-minimal");
 });
 
+test("featurePrRepo follows unanimous Task - Repo:, not the orchestrator folder", () => {
+  const plan = [
+    "# Feature: Build Timing Harness",
+    "> Repo: icemining",
+    "> Branch: feat/build-timing-harness",
+    "",
+    "### Task 1 — Wrapper",
+    "- Repo: icemining-devops",
+    "",
+    "### Task 2 — Snapshot",
+    "- Repo: icemining-devops",
+  ].join("\n");
+  assert.equal(
+    orch.featurePrRepo(plan, "icemining"),
+    "icemining-devops",
+    "all Tasks in devops → PR and git pr-await cwd are devops, not ice-wt",
+  );
+  const mixed = plan.replace("- Repo: icemining-devops", "- Repo: icemining");
+  assert.equal(
+    orch.featurePrRepo(mixed, "icemining"),
+    "icemining",
+    "mixed Task repos fall back to plan/host rather than guessing",
+  );
+});
+
+test("featurePrDriveBlocked refuses to re-await a finished Feature", () => {
+  assert.equal(
+    orch.featurePrDriveBlocked("phase: done\npr: 500\n"),
+    "Feature is already complete; not re-driving the PR",
+  );
+  assert.equal(orch.featurePrDriveBlocked("phase: pr\npr: 500\n"), undefined);
+});
+
 test("T7: mutation writers never get contact_supervisor or an intercom bridge", () => {
   const apply = (
     orch as never as {
@@ -4237,7 +4882,7 @@ test("T7: mutation writers never get contact_supervisor or an intercom bridge", 
 
   const writer = {
     agent: "tdd-worker",
-    model: "cursor/gpt-5.6-luna:xhigh",
+    model: "openai-codex/gpt-5.6-luna:xhigh",
     intercomBridge: { mode: "always" },
     tools: ["read", "contact_supervisor"],
   };
@@ -4289,7 +4934,7 @@ test("T9: workerLaunchParams is a host-gated implementer, not a findings report"
   ) as Record<string, unknown>;
   assert.equal(params.agent, "tdd-worker");
   assert.equal(params.context, "fresh");
-  assert.equal(params.model, "zai/glm-5.3-flash:medium", "simple Task is GLM flash medium");
+  assert.equal(params.model, "openai-codex/gpt-5.6-luna:xhigh", "simple Task is luna xhigh");
   assert.equal(params.output, undefined, "findings output injected Write your findings and Luna never edited");
   assert.deepEqual(params.agentContract, { version: 1 });
   assert.equal((params.intercomBridge as { mode: string }).mode, "off");
@@ -4302,6 +4947,7 @@ test("T9: workerLaunchParams is a host-gated implementer, not a findings report"
   }
   assert.doesNotMatch(String(params.task), /Write your findings/);
   assert.doesNotMatch(String(params.task), /acceptance-report/);
+  assert.match(String(params.task), /^Task 1\/1 — Identical-release cargo skip/m);
 });
 
 test("T9: a Task with no Command is not asked for a checked evidence report", () => {
@@ -4353,13 +4999,25 @@ const OVERLAY_STATUS_IMPL = [
   "qa_pass_cap: 1",
 ].join("\n");
 
+const SIMPLE_WORKER = "simple · tdd-worker gpt-5.6-luna:xhigh";
+const CRITICAL_WORKER = "critical · tdd-worker gpt-5.6-luna:xhigh";
+const PLANNER_AGENT = "inherit:high";
+const REVIEWER_AGENT = "grok-4.6:high";
+const QA_AGENT = "grok-4.6:high";
+
 type OverlayTodo = {
   id: number;
   subject: string;
   status: "pending" | "in_progress" | "completed";
   activeForm?: string;
   blockedBy?: number[];
-  metadata?: { kind: "planner" | "plan-reviewer" | "task" | "qa"; taskId?: string; qaPass?: number };
+  metadata?: {
+    kind: orch.OverlayTodoKind;
+    taskId?: string;
+    qaPass?: number;
+    complexity?: "simple" | "critical";
+    worker?: string;
+  };
 };
 
 function overlayTodos(plan: string, status: string): OverlayTodo[] {
@@ -4368,11 +5026,23 @@ function overlayTodos(plan: string, status: string): OverlayTodo[] {
   }).overlayTodosFromFeature(plan, status);
 }
 
+function paintedWidgetLines(value: unknown): string[] {
+  if (Array.isArray(value)) return value as string[];
+  if (typeof value === "function") {
+    const widget = (value as (tui: unknown, theme: unknown) => { render?: () => string[] })(
+      undefined,
+      undefined,
+    );
+    return widget?.render?.() ?? [];
+  }
+  return [];
+}
+
 test("overlay: mapper and sink are exported (no prompt path)", () => {
   assert.equal(typeof orch.overlayTodosFromFeature, "function");
   assert.equal(typeof orch.projectOverlayTodos, "function");
   assert.equal(typeof orch.syncOverlayTodos, "function");
-  assert.equal(typeof orch.setOverlayTodoSink, "function");
+  assert.equal(typeof orch.refreshFeatureOverlay, "function");
   const src = readFileSync(ORCH_SRC, "utf8");
   assert.equal(/\bfunction\s+todoSyncBlock\b/.test(src), false);
   assert.match(src, /syncOverlayTodos\(/);
@@ -4393,19 +5063,21 @@ test("overlay: Task N id is the plan id; done/in_progress/pending/blocked map de
   assert.deepEqual(
     todos.map((t) => ({ id: t.id, status: t.status, subject: t.subject, kind: t.metadata?.kind })),
     [
-      { id: 1001, status: "completed", subject: "Planner", kind: "planner" },
-      { id: 1002, status: "completed", subject: "Plan reviewer", kind: "plan-reviewer" },
-      { id: 1, status: "completed", subject: "Task 1 — one", kind: "task" },
-      { id: 2, status: "in_progress", subject: "Task 2 — two", kind: "task" },
-      { id: 3, status: "pending", subject: "Task 3 — three", kind: "task" },
-      { id: 4, status: "pending", subject: "Task 4 — four", kind: "task" },
+      { id: 1001, status: "completed", subject: `Plan draft · ${PLANNER_AGENT}`, kind: "planner" },
+      { id: 1002, status: "completed", subject: `Plan review · ${REVIEWER_AGENT}`, kind: "plan-reviewer" },
+      { id: 1003, status: "completed", subject: "Approve", kind: "approve" },
+      { id: 1, status: "completed", subject: `Task 1 — one · ${SIMPLE_WORKER}`, kind: "task" },
+      { id: 2, status: "in_progress", subject: `Task 2 — two · ${SIMPLE_WORKER}`, kind: "task" },
+      { id: 3, status: "pending", subject: `Task 3 — three · ${SIMPLE_WORKER}`, kind: "task" },
+      { id: 4, status: "pending", subject: `Task 4 — four · ${SIMPLE_WORKER}`, kind: "task" },
     ],
   );
   const taskTodos = todos.filter((t) => t.metadata?.kind === "task");
   assert.equal(taskTodos[1]?.activeForm, "implementing Task 2");
   assert.equal(taskTodos[0]?.activeForm, undefined);
   assert.deepEqual(todos[1]?.blockedBy, [1001]);
-  assert.deepEqual(taskTodos[0]?.blockedBy, [1002]);
+  assert.deepEqual(todos[2]?.blockedBy, [1002]);
+  assert.deepEqual(taskTodos[0]?.blockedBy, [1003]);
   assert.deepEqual(taskTodos[1]?.blockedBy, [1]);
   assert.deepEqual(taskTodos[2]?.blockedBy, [2]);
   assert.equal(
@@ -4424,12 +5096,13 @@ test("overlay: same plan+status always yields the same snapshot (no clocks)", ()
 
 test("overlay: live Feature Tasks plus the owed QA pass", () => {
   const todos = overlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL);
-  assert.equal(todos.length, 8);
+  assert.equal(todos.length, 9);
   assert.deepEqual(
     todos.map((t) => [t.id, t.status, t.metadata?.kind]),
     [
       [1001, "completed", "planner"],
       [1002, "completed", "plan-reviewer"],
+      [1003, "completed", "approve"],
       [1, "completed", "task"],
       [2, "completed", "task"],
       [3, "completed", "task"],
@@ -4439,7 +5112,7 @@ test("overlay: live Feature Tasks plus the owed QA pass", () => {
     ],
   );
   const qa = todos.find((t) => t.metadata?.kind === "qa");
-  assert.equal(qa?.subject, "feature-qa");
+  assert.equal(qa?.subject, `feature-qa · ${QA_AGENT}`);
   assert.deepEqual(qa?.blockedBy, [5]);
   assert.equal(qa?.metadata?.qaPass, 1);
 });
@@ -4464,10 +5137,12 @@ test("overlay: QA pass is in_progress only after every Task is done", () => {
 
   const done = overlayTodos(
     plan,
-    ["phase: pr", "qa_pass: 1", "qa_pass_cap: 1"].join("\n"),
+    ["phase: pr", "pr: 2252", "qa_pass: 1", "qa_pass_cap: 1"].join("\n"),
   );
   assert.equal(done.find((t) => t.metadata?.kind === "qa")?.status, "completed");
-  assert.equal(done.filter((t) => t.status === "in_progress").length, 0);
+  const waiting = done.filter((t) => t.status === "in_progress");
+  assert.equal(waiting.length, 1);
+  assert.equal(waiting[0]?.metadata?.kind, "pr");
 });
 
 test("overlay: QA remediation Tasks keep their plan ids; QA pass sits after max id", () => {
@@ -4484,11 +5159,12 @@ test("overlay: QA remediation Tasks keep their plan ids; QA pass sits after max 
   assert.deepEqual(
     todos.map((t) => [t.id, t.subject, t.status, t.metadata?.kind]),
     [
-      [1001, "Planner", "completed", "planner"],
-      [1002, "Plan reviewer", "completed", "plan-reviewer"],
-      [1, "Task 1 — already", "completed", "task"],
-      [6, "Task 6 — QA: missing wait arm", "pending", "task"],
-      [7, "feature-qa", "completed", "qa"],
+      [1001, `Plan draft · ${PLANNER_AGENT}`, "completed", "planner"],
+      [1002, `Plan review · ${REVIEWER_AGENT}`, "completed", "plan-reviewer"],
+      [1003, "Approve", "completed", "approve"],
+      [1, `Task 1 — already · ${SIMPLE_WORKER}`, "completed", "task"],
+      [6, `Task 6 — QA: missing wait arm · ${SIMPLE_WORKER}`, "pending", "task"],
+      [7, `feature-qa · ${QA_AGENT}`, "completed", "qa"],
     ],
   );
 });
@@ -4505,10 +5181,10 @@ test("overlay: two QA passes get stable ids maxTask+1 and maxTask+2", () => {
   );
   const firstQa = first.filter((t) => t.metadata?.kind === "qa");
   assert.equal(firstQa[0]?.id, 2);
-  assert.equal(firstQa[0]?.subject, "feature-qa 1/2");
+  assert.equal(firstQa[0]?.subject, `feature-qa 1/2 · ${QA_AGENT}`);
   assert.equal(firstQa[0]?.status, "in_progress");
   assert.equal(firstQa[1]?.id, 3);
-  assert.equal(firstQa[1]?.subject, "feature-qa 2/2");
+  assert.equal(firstQa[1]?.subject, `feature-qa 2/2 · ${QA_AGENT}`);
   assert.equal(firstQa[1]?.status, "pending");
   assert.deepEqual(firstQa[1]?.blockedBy, [2]);
 
@@ -4530,22 +5206,152 @@ test("overlay: planning Feature shows planner then plan-reviewer before any Task
   assert.deepEqual(
     todos.map((t) => [t.id, t.subject, t.status, t.metadata?.kind]),
     [
-      [1001, "Planner", "in_progress", "planner"],
-      [1002, "Plan reviewer", "pending", "plan-reviewer"],
+      [1000, "x", "in_progress", "feature"],
+      [1001, `Plan draft · ${PLANNER_AGENT}`, "in_progress", "planner"],
+      [1002, `Plan review · ${REVIEWER_AGENT}`, "pending", "plan-reviewer"],
+      [1003, "Approve", "pending", "approve"],
     ],
   );
-  assert.equal(todos[0]?.activeForm, "writing Feature plan");
-  assert.deepEqual(todos[1]?.blockedBy, [1001]);
+  assert.equal(todos.find((t) => t.metadata?.kind === "planner")?.activeForm, "writing Feature plan");
+  assert.deepEqual(todos.find((t) => t.metadata?.kind === "planner")?.blockedBy, [1000]);
+  assert.deepEqual(todos.find((t) => t.metadata?.kind === "plan-reviewer")?.blockedBy, [1001]);
+});
+
+test("overlay: planning stub shows Plan draft, Plan review, Approve and hides Tasks", () => {
+  const plan = [
+    "# Feature: (planning)",
+    "> Status: DRAFT — awaiting approval",
+    "> Name: pending",
+    "## Tasks",
+    "### Task 1 — should stay hidden",
+    "- Status: pending",
+  ].join("\n");
+  const stub = overlayTodos(
+    ["# Feature: (planning)", "> Name: pending", "## Tasks"].join("\n"),
+    "phase: planning\nplan_review: none\nqa_pass_cap: 0\n",
+  );
+  assert.deepEqual(
+    stub.map((t) => [t.metadata?.kind, t.subject, t.status]),
+    [
+      ["planner", `Plan draft · ${PLANNER_AGENT}`, "in_progress"],
+      ["plan-reviewer", `Plan review · ${REVIEWER_AGENT}`, "pending"],
+      ["approve", "Approve", "pending"],
+    ],
+  );
+  const drafted = overlayTodos(
+    plan,
+    "phase: planning\nplan_review: none\nqa_pass_cap: 0\n",
+  );
+  assert.deepEqual(
+    drafted.map((t) => t.metadata?.kind),
+    ["planner", "plan-reviewer", "approve"],
+    "Tasks stay off the board until plan-reviewer finishes",
+  );
+  assert.equal(drafted.find((t) => t.metadata?.kind === "planner")?.status, "completed");
+});
+
+test("overlay: Feature name is the parent row for all tasks", () => {
+  const plan = [
+    "# Feature: Name Auth Dirty Evidence",
+    "> Name: name-auth-dirty-evidence",
+    "### Task 1 — Fingerprint lists dirty rows",
+    "- Status: in_progress",
+    "- Complexity: simple",
+  ].join("\n");
+  const todos = overlayTodos(plan, "phase: implementing\nplan_review: done\nqa_pass_cap: 0\n");
+  const feature = todos.find((t) => t.metadata?.kind === "feature");
+  assert.equal(feature?.id, 1000);
+  assert.equal(feature?.subject, "Name Auth Dirty Evidence");
+  assert.equal(feature?.status, "in_progress");
+  assert.deepEqual(todos.find((t) => t.metadata?.kind === "planner")?.blockedBy, [1000]);
+  const lines = orch.overlayWidgetLines(todos);
+  assert.equal(lines[0], "Todos (3/4)");
+  assert.equal(lines[1], "Name Auth Dirty Evidence");
+  assert.ok(lines[2]?.startsWith("├─ ✓ Plan draft"));
+  assert.ok(lines.some((line) => line.includes("Task 1 — Fingerprint lists dirty rows")));
+  assert.equal(
+    orch.overlayFeatureLabel("# Feature: (planning)\n> Name: pending\n", "name: pending\n"),
+    "",
+    "placeholder title and pending Name are not a parent yet",
+  );
+});
+
+test("overlay: phase pr shows an in-progress Feature PR wait row", () => {
+  const plan = [
+    "# Feature: Pearl Cert Submit Gate",
+    "> Name: pearl-cert-submit-gate-2",
+    "### Task 1 — Fail-closed verifier seam",
+    "- Status: done",
+    "- Complexity: critical",
+  ].join("\n");
+  const todos = overlayTodos(
+    plan,
+    ["phase: pr", "pr: 2252", "plan_review: done", "qa_pass: 2", "qa_pass_cap: 2"].join("\n"),
+  );
+  const pr = todos.find((t) => t.metadata?.kind === "pr");
+  assert.ok(pr, "phase pr must project a wait row, not an all-done board");
+  assert.equal(pr?.status, "in_progress");
+  assert.match(String(pr?.subject), /PR #2252/);
+  assert.equal(pr?.activeForm, "waiting for review");
+  assert.equal(
+    todos.filter((t) => t.metadata?.kind === "qa").every((t) => t.status === "completed"),
+    true,
+  );
+});
+
+test("overlay: reviewer progress stays distinct from repeated fix cycles", () => {
+  for (const reviewed of ["0", "1", "2"]) {
+    const todos = overlayTodos(
+      ["# Feature: Remote", "> Name: remote", "### Task 1 — x", "- Status: done"].join("\n"),
+      ["phase: pr", "pr: 222", "pr_round: 5", `await_round: ${reviewed}`, "await_round_total: 2"].join("\n"),
+    );
+    assert.equal(
+      todos.find((t) => t.metadata?.kind === "pr")?.activeForm,
+      `waiting for review · reviewers ${reviewed}/2`,
+    );
+  }
+});
+
+test("overlay: PR row says review in when the waiter already has findings", () => {
+  const todos = overlayTodos(
+    ["# Feature: Pearl", "> Name: pearl", "### Task 1 — x", "- Status: done"].join("\n"),
+    [
+      "phase: pr",
+      "pr: 2256",
+      "plan_review: done",
+      "qa_pass: 2",
+      "qa_pass_cap: 2",
+      "next_action: pr-await next=read_comments_and_fix — same findings on this head",
+      "worker_run_id: none",
+    ].join("\n"),
+  );
+  const pr = todos.find((t) => t.metadata?.kind === "pr");
+  assert.equal(pr?.activeForm, "review in");
+});
+
+test("overlay: PR row says fixing only while a writer is live", () => {
+  const todos = overlayTodos(
+    ["# Feature: Pearl", "> Name: pearl", "### Task 1 — x", "- Status: done"].join("\n"),
+    [
+      "phase: pr",
+      "pr: 2256",
+      "plan_review: done",
+      "next_action: pr-await next=read_comments_and_fix",
+      "worker_run_id: run-fixer-1",
+    ].join("\n"),
+  );
+  const pr = todos.find((t) => t.metadata?.kind === "pr");
+  assert.equal(pr?.activeForm, "fixing");
 });
 
 test("overlay: colon Task headings still project", () => {
   const todos = overlayTodos(
     "### Task 1: Required manifest rule_set\n- Status: pending\n",
-    "qa_pass_cap: 0\n",
+    "plan_review: done\nqa_pass_cap: 0\n",
   );
   const task = todos.find((t) => t.metadata?.kind === "task");
   assert.equal(task?.id, 1);
-  assert.equal(task?.subject, "Task 1 — Required manifest rule_set");
+  assert.equal(task?.subject, `Task 1 — Required manifest rule_set · ${SIMPLE_WORKER}`);
 });
 
 test("overlay: syncOverlayTodos publishes the snapshot to the sink, not the model", () => {
@@ -4556,27 +5362,228 @@ test("overlay: syncOverlayTodos publishes the snapshot to the sink, not the mode
       writes.push({ id, state });
     },
   };
-  orch.setOverlayTodoSink(sink);
-  try {
-    const snapshot = orch.syncOverlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL);
-    assert.equal(writes.length, 1);
-    assert.equal(writes[0]?.id, "sess-1");
-    assert.deepEqual(writes[0]?.state, snapshot);
-    assert.deepEqual(snapshot, orch.projectOverlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL));
-    assert.equal(snapshot.nextId, 1003);
+  const snapshot = orch.syncOverlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL, sink, "sess-1");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0]?.id, "sess-1");
+  assert.deepEqual(writes[0]?.state, snapshot);
+  assert.deepEqual(snapshot, orch.projectOverlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL));
+  assert.equal(snapshot.nextId, 1004);
 
-    writes.length = 0;
-    orch.setOverlayTodoSink({
-      getActiveRenderSession: () => "",
-      replaceState(id: string, state: unknown) {
-        writes.push({ id, state });
+  writes.length = 0;
+  orch.syncOverlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL, {
+    getActiveRenderSession: () => "",
+    replaceState(id: string, state: unknown) {
+      writes.push({ id, state });
+    },
+  });
+  assert.deepEqual(writes, [], "no foreground session → no publish");
+});
+
+test("overlay: phase done drops the board so the session is ordinary chat", () => {
+  const writes: Array<{ id: string; state: { tasks: unknown[] } }> = [];
+  const sink = {
+    getActiveRenderSession: () => "sess-1",
+    replaceState(id: string, state: { tasks: unknown[] }) {
+      writes.push({ id, state });
+    },
+  };
+  const snapshot = orch.syncOverlayTodos(
+    OVERLAY_PLAN_FIVE,
+    "phase: done\npr: 2256\nparent_session_id: sess-1\nnext_action: landed\n",
+    sink,
+    "sess-1",
+  );
+  assert.deepEqual(snapshot.tasks, []);
+  assert.equal(writes[0]?.id, "sess-1");
+  assert.deepEqual(writes[0]?.state.tasks, []);
+});
+
+test("overlay: Task subjects include complexity and tdd-worker model:thinking", () => {
+  const plan = [
+    "### Task 1 — Fingerprint names dirty rows",
+    "- Status: pending",
+    "- Complexity: simple",
+    "- Worker: openai-codex/gpt-5.6-luna, thinking xhigh",
+    "### Task 2 — Gate 409 JSON",
+    "- Status: pending",
+    "- Complexity: critical",
+    "- Worker: openai-codex/gpt-5.6-luna, thinking xhigh",
+  ].join("\n");
+  const todos = overlayTodos(plan, "plan_review: done\nqa_pass_cap: 0\n");
+  const tasks = todos.filter((t) => t.metadata?.kind === "task");
+  assert.equal(tasks[0]?.subject, `Task 1 — Fingerprint names dirty rows · ${SIMPLE_WORKER}`);
+  assert.equal(tasks[0]?.metadata?.complexity, "simple");
+  assert.equal(tasks[1]?.subject, `Task 2 — Gate 409 JSON · ${CRITICAL_WORKER}`);
+  assert.equal(tasks[1]?.metadata?.complexity, "critical");
+  assert.equal(todos.find((t) => t.metadata?.kind === "planner")?.subject, `Plan draft · ${PLANNER_AGENT}`);
+  assert.equal(
+    todos.find((t) => t.metadata?.kind === "plan-reviewer")?.subject,
+    `Plan review · ${REVIEWER_AGENT}`,
+  );
+});
+
+test("overlay: widget lines occupy the rpiv-todo slot shape", () => {
+  assert.equal(typeof orch.overlayWidgetLines, "function");
+  assert.equal(orch.OVERLAY_WIDGET_KEY, "rpiv-todos");
+  const lines = orch.overlayWidgetLines(
+    overlayTodos(
+      "### Task 1 — one\n- Status: in_progress\n- Complexity: simple\n",
+      "plan_review: done\nqa_pass_cap: 0\n",
+    ),
+  );
+  assert.match(lines[0] ?? "", /^Todos \(\d+\/\d+\)$/);
+  assert.ok(lines.some((line) => line.includes("tdd-worker gpt-5.6-luna:xhigh")));
+  assert.ok(lines.some((line) => line.includes(`Plan draft · ${PLANNER_AGENT}`)));
+});
+
+test("overlay: parseTaskWorkerLine accepts both planner Worker spellings", () => {
+  assert.deepEqual(orch.parseTaskWorkerLine("- Worker: openai-codex/gpt-5.6-luna, thinking medium\n"), {
+    model: "openai-codex/gpt-5.6-luna",
+    thinking: "medium",
+  });
+  assert.deepEqual(orch.parseTaskWorkerLine("- Worker: openai-codex/gpt-5.6-luna:xhigh\n"), {
+    model: "openai-codex/gpt-5.6-luna",
+    thinking: "xhigh",
+  });
+});
+
+test("overlay: syncOverlayTodos paints the widget even without a store sink", () => {
+  const painted: Array<{ key: string; value: unknown }> = [];
+  orch.bindOverlayUi({
+    hasUI: true,
+    ui: {
+      setWidget(key: string, value: unknown) {
+        painted.push({ key, value });
       },
-    });
-    orch.syncOverlayTodos(OVERLAY_PLAN_FIVE, OVERLAY_STATUS_IMPL);
-    assert.deepEqual(writes, [], "no foreground session → no publish");
-  } finally {
-    orch.setOverlayTodoSink(undefined);
-  }
+    },
+    sessionManager: { getSessionId: () => "sess-paint" },
+  });
+  orch.syncOverlayTodos(
+    "### Task 1 — one\n- Status: pending\n- Complexity: simple\n",
+    "plan_review: done\nqa_pass_cap: 0\n",
+    {
+      getActiveRenderSession: () => "",
+      replaceState() {},
+    },
+    "sess-paint",
+  );
+  assert.equal(painted.length, 1);
+  assert.equal(painted[0]?.key, "rpiv-todos");
+  const lines = paintedWidgetLines(painted[0]?.value);
+  assert.ok(lines.some((line) => line.includes(SIMPLE_WORKER)));
+});
+
+test("overlay: unchanged board does not remount the widget", () => {
+  const painted: unknown[] = [];
+  orch.bindOverlayUi({
+    hasUI: true,
+    ui: {
+      setWidget(_key: string, value: unknown) {
+        painted.push(value);
+      },
+    },
+    sessionManager: { getSessionId: () => "sess-stable-paint" },
+  });
+  const plan = "# Feature: Flicker\n\n### Task 1 — one\n- Status: pending\n- Complexity: simple\n";
+  const status = "phase: planning\nplan_review: pending\nqa_pass_cap: 0\n";
+  orch.syncOverlayTodos(plan, status, undefined, "sess-stable-paint");
+  assert.equal(painted.length, 1, "first paint must mount the board");
+  orch.syncOverlayTodos(plan, status, undefined, "sess-stable-paint");
+  assert.equal(painted.length, 1, "identical board must not remount");
+  orch.syncOverlayTodos(
+    plan,
+    "phase: planning\nplan_review: in_progress\nqa_pass_cap: 0\n",
+    undefined,
+    "sess-stable-paint",
+  );
+  assert.equal(painted.length, 2, "a real status change must repaint");
+});
+
+test("overlay: completed Task stays checked off and the next Task is pending", () => {
+  const todos = overlayTodos(
+    [
+      "### Task 1 — Fingerprint names dirty rows",
+      "- Status: done",
+      "- Complexity: simple",
+      "### Task 2 — Gate 409 JSON",
+      "- Status: pending",
+      "- Complexity: critical",
+    ].join("\n"),
+    "phase: implementing\nplan_review: done\nqa_pass_cap: 1\n",
+  );
+  const tasks = todos.filter((t) => t.metadata?.kind === "task");
+  assert.equal(tasks[0]?.status, "completed");
+  assert.equal(tasks[1]?.status, "pending");
+  const lines = orch.overlayWidgetLines(todos);
+  assert.ok(lines.some((line) => line.includes("✓") && line.includes("Task 1")));
+  assert.ok(lines.some((line) => line.includes("○") && line.includes("Task 2") && line.includes(CRITICAL_WORKER)));
+});
+
+test("overlay: after a QA pass adds remediation Tasks they appear pending and the pass is completed", () => {
+  const todos = overlayTodos(
+    [
+      "### Task 1 — already",
+      "- Status: done",
+      "- Complexity: simple",
+      "### Task 6 — QA: missing wait arm",
+      "- Status: pending",
+      "- Complexity: simple",
+    ].join("\n"),
+    ["phase: implementing", "qa_pass: 1", "qa_pass_cap: 1"].join("\n"),
+  );
+  assert.equal(todos.find((t) => t.metadata?.kind === "qa")?.status, "completed");
+  const added = todos.find((t) => t.metadata?.taskId === "6");
+  assert.equal(added?.status, "pending");
+  assert.match(added?.subject ?? "", /Task 6 — QA: missing wait arm/);
+});
+
+test("overlay: refreshFeatureOverlay paints from disk after Task completion", () => {
+  const root = mkdtempSync(join(tmpdir(), "orch-overlay-"));
+  const planFile = join(root, "plan.md");
+  const statusFile = join(root, "status.md");
+  writeFileSync(
+    planFile,
+    [
+      "### Task 1 — one",
+      "- Status: done",
+      "- Complexity: simple",
+      "### Task 2 — two",
+      "- Status: pending",
+      "- Complexity: critical",
+    ].join("\n"),
+  );
+  writeFileSync(statusFile, "phase: implementing\nplan_review: done\nqa_pass: 0\nqa_pass_cap: 1\n");
+  const painted: Array<{ key: string; value: unknown }> = [];
+  const overlayCtx = {
+    hasUI: true,
+    ui: {
+      setWidget(key: string, value: unknown) {
+        painted.push({ key, value });
+      },
+    },
+    sessionManager: { getSessionId: () => "sess-refresh" },
+  };
+  orch.bindOverlayUi(overlayCtx);
+  const snapshot = orch.refreshFeatureOverlay(
+    {
+      repo: "x",
+      gitRoot: root,
+      repoDir: root,
+      featureDir: root,
+      planFile,
+      statusFile,
+      handoffsDir: join(root, "handoffs"),
+      archiveDir: join(root, "archive"),
+    },
+    overlayCtx as never,
+  );
+  assert.equal(
+    snapshot.tasks.find((t) => t.metadata?.kind === "task" && t.metadata.taskId === "1")?.status,
+    "completed",
+  );
+  const lines = paintedWidgetLines(painted.at(-1)?.value);
+  assert.ok(lines.some((line) => line.includes("✓") && line.includes("Task 1")));
+  assert.ok(lines.some((line) => line.includes(CRITICAL_WORKER)));
 });
 
 test("overlay: plan-reviewer in_progress never shares the board with a Task", () => {
@@ -4593,17 +5600,40 @@ test("overlay: plan-reviewer in_progress never shares the board with a Task", ()
   assert.deepEqual(
     todos.map((t) => [t.metadata?.kind, t.status]),
     [
+      ["feature", "in_progress"],
       ["planner", "completed"],
       ["plan-reviewer", "in_progress"],
-      ["task", "pending"],
-      ["qa", "pending"],
+      ["approve", "pending"],
     ],
   );
   assert.equal(todos.find((t) => t.metadata?.kind === "plan-reviewer")?.activeForm, "reviewing Feature plan");
   assert.equal(
-    todos.filter((t) => t.status === "in_progress").length,
+    todos.filter((t) => t.metadata?.kind !== "feature" && t.status === "in_progress").length,
     1,
-    "exactly one in_progress while reviewing",
+    "exactly one work item in_progress while reviewing",
+  );
+});
+
+test("overlay: after plan-reviewer, Approve is in_progress until /orchestrate approve", () => {
+  const plan = [
+    "# Feature: Split Orchestrate Modules",
+    "> Status: DRAFT — awaiting approval",
+    "> Name: split-orchestrate-modules",
+    "### Task 1 — parsers",
+    "- Status: pending",
+  ].join("\n");
+  const todos = overlayTodos(
+    plan,
+    ["phase: planning", "plan_review: done", "qa_pass_cap: 1"].join("\n"),
+  );
+  const approve = todos.find((t) => t.metadata?.kind === "approve");
+  assert.equal(approve?.status, "in_progress");
+  assert.equal(approve?.activeForm, "waiting for /orchestrate approve");
+  assert.equal(todos.find((t) => t.metadata?.kind === "task")?.status, "pending");
+  assert.equal(
+    todos.filter((t) => t.metadata?.kind !== "feature" && t.status === "in_progress").length,
+    1,
+    "exactly one work item in_progress while waiting for approve",
   );
 });
 
@@ -4636,6 +5666,13 @@ test("pipeline: planner awaits plan-reviewer before the approve card; approve wa
   const chain = src.indexOf("await runFeatureChain", wait);
   assert.ok(wait > begin && chain > wait, "approve/resume must wait for plan-reviewer before Tasks");
   assert.match(src, /writerBlockedByPlanReview\(statusNow\)/);
+  const approve = src.lastIndexOf('if (verb === "approve")');
+  const gate = src.indexOf("approveBlockedByPlanReview", approve);
+  const start = src.indexOf("beginImplementation(pi, ctx, feat", gate);
+  assert.ok(
+    approve >= 0 && gate > approve && start > gate,
+    "typed /orchestrate approve must refuse unless plan-reviewer is done, before starting the chain",
+  );
 });
 
 test("gate: writerBlockedByPlanReview is the overlap hard-stop", () => {
@@ -4649,6 +5686,27 @@ test("gate: writerBlockedByPlanReview is the overlap hard-stop", () => {
   assert.match(
     String(orch.writerBlockedByPlanReview("plan_review: in_progress\n")),
     /plan-reviewer still running/,
+  );
+});
+
+test("gate: approveBlockedByPlanReview refuses until plan-reviewer is done", () => {
+  assert.equal(typeof orch.approveBlockedByPlanReview, "function");
+  assert.equal(orch.approveBlockedByPlanReview("plan_review: done\n"), undefined);
+  assert.match(
+    String(orch.approveBlockedByPlanReview("plan_review: running\n")),
+    /cannot approve yet/,
+  );
+  assert.match(
+    String(orch.approveBlockedByPlanReview("plan_review: in_progress\n")),
+    /cannot approve yet/,
+  );
+  assert.match(
+    String(orch.approveBlockedByPlanReview("plan_review: failed\n")),
+    /\/orchestrate review first/,
+  );
+  assert.match(
+    String(orch.approveBlockedByPlanReview("plan_review: none\n")),
+    /has not finished/,
   );
 });
 
@@ -4685,6 +5743,32 @@ test("P2 F5: fixerPushState reads the branch, and an unreadable head is inconclu
       "a head git could not answer must never be read as 'no push'",
     );
   }
+});
+
+test("P2 F5: a no-op fixer on a stale verdict head is not a disagreement", () => {
+  const stale = orch.fixerNoopIsStaleVerdict;
+  assert.equal(
+    stale({
+      verdictHead: "a93099213a40ac7ce4ee444ccdde83bbdbc845fd",
+      localAfter: "a22c6537eb73aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      remoteAfter: "a22c6537eb73aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }),
+    true,
+    "verdict against an older head: doing nothing is correct",
+  );
+  assert.equal(
+    stale({
+      verdictHead: "a22c6537eb73aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      localAfter: "a22c6537eb73aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      remoteAfter: "a22c6537eb73aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }),
+    false,
+    "verdict against the settled head: no-op is a real disagreement",
+  );
+  assert.equal(
+    stale({ verdictHead: "aaaa", localAfter: "aaaa", remoteAfter: "aaaa" }),
+    false,
+  );
 });
 
 test("P2 F5: a fixer that pushed and then timed out re-awaits instead of being called a disagreement", () => {
@@ -4820,7 +5904,7 @@ test("P2 F6: brief_finding lines parse into a stable, head-independent finding s
   );
 });
 
-test("P2 F6: the same findings on a second head, or the round cap, is a disagreement", () => {
+test("P2 F6: the same findings on a second head is a disagreement", () => {
   const classify = orch.classifyFeaturePrNext;
   assert.equal(
     classify("read_comments_and_fix", { prRound: 1 }),
@@ -4832,21 +5916,25 @@ test("P2 F6: the same findings on a second head, or the round cap, is a disagree
     "disagree",
     "the fixer pushed and the reviewers repeated themselves: stop, do not spend another round",
   );
-  assert.equal(orch.FIX_ROUND_CAP, 6);
   assert.equal(
-    classify("read_comments_and_fix", { prRound: 5 }),
+    classify("read_comments_and_fix", { prRound: 1 }),
     "spawn_writer",
-    "one round below the cap still gets a fixer",
+    "pr-await said fix is needed; same-head findings still get a fixer",
   );
   assert.equal(
     classify("read_comments_and_fix", { prRound: 6 }),
-    "disagree",
-    "PRs consumed seven fixers each; the cap is what stops that",
+    "spawn_writer",
+    "no round-count cap: six spent rounds still get a fixer",
+  );
+  assert.equal(
+    classify("read_comments_and_fix", { prRound: 99 }),
+    "spawn_writer",
+    "no round-count cap: a high pr_round still gets a fixer",
   );
   assert.equal(
     classify("read_comments_and_fix", { prRound: 9, chainLocked: true }),
     "refuse",
-    "a writer that holds the Feature outranks the cap: the verdict is queued, not disagreed",
+    "a writer that holds the Feature outranks a repeat: the verdict is queued, not disagreed",
   );
   assert.equal(
     classify("read_comments_and_fix", { prRound: 9, workerLive: true }),
@@ -4855,12 +5943,48 @@ test("P2 F6: the same findings on a second head, or the round cap, is a disagree
   assert.equal(
     classify("git_pr_land", { prRound: 9 }),
     "land",
-    "the cap never blocks a land",
+    "a land is never a disagreement",
+  );
+});
+
+test("P2 F6: same findings on the same head still spawn a fixer", async () => {
+  const tag = orch.findingsTag(orch.parseBriefFindings(BRIEF_TWO));
+  const { dir, paths } = prFeatureFixture(1, [
+    `last_findings: ${tag}`,
+    "pr_head: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  ]);
+  const { pi } = execRecorder("status=handed_off\nnext=yield\n");
+  const spawn = autoSettleSpawn(pi, "run-same-head-1");
+  const { ctx } = makeFakeCtx();
+
+  const action = await withDeadline(
+    (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+      pi,
+      ctx,
+      paths,
+      "99",
+      dir,
+      { done: false, next: "read_comments_and_fix", output: BRIEF_TWO, round: "2" },
+    ),
+    8000,
+  );
+
+  assert.equal(action, "spawn_writer", "pr-await asked for a fix; do not park");
+  assert.equal(spawn.count, 1, "a fixer must start");
+  const status = readFileSync(paths.statusFile, "utf8");
+  assert.doesNotMatch(
+    status,
+    /not another fixer/,
+    "same-head findings must not ack-park the Feature",
   );
 });
 
 test("P2 F6: a disagreement is spent, commented on the PR, and spawns nothing", async () => {
-  const { dir, paths } = prFeatureFixture(6);
+  const tag = orch.findingsTag(orch.parseBriefFindings(BRIEF_TWO));
+  const { dir, paths } = prFeatureFixture(1, [
+    `last_findings: ${tag}`,
+    "pr_head: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  ]);
   const { pi, execs } = execRecorder("");
   const spawn = autoSettleSpawn(pi, "run-disagree-1");
   const { ctx, notices } = makeFakeCtx();
@@ -4877,12 +6001,16 @@ test("P2 F6: a disagreement is spent, commented on the PR, and spawns nothing", 
     6000,
   );
 
-  assert.equal(action, "disagree", "the round cap stops the loop");
-  assert.equal(spawn.count, 0, "no seventh fixer");
-  const comment = execs.find((e) => e.startsWith("gh pr comment 99"));
-  assert.ok(comment, `one gh pr comment from code: ${execs.join(" | ")}`);
-  assert.match(comment!, /credit_share overflows/, "the open findings belong in the comment");
-  for (const argv of execs) assert.doesNotMatch(argv, /git pr-await|git pr-land|gh pr merge/);
+  assert.equal(action, "disagree", "repeated findings stop the loop");
+  assert.equal(spawn.count, 0, "no fixer on a repeat");
+  for (const argv of execs) {
+    assert.doesNotMatch(
+      argv,
+      /gh pr comment/,
+      "disagreement is in-session; do not comment at reviewers",
+    );
+    assert.doesNotMatch(argv, /git pr-await|git pr-land|gh pr merge/);
+  }
   const status = readFileSync(paths.statusFile, "utf8");
   assert.match(status, /^phase: pr$/m, "a disagreement leaves the PR open, not done");
   assert.match(status, /^next_action: disagreed at /m);
@@ -5096,6 +6224,100 @@ test("P2 F10: a dirty worktree refuses, naming the files", async () => {
   assert.match(String(opened?.reason), /src\/pay\.rs/, "the user needs to know what is uncommitted");
 });
 
+test("P2 F10: recoverFeatureWorktree keeps a live path and ignores pending/none", () => {
+  const existing = mkdtempSync(join(tmpdir(), "orch-wt-"));
+  assert.equal(
+    orch.recoverFeatureWorktree({
+      repo: "icemining",
+      name: "pearl-cert-submit-gate-2",
+      worktree: existing,
+    }),
+    existing,
+  );
+  assert.equal(
+    orch.recoverFeatureWorktree({
+      repo: "icemining",
+      name: "pending",
+      worktree: "none",
+      branch: "pending",
+    }),
+    undefined,
+    "pending tokens must not be guessed as farm paths",
+  );
+});
+
+test("P2 F10: Darwin Cargo.lock alone does not refuse the Feature PR", async () => {
+  const pi = makeFakePi(async (cmd, args) => {
+    if (cmd === "git" && args?.[0] === "status") {
+      return { code: 0, stdout: " M Cargo.lock\n", stderr: "" };
+    }
+    if (cmd === "git" && args?.[0] === "rev-list") return { code: 0, stdout: "4\n", stderr: "" };
+    if (cmd === "git" && args?.[0] === "push") return { code: 0, stdout: "ok", stderr: "" };
+    if (cmd === "gh" && args?.[0] === "pr" && args?.[1] === "create") {
+      return {
+        code: 0,
+        stdout: "https://github.com/moofone/icemining/pull/2211\n",
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const opened = await orch.openFeaturePr(pi as never, "/tmp/wt", { title: "t", body: "b" });
+  assert.deepEqual(opened, {
+    pr: "2211",
+    url: "https://github.com/moofone/icemining/pull/2211",
+  });
+});
+
+test("P2 F10: generated node_modules/target trees do not refuse the Feature PR", async () => {
+  assert.equal(
+    orch.isToolchainNoisePath(
+      "apps/web/apps/web/node_modules/.vite/vitest/hash/_svelte_metadata.json",
+    ),
+    true,
+  );
+  assert.equal(
+    orch.isToolchainNoisePath(
+      "crates/auth-backend/target/codex-sync-hardening/criterion/auth_sync_lmdb/base/benchmark.json",
+    ),
+    true,
+  );
+  assert.equal(
+    orch.isToolchainNoisePath("crates/auth-backend/src/lib.rs"),
+    false,
+    "source is never toolchain noise",
+  );
+  const pi = makeFakePi(async (cmd, args) => {
+    if (cmd === "git" && args?.[0] === "status") {
+      return {
+        code: 0,
+        stdout: [
+          " D apps/web/apps/web/node_modules/.vite/vitest/hash/_svelte_metadata.json",
+          " D crates/auth-backend/target/codex-sync-hardening/criterion/base/benchmark.json",
+          " M Cargo.lock",
+          "",
+        ].join("\n"),
+        stderr: "",
+      };
+    }
+    if (cmd === "git" && args?.[0] === "rev-list") return { code: 0, stdout: "5\n", stderr: "" };
+    if (cmd === "git" && args?.[0] === "push") return { code: 0, stdout: "ok", stderr: "" };
+    if (cmd === "gh" && args?.[0] === "pr" && args?.[1] === "create") {
+      return {
+        code: 0,
+        stdout: "https://github.com/moofone/icemining/pull/2254\n",
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const opened = await orch.openFeaturePr(pi as never, "/tmp/wt", { title: "t", body: "b" });
+  assert.deepEqual(opened, {
+    pr: "2254",
+    url: "https://github.com/moofone/icemining/pull/2254",
+  });
+});
+
 test("P2 F10: a failed push and a failed create surface their stderr verbatim", async () => {
   const pushFailed = makeFakePi(async (cmd, args) => {
     if (cmd === "gh" && args?.[0] === "repo") {
@@ -5189,12 +6411,17 @@ test("P3 F11: an uncommitted Task is committed by code, not counted as done", as
   const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 3 — parser");
   assert.equal(gate.state, "committed", "a dirty tree after a writer is committed by code");
   assert.ok(
-    calls.includes("git add -A"),
-    "untracked new files are as much of the Task as its edits",
+    calls.some((c) => c.startsWith("git add -- ") && c.includes("src/a.ts") && c.includes("src/b.ts")),
+    "untracked new files are added by path, not git add -A",
+  );
+  assert.equal(
+    calls.some((c) => c.includes("git add -A") || /git add -- .*Cargo\.lock/.test(c)),
+    false,
+    "Darwin Cargo.lock must never be added",
   );
   assert.ok(
-    calls.includes("git commit -m Task 3 — parser"),
-    "the commit message names the Task deterministically",
+    calls.some((c) => c.startsWith("git commit -m Task 3 — parser -- ")),
+    "the commit message names the Task; pathspec excludes the lock",
   );
 });
 
@@ -5267,6 +6494,113 @@ test("P3 F11: Task 1 refuses to start on a tree that already has someone else's 
     undefined,
     "git that could not answer must not block the Feature on its own",
   );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(pending, " M Cargo.lock"),
+    undefined,
+    "Darwin Cargo.lock is toolchain noise, not foreign work before Task 1",
+  );
+  assert.equal(
+    orch.firstTaskBlockedByDirtyTree(
+      pending,
+      " D crates/auth-backend/target/criterion/base/benchmark.json\n D apps/web/node_modules/.vite/x.json",
+    ),
+    undefined,
+    "generated target/ and node_modules trees are not foreign work before Task 1",
+  );
+  assert.match(
+    orch.firstTaskBlockedByDirtyTree(pending, " M Cargo.lock\n M auth/admin.ts") ?? "",
+    /auth\/admin\.ts/,
+    "real dirt still refuses even when a lockfile is also dirty",
+  );
+});
+
+test("P3 F11: Cargo.lock-only dirt is restored, not committed or blocked", async () => {
+  const calls: string[] = [];
+  let dirty = " M Cargo.lock";
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "restore") {
+      dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "clean", "lockfile noise is not a Task commit");
+  assert.ok(calls.some((c) => c.startsWith("git restore")), "code restores the lock to HEAD");
+  assert.deepEqual(
+    calls.filter((c) => c.includes("commit") || c.startsWith("git add")),
+    [],
+    "must not try to commit a Darwin-rewritten Cargo.lock",
+  );
+});
+
+test("P3 F11: Cargo.lock-only dirt does not block when restore fails", async () => {
+  const pi = makeFakePi(async (_cmd, args) => {
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: " M Cargo.lock", stderr: "" };
+    if (a[0] === "restore") return { code: 1, stdout: "", stderr: "restore refused" };
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "clean", "a failed lock restore is not a Feature block");
+});
+
+test("P3 F11: a real edit still commits when Cargo.lock is also dirty", async () => {
+  const calls: string[] = [];
+  let dirty = " M src/a.ts\n M Cargo.lock";
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "add") {
+      assert.equal(a.includes("Cargo.lock"), false, "git add must not take the lock");
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "commit") {
+      assert.equal(a.includes("Cargo.lock"), false, "git commit pathspec must not include the lock");
+      dirty = " M Cargo.lock";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (a[0] === "restore") {
+      if (a.includes("--worktree") || !a.includes("--staged")) dirty = "";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 1 — x");
+  assert.equal(gate.state, "committed");
+  assert.equal(calls.some((c) => c === "git add -A" || c.startsWith("git add -A ")), false);
+  assert.ok(calls.some((c) => c.startsWith("git add -- ") && c.includes("src/a.ts")));
+  assert.ok(calls.some((c) => c.includes("commit") && c.includes("src/a.ts")));
+});
+
+test("P3 F11: a staged Darwin lock does not block a real-file commit when restore fails", async () => {
+  const calls: string[] = [];
+  let dirty = "M  src/a.ts\nM  Cargo.lock";
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...(args ?? [])].join(" "));
+    const a = args ?? [];
+    if (a[0] === "status") return { code: 0, stdout: dirty, stderr: "" };
+    if (a[0] === "restore") return { code: 1, stdout: "", stderr: "restore refused" };
+    if (a[0] === "commit") {
+      if (a.includes("Cargo.lock")) {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "Cargo.lock must not be committed from macOS (ops-canonical lock policy).",
+        };
+      }
+      dirty = "M  Cargo.lock";
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureWriterCommit(pi as never, "/wt", "Task 3 — parser");
+  assert.equal(gate.state, "committed", "pathspec commit lands the Task without the lock");
+
 });
 
 test("P3 F12: the QA cap is two passes, so QA's own remediation Tasks get reviewed", () => {
@@ -5435,6 +6769,18 @@ test("P3 F14: reviewPlan records the run it spawned", () => {
     /reviewerRunId: runId, reviewerRunDir: asyncRunDir\(runId\)/,
     "without the run id there is nothing for reconciliation to read",
   );
+  const okAt = body.lastIndexOf("if (!review.ok)");
+  const success = body.slice(okAt);
+  assert.match(
+    success,
+    /phase: "reviewing"/,
+    "after review, stay in reviewing so approve can move reviewing → implementing",
+  );
+  assert.equal(
+    /phase: "planning"/.test(success),
+    false,
+    "resetting to planning makes planning → implementing illegal and wedges the Feature",
+  );
   const begin = src.slice(src.indexOf("async function beginImplementation("));
   assert.ok(
     begin.indexOf("reconcilePlanReview(ctx, paths)") <
@@ -5466,12 +6812,13 @@ test("P4 F15: the approve-card path names nothing", () => {
 
 test("P4 F15: the planner completion path names once, inside the chain lock", () => {
   const src = readFileSync(ORCH_SRC, "utf8");
-  const tail = src.slice(src.indexOf('runChildInPhase(pi, ctx, "plan"'));
-  const lock = tail.indexOf("withChainLock(pendingDir");
-  const name = tail.indexOf("ensureFeatureNamed(feat, readText(feat.planFile))");
-  assert.ok(lock > 0 && name > lock, "naming must happen inside the lock, not before it");
+  const plan = src.indexOf('runChildInPhase(pi, ctx, "plan"');
+  const lock = src.lastIndexOf("withChainLock(pendingDir", plan);
+  const name = src.indexOf("ensureFeatureNamed(feat, readText(feat.planFile))", plan);
+  assert.ok(lock > 0 && lock < plan, "planner spawn is inside the lock");
+  assert.ok(name > plan, "naming must happen after the planner child exits, still inside the lock");
   assert.ok(
-    tail.indexOf("reviewPlan(pi, ctx, feat", name) > name,
+    src.indexOf("reviewPlan(pi, ctx, feat", name) > name,
     "and the reviewer starts on the named folder, not the pending one",
   );
   assert.equal(
@@ -5582,7 +6929,7 @@ test("P4 F16: APPROVED is written after the worktree exists and the Tasks parse"
   const fn = src.slice(src.indexOf("async function beginImplementation("));
   const body = fn.slice(0, fn.indexOf("\npi.registerCommand"));
   const wt = body.indexOf("ensureFeatureWorktree(pi, ctx, paths, named.branch)");
-  const tasks = body.indexOf("taskCountError(tasks.length)");
+  const tasks = body.indexOf("parseTasks(named.plan)");
   const approved = body.indexOf("markPlanApproved(readText(paths.planFile))");
   assert.ok(wt > 0 && tasks > wt && approved > tasks, "validate → lock → APPROVED → chain");
   assert.ok(

@@ -25,9 +25,11 @@
  * waiter, `/pr-latch off` disables the sensor for this session (waiter keeps
  * going).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Loader } from "@earendil-works/pi-tui";
-import { spawn } from "node:child_process";
+import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
 import {
 	existsSync,
 	mkdirSync,
@@ -42,6 +44,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readPhase, sessionOwnsFeature, statusValue } from "./lib/feature-state.ts";
 
 import {
 	ACTIONABLE,
@@ -52,6 +55,7 @@ import {
 	adoptableLatch,
 	ensureDriver,
 	findFeatureOwningPr,
+	listFeaturePrOwners,
 	isAcceptedFeaturePrAction,
 	isDriverRunning,
 	latchOff,
@@ -59,15 +63,22 @@ import {
 	parseAwaitCall,
 	parseField,
 	parsePrState,
-	pidAlive,
+	ghPrViewArgs,
+	githubPrUrlFor,
+	githubRepoShortName,
+	normalizeGithubSlug,
 	printedLandCommand,
-	isReferenceCheckout,
 	prLabel,
 	prLinkLabel,
 	registerLatchArm,
+	requestFeaturePrDispatch,
+	registerLatchTerminal,
 	readLatchFile,
 	readWaiterVerdict,
 	readLiveRound,
+	stopWaiterForPr,
+	waiterLogTerminalState,
+	waiterVerdictIsMissingPr,
 	referenceCheckoutFor,
 	repoKey,
 	resolveQueryCwd,
@@ -79,21 +90,23 @@ import {
 	markVerdictDelivered,
 	formatWaitElapsed,
 	formatWaitLine,
+	waitChromePhase,
 	originSlug,
 	prUrl,
 	waiterManualFiles,
-	waiterPidFiles,
 	waitProgressSequence,
 	type FeaturePrOwner,
 	type LatchState,
 } from "./lib/pr-await-core.ts";
+import {
+	claimWaitDelivery,
+	WAIT_OUTCOME_EVENT,
+	WAIT_PROTOCOL_VERSION,
+	waitOutcomeIdentity,
+	type WaitOutcomeNotice,
+} from "./lib/wait-protocol.ts";
 
 export { ACTIONABLE, MECHANICAL, REPO_ROOT, parseAwaitCall, parseField, printedLandCommand, trailingCd };
-
-const DRIVE_BIN =
-	process.env.GHL_PR_AWAIT_BIN ??
-	process.env.GHL_AWAIT_DRIVE_BIN ??
-	join(homedir(), ".local", "bin", "ghl-pr-await");
 
 export type SpawnDriver = (argv: string[]) => { pid?: number };
 
@@ -120,7 +133,6 @@ const WATCH_DEBOUNCE_MS = 250;
  * that race used to degrade into `process.cwd()`.
  */
 export function defaultSpawnDriver(stateFile: string, known?: LatchState): { pid?: number } {
-	mkdirSync(stateDir(), { recursive: true });
 	const latch =
 		known ??
 		(() => {
@@ -137,16 +149,7 @@ export function defaultSpawnDriver(stateFile: string, known?: LatchState): { pid
 	const log = latch
 		? logFile(latch.pr, stateDir(), repoKey(latch.cwd))
 		: join(stateDir(), "drive-unknown.log");
-	const fd = openSync(log, "a");
-	const child = spawn(DRIVE_BIN, ["--state", stateFile, "--daemon"], {
-		detached: true,
-		stdio: ["ignore", fd, fd],
-		env: process.env,
-		cwd: spawnCwd,
-	});
-	child.unref();
-	closeSync(fd);
-	return { pid: child.pid };
+	return spawnDetachedWaiter({ stateFile, cwd: spawnCwd, logFile: log });
 }
 
 function resultText(result: unknown): string {
@@ -208,75 +211,155 @@ export type LatchHooks = {
 	) => void | string | Promise<void | string>;
 };
 
-export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
-	const pendingCommands = new Map<string, string>();
-	const seenCwds = new Set<string>();
+type LatchSlot = {
+	pendingCommands: Map<string, string>;
+	seenCwds: Set<string>;
+	latch: LatchState | undefined;
+	disabled: boolean;
+	ensuring: boolean;
+	sessionId: string;
+	latchFile: string | undefined;
+	watchTimer: ReturnType<typeof setInterval> | undefined;
+	chromeTimer: ReturnType<typeof setInterval> | undefined;
+	stateWatcher: FSWatcher | undefined;
+	watchDebounce: ReturnType<typeof setTimeout> | undefined;
+	waitStartedAt: number;
+	waitCtx: ExtensionContext | undefined;
+	waitLoader: Loader | undefined;
+	terminalWoken: boolean;
+	lastActionableFingerprint: string | undefined;
+	lastRefusedFingerprint: string | undefined;
+	deferralActive: boolean;
+	/** True only after this session has seen the waiter's `--state` file. */
+	waiterStateSeen: boolean;
+	/** Last live ctx for this slot — reconciler wake has no ALS. */
+	holdCtx: ExtensionContext | undefined;
+};
 
-	let latch: LatchState | undefined;
-	let disabled = false;
-	let ensuring = false;
-	let sessionId: string | undefined;
-	/**
-	 * The extension's own copy of the latch, and the only file this module
-	 * writes state into. The waiter is handed one of its *own* files as
-	 * `--state` (`waiterStatePath`) and rewrites it wholesale on every poll —
-	 * that is how a PR #11 verdict once overwrote a PR #18 latch, back when the
-	 * two roles shared `pi-<id>.json`. Never read the latch out of waiter state
-	 * (F20).
-	 */
-	let latchFile: string | undefined;
-	let watchTimer: ReturnType<typeof setInterval> | undefined;
-	let chromeTimer: ReturnType<typeof setInterval> | undefined;
-	let stateWatcher: FSWatcher | undefined;
-	let watchDebounce: ReturnType<typeof setTimeout> | undefined;
-	let waitStartedAt = 0;
-	let waitCtx: ExtensionContext | undefined;
-	/** Pi's `Loader` — same braille frames and 80ms tick as the working spinner. */
-	let waitLoader: Loader | undefined;
-	let terminalWoken = false;
-	/** Fingerprint of the ACTIONABLE verdict already injected this session. */
-	let lastActionableFingerprint: string | undefined;
-	/**
-	 * Fingerprint of a verdict this session dispatched and had refused. It is
-	 * retried on every watch tick — that is how it drains when the chain lock
-	 * frees — so it is tracked separately to keep the retry silent.
-	 */
-	let lastRefusedFingerprint: string | undefined;
-	/**
-	 * True only while this session is actually waiting. absorb / armObservedLatch
-	 * set it; a later user prompt clears it so a merge cannot hijack a chat that
-	 * has moved on (icemining#2150 into an unrelated git-workflow conversation).
-	 */
-	let deferralActive = false;
+const latchAls = new AsyncLocalStorage<LatchSlot>();
+const latchSlots = new Map<string, LatchSlot>();
+
+function newLatchSlot(sessionId: string): LatchSlot {
+	return {
+		pendingCommands: new Map(),
+		seenCwds: new Set(),
+		latch: undefined,
+		disabled: false,
+		ensuring: false,
+		sessionId,
+		latchFile: sessionId ? join(stateDir(), `pi-${sessionId}.latch.json`) : undefined,
+		watchTimer: undefined,
+		chromeTimer: undefined,
+		stateWatcher: undefined,
+		watchDebounce: undefined,
+		waitStartedAt: 0,
+		waitCtx: undefined,
+		waitLoader: undefined,
+		terminalWoken: false,
+		lastActionableFingerprint: undefined,
+		lastRefusedFingerprint: undefined,
+		deferralActive: false,
+		waiterStateSeen: false,
+		holdCtx: undefined,
+	};
+}
+
+function latchSlotOf(
+	ctx?: { sessionManager?: { getSessionId?: () => string } },
+	sessionId?: string,
+): LatchSlot {
+	let id = (sessionId ?? "").trim();
+	if (!id && ctx) {
+		try {
+			id = ctx.sessionManager?.getSessionId?.() ?? "";
+		} catch {
+			id = "";
+		}
+	}
+	let slot = latchSlots.get(id);
+	if (!slot) {
+		slot = newLatchSlot(id);
+		latchSlots.set(id, slot);
+	}
+	return slot;
+}
+
+function runLatchSlot<T>(slot: LatchSlot, fn: () => T): T {
+	return latchAls.run(slot, fn);
+}
+
+export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
+	function st(): LatchSlot {
+		const cur = latchAls.getStore();
+		if (cur) return cur;
+		let fb = latchSlots.get("");
+		if (!fb) {
+			fb = newLatchSlot("");
+			latchSlots.set("", fb);
+		}
+		return fb;
+	}
+	function mustLatch(): LatchState {
+		const held = st().latch;
+		if (!held) throw new Error("pr-await-latch: this session has no latch");
+		return held;
+	}
+	const pendingCommands = {
+		get size() {
+			return st().pendingCommands.size;
+		},
+		clear() {
+			st().pendingCommands.clear();
+		},
+		get(k: string) {
+			return st().pendingCommands.get(k);
+		},
+		set(k: string, v: string) {
+			st().pendingCommands.set(k, v);
+		},
+		delete(k: string) {
+			return st().pendingCommands.delete(k);
+		},
+	};
+	const seenCwds = {
+		add(v: string) {
+			st().seenCwds.add(v);
+		},
+		clear() {
+			st().seenCwds.clear();
+		},
+	};
+
 	const watchMs = hooks.watchMs ?? WATCH_BACKSTOP_MS;
 	const chromeMs = hooks.chromeMs ?? (hooks.watchMs === undefined ? 1_000 : 0);
 	const watchStateDir = hooks.watchStateDir ?? true;
 
+	function withSession<T>(
+		ctx: { sessionManager?: { getSessionId?: () => string } } | undefined,
+		fn: () => T,
+		sessionId?: string,
+	): T {
+		return runLatchSlot(latchSlotOf(ctx, sessionId), fn);
+	}
+
 	const spawnDriver: SpawnDriver =
-		hooks.spawnDriver ?? ((argv) => defaultSpawnDriver(argv[argv.indexOf("--state") + 1] ?? "", latch));
-	const driverRunning = hooks.driverRunning ?? ((pr: string) => isDriverRunning(pr));
-	// `repoKey` is required, not optional: #475 in icemining-devops and #475 in
-	// icemining are different pull requests, so a session whose own repo cannot be
-	// named cannot establish ownership and is treated as solo.
+		hooks.spawnDriver ?? ((argv) => defaultSpawnDriver(argv[argv.indexOf("--state") + 1] ?? "", mustLatch()));
+	const driverRunning =
+		hooks.driverRunning ??
+		((pr: string) => isDriverRunning(pr, undefined, undefined, st().latch?.slug));
+	// Prefer the latch slug over cwd origin: ice-wt is the Feature host farm,
+	// not the PR, and repoKey(ice-wt) is how icemining-devops#500 bound to
+	// icemining#500. `repoKey` remains the fallback when the handshake printed
+	// no URL. A session that cannot name a repo is treated as solo.
 	const featureOwnedPr: NonNullable<LatchHooks["featureOwnedPr"]> =
 		hooks.featureOwnedPr ??
 		((pr, s) => {
-			const repo = repoKey(s.cwd);
+			const repo = githubRepoShortName(s.slug) || repoKey(s.cwd);
 			return repo ? findFeatureOwningPr(pr, { repo, head: s.head }) : undefined;
 		});
 	const onFeatureActionable: NonNullable<LatchHooks["onFeatureActionable"]> =
 		hooks.onFeatureActionable ??
-		(async (ctx, owner, verdict) => {
-			// Imported lazily and by name. The latch must not pull the orchestrator
-			// into every session at load time, and `orchestrate.ts` must never import
-			// back into the latch.
-			const orch = await import("./orchestrate.ts");
-			return await orch.dispatchFeaturePrVerdictForOwner(pi, ctx, owner, {
-				next: verdict.next,
-				output: verdict.output,
-				round: verdict.round,
-			});
-		});
+		((ctx, owner, verdict) => requestFeaturePrDispatch(pi.events, ctx, owner, verdict));
 
 	/**
 	 * The `--state` file for the latched PR: a waiter file, never this session's.
@@ -284,29 +367,34 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * PR and there is nothing to name yet.
 	 */
 	function waiterState(): string | undefined {
-		if (!latch?.pr) return undefined;
-		return waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
+		if (!st().latch?.pr) return undefined;
+		return waiterStatePath(repoKey(mustLatch().cwd), mustLatch().pr, stateDir());
 	}
 
 	/**
 	 * Write the latch. One file, ours (F20).
 	 *
 	 * This used to also seed the waiter's `--state` path with the same blob —
-	 * `pid`, `sessionId`, `origin` and all — which is what made a waiter rewrite
+	 * `pid`, `st().sessionId`, `origin` and all — which is what made a waiter rewrite
 	 * readable as a session latch. The waiter's bootstrap now happens once, at
 	 * spawn, in `seedWaiterState`, and carries `{pr, cwd}` only.
 	 */
 	function persist(): void {
-		if (!latchFile) return;
+		const file = st().latchFile;
+		if (!file) return;
 		try {
 			mkdirSync(stateDir(), { recursive: true });
-			if (latch) {
+			const held = st().latch;
+			if (held) {
 				// Ownership travels with the latch: a live owner must not be adopted away.
-				writeFileSync(latchFile, JSON.stringify({ ...latch, pid: process.pid, sessionId }));
+				writeFileSync(
+					file,
+					JSON.stringify({ ...held, pid: process.pid, sessionId: st().sessionId }),
+				);
 			} else {
 				// Only ours. The waiter's file is the waiter's, and it may still hold
 				// an undelivered verdict for a PR this session merely stopped watching.
-				rmSync(latchFile, { force: true });
+				rmSync(file, { force: true });
 			}
 		} catch {
 			// Never take the session down over the latch.
@@ -321,18 +409,31 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			const url = prUrl(next);
 			if (url) next = { ...next, url };
 		}
-		// Clearing the latch must not re-arm the wake guard: reportTerminal sets
-		// terminalWoken and then clears the latch, and resetting here made the
-		// once-only guard a no-op. Only a genuinely different PR resets it.
-		if (next?.pr && next.pr !== latch?.pr) {
-			terminalWoken = false;
-			lastActionableFingerprint = undefined;
-			waitStartedAt = 0;
-			deferralActive = next.origin === "observed";
-		} else if (!next) {
-			deferralActive = false;
+		if (next && !next.generation) next = { ...next, generation: randomUUID() };
+		if (next && !next.ownerKind) {
+			let owner: FeaturePrOwner | undefined;
+			try {
+				owner = featureOwnedPr(next.pr, next);
+			} catch {
+				owner = undefined;
+			}
+			next = owner
+				? { ...next, ownerKind: "feature", ownerId: owner.dir }
+				: { ...next, ownerKind: "session", ownerId: st().sessionId || "session" };
 		}
-		latch = next;
+		// Clearing the latch must not re-arm the wake guard: reportTerminal sets
+		// st().terminalWoken and then clears the latch, and resetting here made the
+		// once-only guard a no-op. Only a genuinely different PR resets it.
+		if (next?.pr && next.pr !== st().latch?.pr) {
+			st().terminalWoken = false;
+			st().lastActionableFingerprint = undefined;
+			st().waitStartedAt = 0;
+			st().waiterStateSeen = false;
+			st().deferralActive = next.origin === "observed";
+		} else if (!next) {
+			st().deferralActive = false;
+		}
+		st().latch = next;
 		persist();
 	}
 
@@ -361,7 +462,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * used, which is every file that can carry a verdict now that TS writes none
 	 * of them.
 	 *
-	 * `latchFile` is deliberately absent: `pi-<id>.latch.json` is the
+	 * `st().latchFile` is deliberately absent: `pi-<id>.latch.json` is the
 	 * extension's private copy, and treating it as waiter state is the mistake
 	 * ghl-monitor makes when it respawns drivers from it (F3, F20).
 	 */
@@ -369,13 +470,14 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const files: string[] = [];
 		const own = waiterState();
 		if (own) files.push(own);
-		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
+		if (st().latch?.pr) files.push(...waiterManualFiles(mustLatch().pr, stateDir(), mustLatch().slug));
 		return [...new Set(files)];
 	}
 
 	function waiterRound(): { round?: string; roundTotal?: string } {
 		const files: string[] = [...waiterStateFiles()];
-		if (latchFile) files.push(latchFile);
+		const latchPath = st().latchFile;
+		if (latchPath) files.push(latchPath);
 		for (const path of files) {
 			const v = readLiveRound(path);
 			if (!v?.round) continue;
@@ -383,31 +485,57 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			// the previous cycle's until it polls again. Showing it is how the
 			// spinner stuck on r3 across a new wait. The stale value is filtered
 			// here rather than deleted out of a file this module does not own.
-			if (latch?.roundStale && v.round === latch.roundStale) continue;
+			if (st().latch?.roundStale && v.round === mustLatch().roundStale) continue;
 			return v;
 		}
-		if (latch?.round) return { round: latch.round, roundTotal: latch.roundTotal };
+		if (st().latch?.round) return { round: mustLatch().round, roundTotal: mustLatch().roundTotal };
 		return {};
 	}
 
+	function waiterLastNext(): string {
+		for (const path of waiterStateFiles()) {
+			const v = readWaiterVerdict(path)?.lastNext;
+			if (v) return v;
+		}
+		return st().latch?.lastNext ?? "";
+	}
+
 	function waitLine(link = false): string | undefined {
-		if (!latch || !waitStartedAt) return undefined;
+		if (!st().latch || !st().waitStartedAt) return undefined;
 		// No spinner glyph here. `Loader` owns the frames and the 80ms timer;
 		// baking a character into this string is why the chrome used to freeze
 		// on the chrome tick. OSC 8 only on the widget — not the tab title.
 		const { round, roundTotal } = waiterRound();
+		const phase = waitChromePhase({
+			next: waiterLastNext(),
+			writerLive: featureWriterLive(mustLatch()),
+		});
 		return formatWaitLine({
-			label: prLabel(latch),
-			elapsed: formatWaitElapsed(waitStartedAt),
+			label: prLabel(mustLatch()),
+			elapsed: formatWaitElapsed(st().waitStartedAt),
 			round,
 			roundTotal,
-			...(link ? { url: prUrl(latch) } : {}),
+			phase,
+			...(link ? { url: prUrl(mustLatch()) } : {}),
 		});
+	}
+
+	function featureWriterLive(held: LatchState): boolean {
+		try {
+			const owner = featureOwnedPr(held.pr, held);
+			if (!owner) return false;
+			const raw = readFileSync(owner.statusFile, "utf8");
+			const id = raw.match(/^worker_run_id:\s*(\S+)/m)?.[1];
+			return Boolean(id && id !== "none");
+		} catch {
+			return false;
+		}
 	}
 
 	function paintWaitChrome(ctx: ExtensionContext | undefined, text?: string): void {
 		if (!ctx) return;
-		// Footer already has MCP/model. The Loader widget is the wait chrome.
+		// One chrome only: the Loader widget. setStatus shares the footer with
+		// MCP/model and duplicated the wait line there.
 		status(ctx);
 		try {
 			ctx.ui.setTitle(text ?? "");
@@ -417,12 +545,13 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		try {
 			if (!text) {
 				ctx.ui.setWidget("pr-await", undefined);
-				waitLoader = undefined;
+				st().waitLoader = undefined;
 				return;
 			}
 			const linked = waitLine(true) ?? text;
-			if (waitLoader) {
-				waitLoader.setMessage(linked);
+			const existingLoader = st().waitLoader;
+			if (existingLoader) {
+				existingLoader.setMessage(linked);
 				return;
 			}
 			ctx.ui.setWidget(
@@ -436,9 +565,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					);
 					(loader as Loader & { dispose: () => void }).dispose = () => {
 						loader.stop();
-						if (waitLoader === loader) waitLoader = undefined;
+						if (st().waitLoader === loader) st().waitLoader = undefined;
 					};
-					waitLoader = loader;
+					st().waitLoader = loader;
 					return loader;
 				},
 				{ placement: "belowEditor" },
@@ -449,32 +578,32 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	function stopWatch(): void {
-		if (watchTimer) {
-			clearInterval(watchTimer);
-			watchTimer = undefined;
+		if (st().watchTimer) {
+			clearInterval(st().watchTimer);
+			st().watchTimer = undefined;
 		}
-		if (chromeTimer) {
-			clearInterval(chromeTimer);
-			chromeTimer = undefined;
+		if (st().chromeTimer) {
+			clearInterval(st().chromeTimer);
+			st().chromeTimer = undefined;
 		}
-		if (watchDebounce) {
-			clearTimeout(watchDebounce);
-			watchDebounce = undefined;
+		if (st().watchDebounce) {
+			clearTimeout(st().watchDebounce);
+			st().watchDebounce = undefined;
 		}
-		if (stateWatcher) {
+		if (st().stateWatcher) {
 			try {
-				stateWatcher.close();
+				st().stateWatcher?.close();
 			} catch {
 				/* already gone */
 			}
-			stateWatcher = undefined;
+			st().stateWatcher = undefined;
 		}
 		writeWaitProgress(false);
-		waitLoader?.stop();
-		waitLoader = undefined;
-		paintWaitChrome(waitCtx);
-		waitCtx = undefined;
-		waitStartedAt = 0;
+		st().waitLoader?.stop();
+		st().waitLoader = undefined;
+		paintWaitChrome(st().waitCtx);
+		st().waitCtx = undefined;
+		st().waitStartedAt = 0;
 	}
 
 	/**
@@ -487,10 +616,26 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * often is: an unrelated chat once received `Continue the work you deferred`
 	 * for a devops PR it had never heard of.
 	 */
+	function rememberCtx(ctx: ExtensionContext): void {
+		st().holdCtx = ctx;
+	}
+
 	function resumeText(s: LatchState, state: "merged" | "closed"): string {
 		const label = prLabel(s);
 		const where = s.url ? ` (${s.url})` : "";
 		const outcome = state === "merged" ? "merged" : "closed without merging";
+		let owner: FeaturePrOwner | undefined;
+		try {
+			owner = featureOwnedPr(s.pr, s);
+		} catch {
+			owner = undefined;
+		}
+		// Code already archived. One line in chat; not a job, not a skill read.
+		if (owner) {
+			return state === "merged"
+				? `pr-latch: ${label} merged${where}. Feature ${owner.name} is complete. One short confirmation. Do not use tools. Do not read files. Do not run git pr-land or git wt-rm.`
+				: `pr-latch: ${label} closed without merging${where}. Feature ${owner.name} did not land. One short confirmation. Do not use tools. Do not read files. Do not run git pr-land or git wt-rm.`;
+		}
 		if ((s.origin ?? "adopted") === "observed") {
 			return state === "merged"
 				? `pr-latch: ${label} merged${where}. Continue the work you deferred until this merge. Do not wait for another user message.`
@@ -516,7 +661,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const label = prLabel(s);
 		const what =
 			next === "read_comments_and_fix"
-				? "Fix current-head findings (red then green), one push, then git pr-await once."
+				? "Dispatch a fixer child (subagent tool, agent: fixer, cwd: your worktree) with this verdict. Solo mode uses the same fixer as /orchestrate; do not invoke /orchestrate. The child validates and commits without pushing; after a successful handoff, push once, then git pr-await once. Do not implement it yourself."
 				: next === "investigate_dead_reviewers"
 					? "Restart reviewers, then git pr-await once."
 					: next === "fix_command_or_environment"
@@ -539,8 +684,48 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		return state === "merged" ? `pr-latch: ${label} merged` : `pr-latch: ${label} closed without merging`;
 	}
 
+	function lookupFeatureOwner(s: LatchState): FeaturePrOwner | undefined {
+		try {
+			return featureOwnedPr(s.pr, s);
+		} catch {
+			return undefined;
+		}
+	}
+
+	function ownerIsStale(s: LatchState): boolean {
+		if (s.ownerKind !== "feature" || !s.ownerId) return false;
+		const owner = lookupFeatureOwner(s);
+		return !owner || owner.dir !== s.ownerId;
+	}
+
+	function waitNotice(s: LatchState, outcome: string): WaitOutcomeNotice {
+		const live = lookupFeatureOwner(s);
+		const kind = s.ownerKind ?? (live ? "feature" : "session");
+		const id = s.ownerId ?? live?.dir ?? st().sessionId ?? "session";
+		return {
+			v: WAIT_PROTOCOL_VERSION,
+			owner: { kind, id },
+			source: "pr",
+			identity: waitOutcomeIdentity("pr", `${s.slug ?? "pr"}#${s.pr}`),
+			generation: s.generation ?? st().sessionId ?? "none",
+			outcome,
+			deliveredAt: Date.now(),
+		};
+	}
+
+	function emitWaitOutcome(notice: WaitOutcomeNotice): void {
+		try {
+			pi.events?.emit(WAIT_OUTCOME_EVENT, notice);
+		} catch {
+			// Optional bus. Standalone latch still delivers by owner.
+		}
+	}
+
 	function wakeParent(ctx: ExtensionContext, text: string): void {
-		if (!deferralActive) return;
+		// Observed: this session ran pr-await. A later prompt is not /pr-latch clear.
+		// Adopted/discovered: a later prompt is evidence the guess was wrong.
+		const origin = st().latch?.origin ?? "adopted";
+		if (origin !== "observed" && !st().deferralActive) return;
 		try {
 			if (ctx.isIdle()) pi.sendUserMessage(text);
 			else pi.sendUserMessage(text, { deliverAs: "followUp" });
@@ -555,26 +740,30 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		state: "merged" | "closed",
 		opts: { wake: boolean } = { wake: true },
 	): Promise<void> {
-		if (terminalWoken) return;
-		terminalWoken = true;
+		if (st().terminalWoken) return;
+		st().terminalWoken = true;
 		stopWatch();
-		// A `manual-<pr>.json` for a PR that is already over is spent bookkeeping.
-		// Leaving it means every later session in the repo re-adopts the same dead
-		// PR for the next 24h; `manual-2162.json` was still being picked up hours
-		// after that PR merged.
-		if (s.source === "manual") {
-			for (const path of waiterManualFiles(s.pr, stateDir())) {
-				try {
-					rmSync(path, { force: true });
-				} catch {
-					// Cleanup is best-effort; never take the session down over it.
-				}
+		// Spent bookkeeping: a waiter-written `manual-<pr>.json` for a PR that is
+		// already over must not be re-adopted. Leaving it is how
+		// `manual-pi-subagents-2150.json` survived icemining#2150's merge.
+		for (const path of waiterManualFiles(s.pr, stateDir(), s.slug)) {
+			try {
+				rmSync(path, { force: true });
+			} catch {
+				// Cleanup is best-effort; never take the session down over it.
 			}
 		}
 		status(ctx);
 		notify(ctx, toastText(s, state));
-		// Wake while deferralActive is still set; setLatch(undefined) clears it.
-		if (opts.wake) wakeParent(ctx, resumeText(s, state));
+		// A 404 waiter keeps REST-polling after the latch is spent. SIGTERM it
+		// here: `/pr-latch clear` already does, and a terminal PR is the same end.
+		stopWaiterForPr(s.pr, stateDir(), s.slug);
+		const notice = waitNotice(s, state);
+		const firstDelivery = claimWaitDelivery(stateDir(), notice);
+		if (firstDelivery) emitWaitOutcome(notice);
+		// Wake while the latch still names origin; setLatch(undefined) drops it.
+		// Duplicates, restarts, and stale Feature owners notify without inference.
+		if (opts.wake && firstDelivery && !ownerIsStale(s)) wakeParent(ctx, resumeText(s, state));
 		setLatch(undefined);
 	}
 
@@ -590,29 +779,33 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		state: "merged" | "closed",
 		opts: { wake: boolean } = { wake: true },
 	): Promise<void> {
-		if (terminalWoken) return;
-		let owner: FeaturePrOwner | undefined;
-		try {
-			owner = featureOwnedPr(s.pr, s);
-		} catch {
-			owner = undefined;
-		}
-		if (owner) {
+		await withSession(ctx, async () => {
+			if (st().terminalWoken) return;
+			rememberCtx(ctx);
+			let owner: FeaturePrOwner | undefined;
 			try {
-				await onFeatureActionable(ctx, owner, {
-					pr: s.pr,
-					next: state === "merged" ? "done" : "stop",
-					output: "",
-				});
-			} catch (err) {
-				notify(
-					ctx,
-					`pr-latch: dispatching ${prLinkLabel(s)} ${state} to Feature ${owner.name} failed ` +
-						`(${String(err)}).`,
-				);
+				owner = featureOwnedPr(s.pr, s);
+			} catch {
+				owner = undefined;
 			}
-		}
-		await reportTerminal(ctx, s, state, opts);
+			if (owner) {
+				try {
+					await onFeatureActionable(ctx, owner, {
+						pr: s.pr,
+						next: state === "merged" ? "done" : "stop",
+						output: "",
+					});
+				} catch (err) {
+					notify(
+						ctx,
+						`pr-latch: dispatching ${prLinkLabel(s)} ${state} to Feature ${owner.name} failed ` +
+							`(${String(err)}).`,
+					);
+				}
+			}
+			// Dispatch may drop ALS the same way `pi.exec` does.
+			await withSession(ctx, () => reportTerminal(ctx, s, state, opts));
+		});
 	}
 
 	/**
@@ -621,16 +814,71 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * Asked before spending a `gh pr view`. A waiter that has landed or seen the
 	 * PR closed says so in the file it just wrote — and it deletes that file
 	 * once the PR is terminal, so a state path that has vanished under a live
-	 * latch is the same news by another route.
+	 * mustLatch() is the same news by another route.
 	 */
 	function waiterSaysTerminal(): boolean {
+		return diskOutcome() !== undefined || waiterMechanical() || waiterVanishedAfterSeen();
+	}
+
+	function waiterVanishedAfterSeen(): boolean {
 		const own = waiterState();
-		if (own && !existsSync(own)) return true;
+		if (own && existsSync(own)) {
+			st().waiterStateSeen = true;
+			return false;
+		}
+		// A file this session never saw is not "the waiter deleted it after land".
+		// Feature-owned handoff used to treat that missing path as terminal and
+		// spend a `gh pr view` on every log append (LATCH_BUGS L2).
+		return Boolean(own && st().waiterStateSeen);
+	}
+
+	function waiterMechanical(): boolean {
 		for (const path of waiterStateFiles()) {
 			const next = readWaiterVerdict(path)?.lastNext;
-			if (next && (TERMINAL_NEXT.has(next) || MECHANICAL.has(next))) return true;
+			if (next && MECHANICAL.has(next)) return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Terminal outcome already on disk — log, JSON, or status.md. Enough to
+	 * wake without GitHub, which is how a rate-limit used to keep a merge silent.
+	 */
+	function diskOutcome(): "merged" | "closed" | undefined {
+		const held = st().latch;
+		if (!held) return undefined;
+		try {
+			const owner = featureOwnedPr(held.pr, held);
+			if (owner) {
+				const text = readFileSync(owner.statusFile, "utf8");
+				if (readPhase(text) === "done") return "merged";
+				const next = (statusValue(text, "next_action") ?? "").toLowerCase();
+				if (next === "landed") return "merged";
+				if (/\bclosed\b/.test(next) && !/\bmerged\b/.test(next)) return "closed";
+			}
+		} catch {
+			/* ownership or status.md unreadable is not terminal */
+		}
+		for (const path of waiterStateFiles()) {
+			const next = readWaiterVerdict(path)?.lastNext;
+			if (next && TERMINAL_NEXT.has(next)) return next === "stop" ? "closed" : "merged";
+		}
+		return waiterLogTerminalState(held.pr, undefined, held.slug);
+	}
+
+	/**
+	 * Fire-and-forget watch I/O. `mustLatch()` after `await pi.exec` used to
+	 * become uncaughtException and kill the TUI when ALS dropped or the latch
+	 * was cleared mid-tick.
+	 */
+	function spawnWatchTick(slot: LatchSlot, work: () => Promise<void>): void {
+		void runLatchSlot(slot, async () => {
+			try {
+				await work();
+			} catch {
+				// A watch tick must never take the process down.
+			}
+		});
 	}
 
 	/**
@@ -640,80 +888,124 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * is that GitHub is asked by one process, not by every session watching.
 	 */
 	function onStateDirChange(ctx: ExtensionContext): void {
-		if (watchDebounce || disabled || !latch) return;
-		watchDebounce = setTimeout(() => {
-			watchDebounce = undefined;
-			if (disabled || !latch) return;
-			paintWaitChrome(ctx, waitLine());
-			void (async () => {
-				await checkActionable(ctx);
-				if (waiterSaysTerminal()) await checkTerminal(ctx);
-			})();
+		if (st().watchDebounce || st().disabled || !st().latch) return;
+		const slot = st();
+		st().watchDebounce = setTimeout(() => {
+			runLatchSlot(slot, () => {
+				st().watchDebounce = undefined;
+				if (st().disabled || !st().latch) return;
+				paintWaitChrome(ctx, waitLine());
+				spawnWatchTick(slot, async () => {
+					const outcome = diskOutcome();
+					if (outcome) {
+						const held = st().latch;
+						if (!held) return;
+						await finishTerminal(ctx, held, outcome);
+						return;
+					}
+					await checkActionable(ctx);
+					if (waiterSaysTerminal()) await checkTerminal(ctx);
+				});
+			});
 		}, WATCH_DEBOUNCE_MS);
-		watchDebounce.unref?.();
+		st().watchDebounce?.unref?.();
 	}
 
 	function startWatch(ctx: ExtensionContext): void {
-		if (watchMs <= 0 || disabled || !latch) {
+		if (watchMs <= 0 || st().disabled || !st().latch) {
 			stopWatch();
 			return;
 		}
-		waitCtx = ctx;
-		if (!waitStartedAt) waitStartedAt = Date.now();
+		const slot = st();
+		rememberCtx(ctx);
+		st().waitCtx = ctx;
+		if (!st().waitStartedAt) st().waitStartedAt = Date.now();
 		writeWaitProgress(true);
 		paintWaitChrome(ctx, waitLine());
-		if (!watchTimer) {
-			watchTimer = setInterval(() => {
-				paintWaitChrome(ctx, waitLine());
-				void (async () => {
-					await checkTerminal(ctx);
-					await checkActionable(ctx);
-				})();
+		if (!st().watchTimer) {
+			st().watchTimer = setInterval(() => {
+				runLatchSlot(slot, () => {
+					paintWaitChrome(ctx, waitLine());
+					spawnWatchTick(slot, async () => {
+						const outcome = diskOutcome();
+						if (outcome) {
+							const held = st().latch;
+							if (!held) return;
+							await finishTerminal(ctx, held, outcome);
+							return;
+						}
+						await checkTerminal(ctx);
+						await checkActionable(ctx);
+					});
+				});
 			}, watchMs);
-			watchTimer.unref?.();
+			st().watchTimer?.unref?.();
 		}
-		if (!chromeTimer && chromeMs > 0) {
-			chromeTimer = setInterval(() => {
-				paintWaitChrome(ctx, waitLine());
+		if (!st().chromeTimer && chromeMs > 0) {
+			st().chromeTimer = setInterval(() => {
+				runLatchSlot(slot, () => {
+					paintWaitChrome(ctx, waitLine());
+					// status.md lives under ~/orchestrator, not the waiter dir.
+					// Reconciler archive never fires fs.watch; this is how an idle
+					// session notices a merge another process already wrote.
+					if (st().terminalWoken || !st().latch) return;
+					const outcome = diskOutcome();
+					if (!outcome) return;
+					spawnWatchTick(slot, async () => {
+						if (st().terminalWoken || !st().latch) return;
+						const held = st().latch;
+						if (!held) return;
+						await finishTerminal(ctx, held, outcome);
+					});
+				});
 			}, chromeMs);
-			chromeTimer.unref?.();
+			st().chromeTimer?.unref?.();
 		}
-		if (!stateWatcher && watchStateDir) {
+		if (!st().stateWatcher && watchStateDir) {
 			try {
 				mkdirSync(stateDir(), { recursive: true });
-				stateWatcher = watch(stateDir(), { persistent: false }, () => {
-					onStateDirChange(ctx);
+				st().stateWatcher = watch(stateDir(), { persistent: false }, () => {
+					runLatchSlot(slot, () => onStateDirChange(ctx));
 				});
 				// A directory that cannot be watched is not a reason to stop
 				// waiting: the backstop timer still runs.
-				stateWatcher.on("error", () => {
-					stateWatcher = undefined;
+				st().stateWatcher?.on("error", () => {
+					runLatchSlot(slot, () => {
+						st().stateWatcher = undefined;
+					});
 				});
 			} catch {
-				stateWatcher = undefined;
+				st().stateWatcher = undefined;
 			}
 		}
 	}
 
 	async function checkTerminal(ctx: ExtensionContext): Promise<void> {
-		if (disabled || !latch) {
+		const held = st().latch;
+		if (st().disabled || !held) {
 			stopWatch();
 			return;
 		}
-		const state = await prState(latch.pr, latch.cwd);
-		if (state === "merged" || state === "closed") {
-			await finishTerminal(ctx, latch, state);
-		}
+		const state = await prState(held.pr, held.cwd, held.slug);
+		if (state !== "merged" && state !== "closed") return;
+		// `pi.exec` can drop AsyncLocalStorage. Re-bind before touching the slot.
+		await withSession(ctx, async () => {
+			if (st().disabled || st().terminalWoken) return;
+			const still = st().latch;
+			if (!still || still.pr !== held.pr) return;
+			await finishTerminal(ctx, still, state);
+		});
 	}
 
 	/**
 	 * The Grok/Claude stop-hook injects one undelivered ACTIONABLE verdict on
 	 * Stop. Pi has no Stop hook — the session has already yielded — so the
-	 * latch must deliver that verdict itself or review fixes never start.
+	 * mustLatch() must deliver that verdict itself or review fixes never start.
 	 */
 	async function checkActionable(ctx: ExtensionContext): Promise<void> {
-		if (disabled || !latch) return;
-		const pr = latch.pr;
+		const held = st().latch;
+		if (st().disabled || !held) return;
+		const pr = held.pr;
 		const candidates = waiterStateFiles();
 		let hit:
 			| { path: string; lastNext: string; verdict?: string; round?: string }
@@ -726,28 +1018,33 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			break;
 		}
 		if (!hit) return;
+		// Waiter REST 404 on get-a-pull-request is a missing PR, not an env fix.
+		if (waiterVerdictIsMissingPr(hit.verdict)) {
+			await finishTerminal(ctx, held, "closed");
+			return;
+		}
 		const fp = actionableFingerprint({
 			next: hit.lastNext,
 			verdict: hit.verdict,
 			round: hit.round,
 		});
-		if (fp === lastActionableFingerprint) return;
+		if (fp === st().lastActionableFingerprint) return;
 		// A verdict this session already tried and had refused is re-attempted on
 		// every watch tick — that retry is how it drains when the chain lock is
 		// released — but it must not re-announce itself each time.
-		const repeatOfRefusal = fp === lastRefusedFingerprint;
+		const repeatOfRefusal = fp === st().lastRefusedFingerprint;
 		if (!repeatOfRefusal) {
-			status(ctx, `pr-await ${prLabel(latch)} · ${hit.lastNext}`);
-			notify(ctx, `pr-latch: ${prLinkLabel(latch)} ${hit.lastNext}`);
+			status(ctx, `pr-await ${prLabel(held)} · ${hit.lastNext}`);
+			notify(ctx, `pr-latch: ${prLinkLabel(held)} ${hit.lastNext}`);
 		}
 
 		// A PR a live Feature owns is fixed by a writer that code dispatches, so
 		// this session is told nothing to do. Waking it would make whoever holds
 		// the latch the fixer: the parent orchestrator, which must not implement,
-		// or — for an adopted latch — a chat that never heard of the PR.
+		// or — for an adopted mustLatch() — a chat that never heard of the PR.
 		let owner: FeaturePrOwner | undefined;
 		try {
-			owner = featureOwnedPr(pr, latch);
+			owner = featureOwnedPr(pr, held);
 		} catch {
 			// Ownership could not be established. Solo is the pre-Feature behaviour
 			// and the only one that keeps a plain session's fix moving.
@@ -757,7 +1054,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			if (!owner.worktree) {
 				notify(
 					ctx,
-					`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} belongs to Feature ${owner.name}, which ` +
+					`pr-latch: ${prLinkLabel(held)} ${hit.lastNext} belongs to Feature ${owner.name}, which ` +
 						`records no worktree — nothing dispatched. Set \`worktree:\` in ${owner.statusFile}, ` +
 						`then /orchestrate resume ${owner.name}.`,
 				);
@@ -769,7 +1066,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			if (!repeatOfRefusal) {
 				notify(
 					ctx,
-					`pr-latch: ${prLinkLabel(latch)} ${hit.lastNext} → Feature ${owner.name}: dispatched by ` +
+					`pr-latch: ${prLinkLabel(held)} ${hit.lastNext} → Feature ${owner.name}: dispatched by ` +
 						`/orchestrate. This session stays idle.`,
 				);
 			}
@@ -788,30 +1085,35 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				// A failed dispatch is reported, never converted into a parent turn:
 				// the session that holds the latch is still not the fixer. The
 				// verdict stays on disk so a later attempt can still find it.
-				lastRefusedFingerprint = fp;
+				await withSession(ctx, () => {
+					st().lastRefusedFingerprint = fp;
+				});
 				notify(
 					ctx,
-					`pr-latch: dispatching ${prLinkLabel(latch)} ${hit.lastNext} to Feature ${owner.name} failed ` +
+					`pr-latch: dispatching ${prLinkLabel(held)} ${hit.lastNext} to Feature ${owner.name} failed ` +
 						`(${String(err)}). Run /orchestrate resume ${owner.name}.`,
 				);
 				return;
 			}
-			if (!isAcceptedFeaturePrAction(action)) {
-				// Refused: leave every file undelivered. The reconciler and the next
-				// watch tick both retry it once the writer that holds the Feature is
-				// done. `lastActionableFingerprint` stays unset so that retry works.
-				lastRefusedFingerprint = fp;
-				return;
-			}
-			lastActionableFingerprint = fp;
-			lastRefusedFingerprint = undefined;
-			for (const path of candidates) markVerdictDelivered(path);
+			await withSession(ctx, () => {
+				if (!isAcceptedFeaturePrAction(action)) {
+					// Refused: leave every file undelivered. The reconciler and the next
+					// watch tick both retry it once the writer that holds the Feature is
+					// done. `st().lastActionableFingerprint` stays unset so that retry works.
+					st().lastRefusedFingerprint = fp;
+					return;
+				}
+				st().lastActionableFingerprint = fp;
+				st().lastRefusedFingerprint = undefined;
+				for (const path of candidates) markVerdictDelivered(path, fp);
+			});
 			return;
 		}
-		// Solo: this session is the fixer, so the wake itself is the delivery.
-		lastActionableFingerprint = fp;
-		for (const path of candidates) markVerdictDelivered(path);
-		wakeParent(ctx, actionableResumeText(latch, hit.lastNext, hit.verdict));
+		// Solo: the wake itself is the delivery; the session dispatches the shared
+		// fixer child (git-workflow skill) instead of implementing the findings.
+		st().lastActionableFingerprint = fp;
+		for (const path of candidates) markVerdictDelivered(path, fp);
+		wakeParent(ctx, actionableResumeText(held, hit.lastNext, hit.verdict));
 	}
 
 	function notify(ctx: ExtensionContext, text: string): void {
@@ -839,16 +1141,25 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 	}
 
-	async function prState(pr: string, cwd: string): Promise<ReturnType<typeof parsePrState>> {
+	async function prState(pr: string, cwd: string, slug?: string): Promise<ReturnType<typeof parsePrState>> {
+		const args = ghPrViewArgs(pr, slug);
 		const tried = new Set<string>();
 		for (const candidate of [resolveQueryCwd(cwd), cwd, referenceCheckoutFor(cwd)]) {
 			if (!candidate || tried.has(candidate)) continue;
 			tried.add(candidate);
-			const { out, ok } = await sh("gh", ["pr", "view", pr, "--json", "state,mergedAt"], candidate);
+			const { out, ok } = await sh("gh", args, candidate);
 			const st = parsePrState(out, ok);
 			if (st !== "unknown") return st;
+			if (waiterVerdictIsMissingPr(out) && (await repoAccessible(candidate, slug))) return "closed";
 		}
 		return "unknown";
+	}
+
+	async function repoAccessible(cwd: string, slug?: string): Promise<boolean> {
+		const repo = normalizeGithubSlug(slug) || originSlug(cwd) || "";
+		if (!repo.includes("/")) return false;
+		const { ok } = await sh("gh", ["repo", "view", repo, "--json", "name"], cwd);
+		return ok;
 	}
 
 	function absorb(command: string, output: string, ctx: ExtensionContext): void {
@@ -873,10 +1184,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const head = parseField(output, "head");
 		const round = parseField(output, "round");
 		const roundTotal = parseField(output, "round_total");
-		const url =
-			output.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/)?.[0] ??
-			parseField(output, "url");
-		const slug = url?.match(/github\.com\/([^\s/]+\/[^\s/]+)\/pull\//)?.[1];
+		const fromText = githubPrUrlFor(pr, output) ?? githubPrUrlFor(pr, parseField(output, "url"));
+		const url = fromText?.url;
+		const slug = fromText?.slug;
 		// First-hand: this session ran the command, so it may later be told that it
 		// deferred work until this PR resolves.
 		setLatch({
@@ -908,9 +1218,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * matching and live progress appears.
 	 */
 	function markInheritedWaiterRound(): void {
-		if (!latch) return;
+		if (!st().latch) return;
 		let stale: string | undefined;
-		for (const path of [...waiterStateFiles(), latchFile].filter(
+		for (const path of [...waiterStateFiles(), st().latchFile].filter(
 			(p): p is string => Boolean(p),
 		)) {
 			const v = readLiveRound(path);
@@ -920,105 +1230,112 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			}
 		}
 		if (!stale) return;
-		latch = { ...latch, roundStale: stale };
+		st().latch = { ...mustLatch(), roundStale: stale };
 		persist();
 	}
 
-	async function handoff(ctx: ExtensionContext, opts: { wakeOnTerminal?: boolean } = {}): Promise<void> {
-		if (disabled || ensuring || latchOff()) return;
-		ensuring = true;
-		try {
-			if (!latch) return;
+	function ensureWaiterIfNeeded(): { action: "spawned" | "already" | "skipped" } | undefined {
+		const running = driverRunning(mustLatch().pr);
+		if (running) return { action: "already" };
+		if (!spawnCwdFor(mustLatch())) return undefined;
+		const statePath = waiterStatePath(repoKey(mustLatch().cwd), mustLatch().pr, stateDir());
+		seedWaiterState(statePath, { pr: mustLatch().pr, cwd: mustLatch().cwd });
+		return ensureDriver({
+			pr: mustLatch().pr,
+			stateFile: statePath,
+			spawn: spawnDriver,
+			running: false,
+		});
+	}
 
-			const state = await prState(latch.pr, latch.cwd);
-			if (state === "closed" || state === "merged") {
-				await finishTerminal(ctx, latch, state, { wake: !!opts.wakeOnTerminal });
+	async function handoff(ctx: ExtensionContext, opts: { wakeOnTerminal?: boolean } = {}): Promise<void> {
+		if (st().disabled || st().ensuring || latchOff()) return;
+		const slot = st();
+		slot.ensuring = true;
+		try {
+			const held = slot.latch;
+			if (!held) return;
+			rememberCtx(ctx);
+
+			const recorded = diskOutcome();
+			if (recorded) {
+				await finishTerminal(ctx, held, recorded, { wake: !!opts.wakeOnTerminal });
 				return;
 			}
 
-			persist();
+			const state = await prState(held.pr, held.cwd, held.slug);
+			await runLatchSlot(slot, async () => {
+				const live = st().latch;
+				if (!live || live.pr !== held.pr) return;
+				if (state === "closed" || state === "merged") {
+					await finishTerminal(ctx, live, state, { wake: !!opts.wakeOnTerminal });
+					return;
+				}
 
-			// A PR a live Feature owns has a durable owner: the reconciler
-			// ensures exactly one waiter for it. Forking one here too is the
-			// second of the three uncoordinated spawners that put 25 daemons on
-			// one PR and rate-limited GitHub (F3). Watch and drain a pending
-			// verdict, but start nothing.
+				persist();
+
+			// One waiter, pid-locked. Feature-owned used to skip spawn entirely and
+			// die if the reconciler was not running in this process. Restarting a
+			// dead waiter is not F3 — F3 was spawning while one was already alive.
 			let owned = false;
 			try {
-				owned = Boolean(featureOwnedPr(latch.pr, latch));
+				owned = Boolean(featureOwnedPr(mustLatch().pr, mustLatch()));
 			} catch {
-				// Ownership could not be established; treat it as solo, which is
-				// the behaviour that keeps a plain session's PR moving.
 				owned = false;
 			}
 			if (owned) {
-				status(ctx, `pr-await ${prLabel(latch)} · Feature-owned`);
+				const result = ensureWaiterIfNeeded();
+				status(ctx, `pr-await ${prLabel(mustLatch())} · Feature-owned`);
 				notify(
 					ctx,
-					`pr-latch: ${prLinkLabel(latch)} belongs to a live /orchestrate Feature — ` +
-						`/orchestrate owns its waiter. This session watches only.`,
+					result?.action === "spawned"
+						? `pr-latch: ${prLinkLabel(mustLatch())} Feature-owned — waiter restarted (none was alive)`
+						: `pr-latch: ${prLinkLabel(mustLatch())} belongs to a live /orchestrate Feature — ` +
+							`this session watches; a waiter is ${result ? "already running" : "not startable here"}.`,
 				);
 				startWatch(ctx);
 				await checkActionable(ctx);
 				return;
 			}
 
-			const running = driverRunning(latch.pr);
-			if (!running && !spawnCwdFor(latch)) {
+			const running = driverRunning(mustLatch().pr);
+			if (!running && !spawnCwdFor(mustLatch())) {
+				if (mustLatch().slug) {
+					status(ctx, `pr-await ${prLabel(mustLatch())} · watching`);
+					startWatch(ctx);
+					await checkActionable(ctx);
+					return;
+				}
 				// An open PR with no waiter and nowhere to start one. Say so loudly:
 				// silence here is what left icemining#2163 open with a dead daemon.
-				status(ctx, `pr-await ${prLabel(latch)} · NO WAITER`);
+				status(ctx, `pr-await ${prLabel(mustLatch())} · NO WAITER`);
 				notify(
 					ctx,
-					`pr-latch: cannot start a waiter for ${prLinkLabel(latch)} — ${latch.cwd} is not a git checkout ` +
-						`and has no reference checkout. Re-run \`git pr-await ${latch.pr}\` from inside the PR's worktree.`,
+					`pr-latch: cannot start a waiter for ${prLinkLabel(mustLatch())} — ${mustLatch().cwd} is not a git checkout ` +
+						`and has no reference checkout. Re-run \`git pr-await ${mustLatch().pr}\` from inside the PR's worktree.`,
 				);
 				return;
 			}
-			// The waiter is handed one of its own files, seeded with the same
-			// `{pr, cwd}` bootstrap `ghl-pr-await`'s handoff writes for itself —
-			// the `--daemon` hop takes no positional PR and reads both out of it.
-			const statePath = waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
-			seedWaiterState(statePath, { pr: latch.pr, cwd: latch.cwd });
-			const result = ensureDriver({
-				pr: latch.pr,
-				stateFile: statePath,
-				spawn: spawnDriver,
-				running,
-			});
-			status(ctx, `pr-await ${prLabel(latch)} · handed off`);
+			const result = ensureWaiterIfNeeded() ?? { action: "skipped" as const };
+			status(ctx, `pr-await ${prLabel(mustLatch())} · handed off`);
 			notify(
 				ctx,
 				result.action === "already"
-					? `pr-latch: ${prLinkLabel(latch)} waiter already running (detached)`
-					: `pr-latch: handed off ${prLinkLabel(latch)} — session may end, wait continues at 0 tokens`,
+					? `pr-latch: ${prLinkLabel(mustLatch())} waiter already running (detached)`
+					: `pr-latch: handed off ${prLinkLabel(mustLatch())} — session may end, wait continues at 0 tokens`,
 			);
-			startWatch(ctx);
-			// Immediate: `/rreload` and settle-with-a-waiting-verdict must not
-			// wait for a state-dir event. No-op when lastNext is yield/poll_again.
-			await checkActionable(ctx);
+				startWatch(ctx);
+				// Immediate: `/rreload` and settle-with-a-waiting-verdict must not
+				// wait for a state-dir event. No-op when lastNext is yield/poll_again.
+				await checkActionable(ctx);
+			});
 		} finally {
-			ensuring = false;
+			slot.ensuring = false;
 		}
 	}
 
 	function killDriver(pr: string): void {
-		// Both spellings: `/pr-latch clear` promises the waiter is stopped, and
-		// leaving the repo-qualified daemon alive would keep polling GitHub.
-		for (const path of waiterPidFiles(pr, stateDir())) {
-			let pid = 0;
-			try {
-				pid = Number(readFileSync(path, "utf8").trim());
-			} catch {
-				continue;
-			}
-			if (!Number.isInteger(pid) || pid <= 0 || !pidAlive(pid)) continue;
-			try {
-				process.kill(pid, "SIGTERM");
-			} catch {
-				// already gone
-			}
-		}
+		stopWaiterForPr(pr, stateDir(), st().latch?.pr === pr ? mustLatch().slug : undefined);
 	}
 
 	// `/orchestrate` runs `git pr-await` via `pi.exec`, which is not a bash tool
@@ -1026,57 +1343,135 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	// yield handshake; this is that arm. `orchestrate.ts` must not import this
 	// file — the registry lives in `pr-await-core.ts`.
 	registerLatchArm((ctx, seed) => {
-		if (disabled || latchOff()) return;
-		setLatch({
-			pr: String(seed.pr),
-			cwd: seed.cwd,
-			lastNext: seed.lastNext ?? "yield",
-			url: seed.url,
-			slug: seed.slug,
-			head: seed.head,
-			origin: "observed",
-		});
-		void handoff(ctx as ExtensionContext, { wakeOnTerminal: true });
-	});
+		void withSession(
+			ctx as ExtensionContext,
+			async () => {
+				if (st().disabled || latchOff()) return;
+				setLatch({
+					pr: String(seed.pr),
+					cwd: seed.cwd,
+					lastNext: seed.lastNext ?? "yield",
+					url: seed.url,
+					slug: seed.slug,
+					head: seed.head,
+					origin: "observed",
+					round: seed.round,
+					roundTotal: seed.roundTotal,
+				});
+				await handoff(ctx as ExtensionContext, { wakeOnTerminal: true });
+			},
+			seed.sessionId,
+		).catch(() => {});
+	}, pi.events);
 
-	pi.on("session_start", async (event, ctx) => {
+	registerLatchTerminal((notice) => {
+		let hit = false;
+		for (const slot of latchSlots.values()) {
+			const held = slot.latch;
+			if (!held || slot.disabled) continue;
+			if (String(held.pr) !== String(notice.pr)) continue;
+			const observed = (held.origin ?? "adopted") === "observed";
+			if (notice.sessionId) {
+				const named = slot.sessionId && notice.sessionId === slot.sessionId;
+				// Parent session id and the session that ran pr-await can differ.
+				// Waking only the parent left 2258's latch holder silent.
+				if (!named && !observed) continue;
+			} else if (!observed) {
+				continue;
+			}
+			const ctx = slot.holdCtx ?? slot.waitCtx;
+			if (!ctx) continue;
+			hit = true;
+			// Body is sync until the first await; reportTerminal has none, so
+			// terminalWoken is set before the reconciler's caller continues.
+			void runLatchSlot(slot, () => reportTerminal(ctx, held, notice.state)).catch(() => {});
+		}
+		return hit;
+	}, pi.events);
+
+	pi.on("session_start", async (event, ctx) => withSession(ctx, async () => {
 		const id = ctx.sessionManager.getSessionId();
-		sessionId = id;
-		latchFile = id ? join(stateDir(), `pi-${id}.latch.json`) : undefined;
+		st().sessionId = id;
+		rememberCtx(ctx);
+		st().latchFile = id ? join(stateDir(), `pi-${id}.latch.json`) : undefined;
 		seenCwds.clear();
 		pendingCommands.clear();
-		deferralActive = false;
-		if (!latchFile) return;
+		st().deferralActive = false;
+		if (!st().latchFile) return;
 
 		const reason =
 			event && typeof event === "object" && typeof (event as { reason?: unknown }).reason === "string"
 				? (event as { reason: string }).reason
 				: "startup";
 
-		// This session's own latch, and only that. The fallback used to be the
+		// This session's own mustLatch(), and only that. The fallback used to be the
 		// shared `pi-<id>.json`, which by then was whatever the waiter had last
 		// written — a waiter rewrite read back as a session latch (F20).
-		latch = readLatchFile(latchFile);
-		if (latch) {
-			// Same-session reload. The previous process may have died without the
-			// waiter, so re-ensure it, but do not wake: the user is not here.
-			deferralActive = (latch.origin ?? "adopted") === "observed";
-			if (!disabled) void handoff(ctx, { wakeOnTerminal: false });
+		const latchPath = st().latchFile;
+		st().latch = latchPath ? readLatchFile(latchPath) : undefined;
+		if (st().latch) {
+			// Same-session `/reload`. The user is in this chat.
+			st().deferralActive = (mustLatch().origin ?? "adopted") === "observed";
+			if (!st().disabled) void handoff(ctx, { wakeOnTerminal: true }).catch(() => {});
 			return;
 		}
 
 		// A pi reload mints a NEW session id, so the previous session's latch is
-		// orphaned under a name we would never look for. Take it over only when
-		// this session is a successor in the SAME worktree. A fresh chat in the
-		// reference checkout (`~/Dev/git/icemining`) must not inherit ice-wt PRs
-		// — that is how #2150 woke an unrelated conversation.
-		if (disabled || latchOff()) return;
-		if (reason === "new" || reason === "resume") return;
-		if (isReferenceCheckout(ctx.cwd)) return;
+		// orphaned under a name we would never look for. Re-arm only a Feature
+		// this session actually owns (parent_session_id / parent_session_file).
+		// Never pick "the newest Feature PR in this repo" — every chat in
+		// ~/Dev/git/icemining shares that cwd, which is how auth and graph tabs
+		// woke up as pearl-cert-submit-gate-2 after /reload.
+		//
+		// `reason === "new"` must not skip this: /reload often mints a new id on
+		// the same session file. Skipping left 2258 as "open, next=yield" in chat
+		// after reload while status.md already said landed.
+		if (st().disabled || latchOff()) return;
+
+		let ownId = st().sessionId;
+		let sessionFile = "";
+		try {
+			sessionFile = ctx.sessionManager.getSessionFile() ?? "";
+		} catch {
+			sessionFile = "";
+		}
+		const owned = listFeaturePrOwners({
+			phases: ["pr", "paused", "blocked", "feature-qa", "implementing"],
+		}).filter((owner) => {
+			try {
+				return sessionOwnsFeature(readFileSync(owner.statusFile, "utf8"), {
+					id: ownId,
+					file: sessionFile,
+				});
+			} catch {
+				return false;
+			}
+		});
+		const waiting = owned.filter((o) => (o.phase ?? "").toLowerCase() === "pr");
+		const bind = waiting.length === 1 ? waiting[0] : undefined;
+		if (bind) {
+			const owner = bind;
+			const wt =
+				owner.worktree && existsSync(owner.worktree) ? owner.worktree : ctx.cwd;
+			setLatch({
+				pr: owner.pr,
+				cwd: wt,
+				url: owner.slug?.includes("/")
+					? `https://github.com/${owner.slug}/pull/${owner.pr}`
+					: undefined,
+				slug: owner.slug,
+				lastNext: "yield",
+				origin: "observed",
+			});
+			st().deferralActive = true;
+			void handoff(ctx, { wakeOnTerminal: true }).catch(() => {});
+			return;
+		}
+		if (reason === "new") return;
 		const repo = repoKey(ctx.cwd);
 		if (!repo) return;
 		const adopted = adoptableLatch(stateDir(), {
-			exclude: [latchFile],
+			exclude: st().latchFile ? [st().latchFile as string] : [],
 			repo,
 			cwd: ctx.cwd,
 		});
@@ -1084,28 +1479,33 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		setLatch({ ...adopted, origin: "adopted" });
 		// Successor of a wait in this worktree: still waiting, even though origin
 		// is adopted (the wake must not claim this session deferred the work).
-		deferralActive = true;
+		st().deferralActive = true;
 		notify(ctx, `pr-latch: adopted ${prLinkLabel(adopted)} from a previous session`);
-		void handoff(ctx, { wakeOnTerminal: adopted.source !== "manual" });
-	});
+		void handoff(ctx, { wakeOnTerminal: adopted.source !== "manual" }).catch(() => {});
+	}));
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => withSession(ctx, () => {
 		// Leave the waiter. Aborting it was the D-2 self-inflicted stall.
 		stopWatch();
 		pendingCommands.clear();
 		seenCwds.clear();
-	});
+		const id = st().sessionId;
+		if (id) latchSlots.delete(id);
+	}));
 
-	pi.on("input", async (event) => {
+	pi.on("input", async (event, ctx) => withSession(ctx, () => {
 		const source =
 			event && typeof event === "object" ? (event as { source?: unknown }).source : undefined;
 		// Our own merge/ACTIONABLE injection is source "extension". A real user
 		// prompt means this session has moved on; toast on merge, do not hijack.
-		if (source !== "extension") deferralActive = false;
+		if (source !== "extension") {
+			const origin = st().latch?.origin ?? "adopted";
+			if (origin === "adopted" || origin === "discovered") st().deferralActive = false;
+		}
 		return { action: "continue" as const };
-	});
+	}));
 
-	pi.on("tool_execution_start", async (event) => {
+	pi.on("tool_execution_start", async (event, ctx) => withSession(ctx, () => {
 		if (event.toolName !== "bash") return;
 		const command = (event.args as { command?: string } | undefined)?.command;
 		if (!command) return;
@@ -1114,53 +1514,54 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (/\bgit\s+pr-await\b|\bgh\s+pr\s+create\b/.test(command)) {
 			pendingCommands.set(event.toolCallId, command);
 		}
-	});
+	}));
 
-	pi.on("tool_execution_end", async (event, ctx) => {
+	pi.on("tool_execution_end", async (event, ctx) => withSession(ctx, () => {
 		const command = pendingCommands.get(event.toolCallId);
 		if (!command) return;
 		pendingCommands.delete(event.toolCallId);
 		if (event.isError) return;
 		absorb(command, resultText(event.result), ctx);
-	});
+	}));
 
-	pi.on("agent_settled", async (_event, ctx) => {
-		if (disabled || !ctx.isIdle()) return;
-		void handoff(ctx, { wakeOnTerminal: true });
-	});
+	pi.on("agent_settled", async (_event, ctx) => withSession(ctx, () => {
+		if (st().disabled || !ctx.isIdle()) return;
+		void handoff(ctx, { wakeOnTerminal: true }).catch(() => {});
+	}));
 
 	pi.registerCommand("pr-latch", {
 		description: "Show, clear, or disable the background git pr-await latch",
-		handler: async (args, ctx) => {
+		handler: async (args, ctx) => withSession(ctx, async () => {
 			const arg = args.trim();
 			if (arg === "clear") {
 				stopWatch();
-				if (latch) killDriver(latch.pr);
+				if (st().latch) killDriver(mustLatch().pr);
 				setLatch(undefined);
 				status(ctx);
 				ctx.ui.notify("pr-latch cleared (waiter stopped)", "info");
 				return;
 			}
 			if (arg === "off") {
-				disabled = true;
+				st().disabled = true;
 				status(ctx);
 				ctx.ui.notify("pr-latch sensor disabled for this session (waiter, if any, keeps going)", "info");
 				return;
 			}
 			if (arg === "on") {
-				disabled = false;
+				st().disabled = false;
 				ctx.ui.notify("pr-latch enabled", "info");
 				return;
 			}
+			const held = st().latch;
 			ctx.ui.notify(
-				disabled
+				st().disabled
 					? "pr-latch: sensor disabled (/pr-latch on to re-enable)"
-					: latch
-						? `pr-latch: PR #${latch.pr} · next=${latch.lastNext ?? "?"} · ` +
-							`${driverRunning(latch.pr) ? "waiter running" : "no waiter"} · ${latch.cwd}`
+					: held
+						? `pr-latch: PR #${held.pr} · next=${held.lastNext ?? "?"} · ` +
+							`${driverRunning(held.pr) ? "waiter running" : "no waiter"} · ${held.cwd}`
 						: "pr-latch: no PR latched",
 				"info",
 			);
-		},
+		}),
 	});
 }

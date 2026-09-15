@@ -9,8 +9,9 @@
  * Live Feature: ~/orchestrator/<repo>/<name>/{plan.md,status.md,handoffs/}
  * While planning (no title yet): ~/orchestrator/<repo>/pending-<utc>/
  * After `# Feature:` exists, pending-* is renamed to <name>/. No current/
- * pointer. Never slugged from the raw objective.
- * Visible overlay: rpiv-todo `todo` tool, mirrored from planner → plan-reviewer → Tasks → feature-qa.
+ * pointer. A relative sibling symlink is left at pending-* so parent reads of
+ * the launch path still resolve. Never slugged from the raw objective.
+ * Visible overlay: Feature todos projected into the rpiv-todo panel (complexity + tdd-worker).
  * Tasks never start while plan-reviewer is in flight. Approve waits for (or runs)
  * plan-reviewer first. That sequence is code, not a parent-model prompt.
  * Sidecar `orchestrate.json` `autoAdvanceOnLanded` (default true): a Task whose
@@ -32,11 +33,11 @@ import {
   readFileSync,
   renameSync,
   statSync,
-  unlinkSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type {
   ExtensionAPI,
@@ -47,15 +48,22 @@ import {
   actionableFingerprint,
   armObservedLatch,
   findFeatureOwningPr,
+  formatReviewerProgress,
+  ghPrViewArgs,
+  githubRepoShortName,
   isDriverRunning,
   landFailedAlreadyMerged,
   listFeaturePrOwners,
   MECHANICAL,
+  notifyLatchTerminal,
+  registerFeaturePrDispatch,
   parseKeyedTokens,
   printedLandCommand,
   repoKey,
   spendWaiterVerdict,
+  stopWaiterForPr,
   undeliveredWaiterVerdicts,
+  waitChromePhase,
   waiterPaths,
   type FeaturePrOwner,
 } from "./lib/pr-await-core.ts";
@@ -66,24 +74,54 @@ import {
   readPhase as readFeaturePhase,
   writeStatusFields,
   resumePhase,
+  sessionOwnsFeature,
   statusField,
   transitionRefusal as phaseTransitionRefusal,
   type FeaturePhase,
   type FeaturePhase as Phase,
+  type SessionIdentity,
 } from "./lib/feature-state.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
 import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
+import {
+  acceptCompletedDependency, baselineMismatch, capturePlanBaseline, readPlanBaseline,
+  structuredAcceptance, taskChecks, writePlanBaseline, type ReviewedTask,
+} from "./lib/task-contract.ts";
+
 
 // The latch reads Feature ownership from the same helper; re-exported here so
 // the dispatcher has one public surface and the latch never imports this file.
 export { findFeatureOwningPr };
+export { sessionOwnsFeature };
 export type { FeaturePrOwner } from "./lib/pr-await-core.ts";
+export type { SessionIdentity };
+
+export function sessionIdentityFrom(ctx: {
+  sessionManager?: {
+    getSessionId?: () => string;
+    getSessionFile?: () => string | null | undefined;
+  };
+}): SessionIdentity {
+  let id = "";
+  let file = "";
+  try {
+    id = ctx.sessionManager?.getSessionId?.() ?? "";
+  } catch {
+    /* stale ctx after /reload */
+  }
+  try {
+    file = ctx.sessionManager?.getSessionFile?.() ?? "";
+  } catch {
+    /* stale ctx after /reload */
+  }
+  return { id: id.trim() || undefined, file: file.trim() || undefined };
+}
 
 const ORCH_ROOT = join(homedir(), "orchestrator");
 const REF_ROOT = join(homedir(), "Dev/git");
 /** Isolated host-Feature lanes. Pi auto-loads each extensions/<name>/index.ts; never put a lane there. */
 export const HOST_WORKTREE_ROOT = join(homedir(), ".pi/agent/worktrees");
-/** Repo → worktree farm directory name. Default is `<repo>-wt`. */
+/** Repo → worktree farm directory name. Must match ghl-cli `farm_dir_name`. Default is `<repo>-wt`. */
 const REPO_TO_WT_ROOT: Record<string, string> = {
   icemining: "ice-wt",
   "icemining-devops": "devops-wt",
@@ -105,7 +143,7 @@ export const FORBIDDEN = [
   "Do NOT edit, stage, or commit in a reference checkout under ~/Dev/git/<repo>.",
   "Do NOT launch tdd-worker with cwd set to a reference checkout.",
   "Do NOT spawn tdd-worker, fixer, feature-qa, qa-opus, planner, or plan-reviewer from this parent. The /orchestrate extension launches those.",
-  "Do NOT launch tdd-worker on composer-*, inherit, or unnamed models. Simple tdd-worker is zai/glm-5.3-flash:medium. Critical tdd-worker is cursor/grok-4.6:medium. feature-qa, qa-opus, and plan-reviewer run on the reviewer model configured once in extensions/orchestrate.json (`qaModel`, xai/grok-4.6:high) — never name your own. Never fall back to this session's model.",
+  "Do NOT launch tdd-worker on composer-*, inherit, or unnamed models. Simple tdd-worker is `tddWorkerSimple` (openai-codex/gpt-5.6-luna:xhigh). Critical tdd-worker is `tddWorkerCritical` (openai-codex/gpt-5.6-luna:xhigh). feature-qa and qa-opus are `qaReviewer` (cursor/grok-4.6:high). plan-reviewer is `planReviewer` (cursor/grok-4.6:high) — never name your own. Never fall back to this session's model.",
   "ALWAYS follow git-workflow aliases: `git wt`, `git pr-await`, `git pr-land`, `git wt-rm`. Never raw `git worktree add` / `gh pr merge` for those steps.",
   "`next=yield` means stop talking. Do not re-invoke, pipe, `timeout`, or `--once` on `git pr-await`. `ghl-pr-await` owns the wait.",
 ].join("\n");
@@ -129,81 +167,165 @@ interface Task {
   status: string;
   /** Planner/parent judgment. Most Tasks are simple. critical = extra risk. */
   complexity?: "simple" | "critical";
+  /** From `- Worker: <model>, thinking <level>` when the planner wrote it. */
+  workerModel?: string;
+  workerThinking?: string;
 }
 
-const WORKERS = {
+type WriterComplexity = "simple" | "critical";
+type WriterSpec = { model: string; thinking: string; short: string };
+
+const DEFAULT_WORKERS: Record<WriterComplexity, WriterSpec> = {
   simple: {
-    model: "zai/glm-5.3-flash",
-    thinking: "medium",
-    short: "glm medium",
+    model: "openai-codex/gpt-5.6-luna",
+    thinking: "xhigh",
+    short: "gpt-5.6-luna xhigh",
   },
   critical: {
-    model: "cursor/grok-4.6",
-    thinking: "medium",
-    short: "cursor grok medium",
+    model: "openai-codex/gpt-5.6-luna",
+    thinking: "xhigh",
+    short: "gpt-5.6-luna xhigh"
   },
-} as const;
+};
 
-function workerFor(complexity?: "simple" | "critical") {
-  return complexity ? WORKERS[complexity] : undefined;
+function sidecarWriterModels(jsonText?: string): {
+  tddWorkerSimple?: string;
+  tddWorkerCritical?: string;
+} {
+  const text = jsonText ?? (existsSync(SIDECAR_PATH) ? readText(SIDECAR_PATH) : "");
+  if (!text.trim()) return {};
+  try {
+    const parsed = JSON.parse(text) as {
+      tddWorkerSimple?: unknown;
+      tddWorkerCritical?: unknown;
+      TddWorkerSimple?: unknown;
+      TddWorkerCritical?: unknown;
+    };
+    const pick = (value: unknown) =>
+      typeof value === "string" && value.trim() ? value.trim() : undefined;
+    return {
+      tddWorkerSimple: pick(parsed.tddWorkerSimple) ?? pick(parsed.TddWorkerSimple),
+      tddWorkerCritical: pick(parsed.tddWorkerCritical) ?? pick(parsed.TddWorkerCritical),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writerShort(model: string, thinking: string): string {
+  const id = (model.split("/").pop() ?? model).trim();
+  return `${id} ${thinking}`;
+}
+
+/** tdd-worker pin for a complexity. Sidecar `tddWorkerSimple` / `tddWorkerCritical`. */
+export function writerSpec(complexity: WriterComplexity, jsonText?: string): WriterSpec {
+  const defaults = DEFAULT_WORKERS[complexity];
+  const cfg = sidecarWriterModels(jsonText);
+  const raw = complexity === "critical" ? cfg.tddWorkerCritical : cfg.tddWorkerSimple;
+  if (!raw) return { ...defaults };
+  const model = (raw.split(":")[0] ?? "").trim() || defaults.model;
+  const thinking = raw.split(":")[1]?.trim() || defaults.thinking;
+  return { model, thinking, short: writerShort(model, thinking) };
+}
+
+export function writerModelFor(complexity: WriterComplexity, jsonText?: string): string {
+  return modelWithThinking(writerSpec(complexity, jsonText));
+}
+
+export function writerModelBase(complexity: WriterComplexity, jsonText?: string): string {
+  return writerSpec(complexity, jsonText).model.toLowerCase();
+}
+
+function workerFor(complexity?: WriterComplexity, jsonText?: string) {
+  return complexity ? writerSpec(complexity, jsonText) : undefined;
 }
 
 const WRITER_AGENTS = new Set(["tdd-worker", "fixer", "feature-qa", "qa-opus", "plan-reviewer"]);
 
 /**
- * The review agents, and the one place their model is decided.
+ * The review agents, and the places their models are decided.
  *
- * Reviewers are a different allow-list from writers: `settings.json` scopes
- * these three to `qaModel` (xai/grok-4.6). GLM flash is legal for a simple
- * tdd-worker and refused here; launching QA on the wrong id is refused by
- * modelScope before the child starts and parks a finished Feature at
- * `feature-qa failed` with no PR, forever, which is why the id is read from
- * one place rather than repeated at each launch site.
+ * `feature-qa` and `qa-opus` are `qaReviewer` (cursor/grok-4.6).
+ * `plan-reviewer` is `planReviewer` (cursor/grok-4.6). Luna xhigh is legal
+ * for simple and critical tdd-workers and refused here;
+ * launching QA on the wrong id is refused by modelScope before the child
+ * starts and parks a finished Feature at `feature-qa failed` with no PR,
+ * forever, which is why the id is read from the sidecar rather than
+ * repeated at each launch site.
  *
- * To change the reviewer model, edit `qaModel` in `orchestrate.json` and
- * widen `modelScope.agents.*` in settings.json to match. Nothing else.
+ * To change feature-qa / qa-opus, edit `qaReviewer`. To change
+ * plan-reviewer, edit `planReviewer`. To change tdd-worker pins, edit
+ * `tddWorkerSimple` / `tddWorkerCritical`. Widen `modelScope.agents.*`
+ * in settings.json to match. Nothing else.
  */
 const QA_AGENTS = new Set(["feature-qa", "qa-opus", "plan-reviewer"]);
-const DEFAULT_QA_MODEL = "xai/grok-4.6";
-/** Per-agent thinking, used when neither the caller nor `qaModel` names one. */
+const DEFAULT_QA_MODEL = "cursor/grok-4.6";
+const DEFAULT_FEATURE_QA_MODEL = "cursor/grok-4.6";
+const DEFAULT_QA_OPUS_MODEL = "cursor/grok-4.6";
+/** Per-agent thinking, used when neither the caller nor the sidecar names one. */
 const QA_THINKING: Record<string, string> = {
   "feature-qa": "high",
   "qa-opus": "high",
   "plan-reviewer": "high",
 };
 
-/** QA never launches above high. Simple tdd-worker is glm medium. */
+/** QA never launches above high. tdd-worker is openai-codex/gpt-5.6-luna:xhigh. */
 function capThinking(level: string): string {
   return /^(xhigh|extra-high|max)$/i.test(level.trim()) ? "high" : level;
 }
 
-function qaModelSetting(jsonText?: string): string {
+function sidecarReviewModels(jsonText?: string): {
+  planReviewer?: string;
+  qaReviewer?: string;
+} {
   const text = jsonText ?? (existsSync(SIDECAR_PATH) ? readText(SIDECAR_PATH) : "");
-  if (!text.trim()) return DEFAULT_QA_MODEL;
+  if (!text.trim()) return {};
   try {
-    const parsed = JSON.parse(text) as { qaModel?: unknown };
-    if (typeof parsed.qaModel === "string" && parsed.qaModel.trim()) return parsed.qaModel.trim();
+    const parsed = JSON.parse(text) as {
+      planReviewer?: unknown;
+      qaReviewer?: unknown;
+      PlanReviewer?: unknown;
+      QaReviewer?: unknown;
+    };
+    const pick = (value: unknown) =>
+      typeof value === "string" && value.trim() ? value.trim() : undefined;
+    return {
+      planReviewer: pick(parsed.planReviewer) ?? pick(parsed.PlanReviewer),
+      qaReviewer: pick(parsed.qaReviewer) ?? pick(parsed.QaReviewer),
+    };
   } catch {
-    /* malformed sidecar keeps the default */
+    return {};
   }
-  return DEFAULT_QA_MODEL;
+}
+
+function qaModelSetting(jsonText?: string, agent?: string): string {
+  const { planReviewer, qaReviewer } = sidecarReviewModels(jsonText);
+  if (agent === "feature-qa") return qaReviewer || planReviewer || DEFAULT_FEATURE_QA_MODEL;
+  if (agent === "qa-opus") return qaReviewer || planReviewer || DEFAULT_QA_OPUS_MODEL;
+  return planReviewer || DEFAULT_QA_MODEL;
 }
 
 /** The reviewer model id without any `:thinking` suffix. */
-export function qaModelBase(jsonText?: string): string {
-  return (qaModelSetting(jsonText).split(":")[0] ?? "").trim().toLowerCase() || DEFAULT_QA_MODEL;
+export function qaModelBase(jsonText?: string, agent?: string): string {
+  const fallback =
+    agent === "feature-qa"
+      ? DEFAULT_FEATURE_QA_MODEL
+      : agent === "qa-opus"
+        ? DEFAULT_QA_OPUS_MODEL
+        : DEFAULT_QA_MODEL;
+  return (qaModelSetting(jsonText, agent).split(":")[0] ?? "").trim().toLowerCase() || fallback;
 }
 
 /** The full `id:thinking` a reviewer launches on. Caller level wins. */
 export function qaModelFor(agent: string, thinking?: string, jsonText?: string): string {
-  const configured = qaModelSetting(jsonText).split(":")[1]?.trim();
+  const configured = qaModelSetting(jsonText, agent).split(":")[1]?.trim();
   const level = capThinking(thinking?.trim() || configured || QA_THINKING[agent] || "high");
-  return `${qaModelBase(jsonText)}:${level}`;
+  return `${qaModelBase(jsonText, agent)}:${level}`;
 }
 
-export function isAllowedQaModel(model: string, jsonText?: string): boolean {
+export function isAllowedQaModel(model: string, jsonText?: string, agent?: string): boolean {
   if (typeof model !== "string") return false;
-  return (model.split(":")[0] ?? "").trim().toLowerCase() === qaModelBase(jsonText);
+  return (model.split(":")[0] ?? "").trim().toLowerCase() === qaModelBase(jsonText, agent);
 }
 
 /** Writers may not inherit the parent Cursor Grok session. */
@@ -211,25 +333,10 @@ export function isAllowedWriterModel(model: string): boolean {
   if (typeof model !== "string") return false;
   const base = (model.split(":")[0] ?? "").trim().toLowerCase();
   return (
-    base === "zai/glm-5.3-flash" ||
+    base === "openai-codex/gpt-5.6-luna" ||
     base === "cursor/grok-4.6" ||
-    base === "cursor/gpt-5.6-luna" ||
     base === "anthropic/claude-opus-5"
   );
-}
-
-/** Why this spawn must not go out. `undefined` means the guard does not apply or the model is allowed. */
-export function writerSpawnRejection(params: Record<string, unknown>): string | undefined {
-  const agent = typeof params.agent === "string" ? params.agent : "";
-  if (!WRITER_AGENTS.has(agent)) return undefined;
-  const model = typeof params.model === "string" ? params.model.trim() : "";
-  const allowed = QA_AGENTS.has(agent) ? isAllowedQaModel(model) : isAllowedWriterModel(model);
-  if (allowed) return undefined;
-  const shown = model || "(inherited parent model)";
-  return QA_AGENTS.has(agent)
-    ? `refusing ${agent} on ${shown}; QA is ${qaModelFor(agent)} only — never inherit`
-    : `refusing ${agent} on ${shown}; orchestration writers are ` +
-        `zai/glm-5.3-flash or cursor/grok-4.6 only — never composer or inherit`;
 }
 
 /**
@@ -413,8 +520,19 @@ function promoteLiveFolder(paths: Paths, name: string): string {
     bindFeature(paths, dest);
     return dest;
   }
-  if (paths.featureDir !== dest && existsSync(paths.featureDir) && !existsSync(dest)) {
-    renameSync(paths.featureDir, dest);
+  const src = paths.featureDir;
+  if (src !== dest && existsSync(src) && !existsSync(dest)) {
+    renameSync(src, dest);
+    // F15 names after the planner exits, but the parent still holds the launch
+    // pending-* path (notify, inlined plan-run.md). discoverFeatures skips
+    // non-directories, so this is not a second Feature.
+    if (basename(src).startsWith("pending-")) {
+      try {
+        symlinkSync(relative(dirname(src), dest) || name, src);
+      } catch {
+        /* dest is the source of truth; redirect is best-effort */
+      }
+    }
   }
   bindFeature(paths, dest);
   return dest;
@@ -855,6 +973,25 @@ function presentDraftApproveCards(
   }
 }
 
+function formatTodoProgress(paths: Paths, headline: string, extra: string[] = []): string {
+  const todos = overlayTodosFromFeature(readText(paths.planFile), readText(paths.statusFile));
+  const lines = todos.map((t) => {
+    const mark =
+      t.status === "completed" ? "done" : t.status === "in_progress" ? "now" : "pending";
+    return `- ${t.subject} (${mark})`;
+  });
+  return [headline, "", "Todos:", ...lines, ...extra].join("\n");
+}
+
+/** Shown only after plan-reviewer has settled. Approve starts tdd-worker on Task 1. */
+function formatReviewReadyMessage(paths: Paths, name: string, branch: string): string {
+  return formatTodoProgress(
+    paths,
+    `Plan reviewed: ${paths.planFile}\nName ${name} (${branch}).`,
+    ["", `Next: ${approveCommand(name)}`, "That starts tdd-worker on Task 1. This session is idle."],
+  );
+}
+
 export function clampedQaPassCap(raw: number): number {
   if (!Number.isFinite(raw) || raw < 0) return DEFAULT_QA_PASS_CAP;
   return Math.min(MAX_QA_PASS_CAP, Math.floor(raw));
@@ -870,11 +1007,6 @@ function qaPassState(status: string): { pass: number; cap: number } {
     pass: Number.isFinite(pass) && pass > 0 ? pass : 0,
     cap: clampedQaPassCap(Number.isFinite(rawCap) ? rawCap : DEFAULT_QA_PASS_CAP),
   };
-}
-
-export function taskCountError(n: number): string | undefined {
-  if (n > MAX_TASKS) return `Plan has ${n} Tasks; cap is ${MAX_TASKS}. Split the Feature.`;
-  return undefined;
 }
 
 function needsFeatureQa(status: string): boolean {
@@ -917,6 +1049,35 @@ export function writerBlockedByPlanReview(status: string): string | undefined {
   return undefined;
 }
 
+/**
+ * A finished Feature must not re-enter `git pr-await`. That handshake is how
+ * icemining-devops#500, already merged, was re-driven as icemining#500 from
+ * ice-wt after `phase: done`.
+ */
+export function featurePrDriveBlocked(status: string): string | undefined {
+  if (readFeaturePhase(status) === "done") {
+    return "Feature is already complete; not re-driving the PR";
+  }
+  return undefined;
+}
+
+/**
+ * `/orchestrate approve` is the last user step after plan-reviewer finishes.
+ * The TUI card already waits for `plan_review: done`; the command must too,
+ * or a typed approve during review marks the plan APPROVED mid-review.
+ */
+export function approveBlockedByPlanReview(status: string): string | undefined {
+  const state = planReviewState(status);
+  if (state === "done") return undefined;
+  if (state === "running") {
+    return "plan-reviewer still running; cannot approve yet";
+  }
+  if (state === "failed") {
+    return "plan-reviewer failed; /orchestrate review first, then approve";
+  }
+  return "plan-reviewer has not finished; cannot approve yet";
+}
+
 export type PlanReviewReconcile = "keep" | "wait" | "done" | "failed";
 
 /**
@@ -945,6 +1106,37 @@ export function worktreePathFor(branch: string, repo = "icemining"): string {
   return join(worktreeFarmFor(repo), branch.replace(/\//g, "-"));
 }
 
+/**
+ * Where the writer actually is, when status.md lost `worktree:`.
+ *
+ * A reseeded Feature keeps `pr: 2252` and `worktree: none`. Dispatch then
+ * refuses ("no worktree"), the latch still treats the PR as Feature-owned,
+ * and reload watches forever. The farm path is deterministic.
+ */
+export function recoverFeatureWorktree(input: {
+  repo: string;
+  name: string;
+  worktree?: string;
+  branch?: string;
+}): string | undefined {
+  if (input.worktree && !isPendingToken(input.worktree) && existsSync(input.worktree)) {
+    return input.worktree;
+  }
+  const guesses: string[] = [];
+  const branch = (input.branch ?? "").trim();
+  if (branch && !isPendingToken(branch)) {
+    guesses.push(worktreePathFor(branch, input.repo));
+  }
+  const name = (input.name ?? "").trim();
+  if (name && !isPendingToken(name)) {
+    guesses.push(worktreePathFor(`feat/${name}`, input.repo));
+  }
+  for (const guess of guesses) {
+    if (guess && existsSync(guess)) return guess;
+  }
+  return undefined;
+}
+
 function isWorktreeFarm(dir: string): boolean {
   const normalized = dir.replace(/\/+$/, "");
   if (normalized === HOST_WORKTREE_ROOT) return true;
@@ -965,8 +1157,69 @@ function isAllowedWorktreePath(dir: string, repo?: string): boolean {
   return true;
 }
 
-function parseAlreadyUsedWorktree(text: string): string {
-  return (text.match(/already used by worktree at '([^']+)'/i)?.[1] ?? "").trim();
+/**
+ * True when `dir` is a checkout under a sibling `*-wt` farm that is not this
+ * repo's create farm (`icemining-wt/feat-x` while create goes to `ice-wt`).
+ * Host lanes and reference checkouts are never strays.
+ */
+export function isStrayFarmCheckout(dir: string, repo: string): boolean {
+  if (!dir || !repo || isHostBase(repo)) return false;
+  const farm = dirname(dir);
+  if (dirname(farm) !== REF_ROOT) return false;
+  const name = basename(farm);
+  if (!(name === "ice-wt" || name.endsWith("-wt"))) return false;
+  return farm !== worktreeFarmFor(repo);
+}
+
+/**
+ * Path `ghl-wt` created, attached, or refused because it already exists.
+ * Older git still says `already used by worktree at '…'`.
+ */
+export function parseGitWtCreatedPath(text: string): string {
+  const used = text.match(/already used by worktree at '([^']+)'/i)?.[1]?.trim();
+  if (used) return used;
+  const exists = text.match(/(?:^|\n)(?:ghl-wt:\s*)?(\/\S+) already exists\b/im)?.[1]?.trim();
+  if (exists) return exists;
+  const arrow = text.match(/^→\s+(\/\S+)/m)?.[1]?.trim();
+  return arrow ?? "";
+}
+
+async function relocateStrayFarmWorktree(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  from: string,
+  repo: string,
+  branch: string,
+): Promise<string> {
+  if (!isStrayFarmCheckout(from, repo)) return "";
+  const dest = worktreePathFor(branch, repo);
+  if (!dest || dest === from) return "";
+  const already = existingGitDir(dest);
+  if (already) return already;
+  try {
+    mkdirSync(dirname(dest), { recursive: true });
+    const result = await pi.exec("git", ["worktree", "move", from, dest], {
+      cwd: gitRoot,
+      timeout: 60_000,
+    });
+    if (result.code !== 0) return "";
+  } catch {
+    return "";
+  }
+  return existingGitDir(dest);
+}
+
+async function acceptWorktreeDir(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  dir: string,
+  repo: string,
+  branch: string,
+): Promise<string> {
+  if (!dir || dir === "none") return "";
+  if (isAllowedWorktreePath(dir, repo)) return dir;
+  const moved = await relocateStrayFarmWorktree(pi, gitRoot, dir, repo, branch);
+  return moved && isAllowedWorktreePath(moved, repo) ? moved : "";
 }
 
 async function findExistingWorktree(
@@ -1000,16 +1253,20 @@ async function materializeHostWorktree(
   dest: string,
 ): Promise<boolean> {
   if (!src || !dest || isLiveHostCheckout(dest) || dest === src) return false;
-  if (existsSync(join(dest, ".git"))) return true;
   try {
-    mkdirSync(dirname(dest), { recursive: true });
-    cpSync(src, dest, { recursive: true, filter: hostCopyFilter });
-  } catch {
-    return false;
-  }
-  try {
-    const init = await pi.exec("git", ["init"], { cwd: dest, timeout: 15_000 });
-    return init.code === 0 && existsSync(join(dest, ".git"));
+    if (!existsSync(join(dest, ".git"))) {
+      mkdirSync(dirname(dest), { recursive: true });
+      cpSync(src, dest, { recursive: true, filter: hostCopyFilter });
+      const init = await pi.exec("git", ["init"], { cwd: dest, timeout: 15_000 });
+      if (init.code !== 0 || !existsSync(join(dest, ".git"))) return false;
+    }
+    const head = await pi.exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: dest, timeout: 15_000 });
+    if (head.code === 0) return true;
+    // An unborn host lane needs a source commit for the same review contract.
+    const add = await pi.exec("git", ["add", "--all"], { cwd: dest, timeout: 30_000 });
+    if (add.code !== 0) return false;
+    const commit = await pi.exec("git", ["commit", "--allow-empty", "-m", "Snapshot host source before plan review"], { cwd: dest, timeout: 30_000 });
+    return commit.code === 0;
   } catch {
     return false;
   }
@@ -1126,6 +1383,20 @@ async function ensureFeatureWorktree(
     upsertStatusFile(paths, { worktree: dest, branch });
     return dest;
   }
+  const prRepo = featurePrRepo(readText(paths.planFile), paths.repo);
+  if (prRepo && prRepo !== paths.repo) {
+    const dir = await ensureRepoWorktree(pi, prRepo, branch);
+    if (!dir || !isAllowedWorktreePath(dir, prRepo)) {
+      uiNotify(
+        ctx,
+        `Cannot git wt in ${prRepo} for ${branch} (Feature folder is ${paths.repo}; all Tasks land in ${prRepo}).`,
+        "error",
+      );
+      return null;
+    }
+    upsertStatusFile(paths, { worktree: dir, branch });
+    return dir;
+  }
   const recorded = statusField(readText(paths.statusFile), "worktree");
   const existing = await findExistingWorktree(pi, paths.gitRoot, branch);
   const preferred = worktreePathFor(branch, paths.repo);
@@ -1133,9 +1404,10 @@ async function ensureFeatureWorktree(
     (p): p is string => Boolean(p) && p !== "none",
   );
   for (const dir of candidates) {
-    if (isAllowedWorktreePath(dir, paths.repo)) {
-      upsertStatusFile(paths, { worktree: dir, branch });
-      return dir;
+    const accepted = await acceptWorktreeDir(pi, paths.gitRoot, dir, paths.repo, branch);
+    if (accepted) {
+      upsertStatusFile(paths, { worktree: accepted, branch });
+      return accepted;
     }
   }
   // One implementation, the Rust one. `--yes` is not optional: `ghl-wt` prompts
@@ -1146,20 +1418,24 @@ async function ensureFeatureWorktree(
     cwd: paths.gitRoot,
     timeout: 180000,
   });
-  const dir =
-    (existsSync(preferred) && preferred) ||
-    parseAlreadyUsedWorktree(`${result.stderr}\n${result.stdout}`) ||
-    (await findExistingWorktree(pi, paths.gitRoot, branch));
-  if (!dir || !isAllowedWorktreePath(dir, paths.repo)) {
-    uiNotify(
-      ctx,
-      worktreeFailureMessage(branch, result, basename(worktreeFarmFor(paths.repo))),
-      "error",
-    );
-    return null;
+  const created = parseGitWtCreatedPath(`${result.stderr}\n${result.stdout}`);
+  const found = await findExistingWorktree(pi, paths.gitRoot, branch);
+  const after = [preferred, created, found].filter(
+    (p): p is string => Boolean(p) && p !== "none",
+  );
+  for (const dir of after) {
+    const accepted = await acceptWorktreeDir(pi, paths.gitRoot, dir, paths.repo, branch);
+    if (accepted) {
+      upsertStatusFile(paths, { worktree: accepted, branch });
+      return accepted;
+    }
   }
-  upsertStatusFile(paths, { worktree: dir, branch });
-  return dir;
+  uiNotify(
+    ctx,
+    worktreeFailureMessage(branch, result, basename(worktreeFarmFor(paths.repo))),
+    "error",
+  );
+  return null;
 }
 
 export type FeaturePick = {
@@ -1425,7 +1701,9 @@ function selectFeature(
   ) {
     uiNotify(ctx, `Using Feature ${row.name} (matched "${want}")`, "info");
   }
-  return rebindToFeatureDir(paths, row.dir);
+  const bound = rebindToFeatureDir(paths, row.dir);
+  bindFeatureToSession(bound, ctx);
+  return bound;
 }
 
 /** Verbs that take a Feature folder name as the next token. */
@@ -1515,8 +1793,8 @@ const VERB_COMPLETIONS = [
   { value: "pause", label: "pause", description: "Stop after current Task" },
   { value: "resume", label: "resume", description: "Unpause and continue" },
   { value: "status", label: "status", description: "All Features, Tasks, PRs" },
-  { value: "review", label: "review", description: "xai/grok-4.6 high plan review" },
-  { value: "qa", label: "qa", description: "xai/grok-4.6 high QA Tasks on a Feature" },
+  { value: "review", label: "review", description: "cursor/grok-4.6 high plan review" },
+  { value: "qa", label: "qa", description: "cursor/grok-4.6 high QA Tasks on a Feature" },
   { value: "help", label: "help", description: "Usage" },
 ];
 
@@ -1640,7 +1918,6 @@ function applyBase(paths: Paths, base: FeatureBase): Paths {
   paths.gitRoot = base.gitRoot;
   paths.repoDir = join(ORCH_ROOT, base.id);
   paths.archiveDir = join(paths.repoDir, "archive");
-  migrateLegacyCurrent(paths.repoDir);
   return paths;
 }
 
@@ -1796,12 +2073,34 @@ async function formatFleetStatus(
   return blocks.join("\n").trimEnd();
 }
 
+function rewritePlanRunHandoff(
+  paths: Paths,
+  fromDir: string,
+  toDir: string,
+  name: string,
+  branch: string,
+): void {
+  const file = join(paths.handoffsDir, "plan-run.md");
+  const text = readText(file);
+  if (!text) return;
+  let next = fromDir && fromDir !== toDir ? text.split(fromDir).join(toDir) : text;
+  if (next !== text || /^Name:\s*pending\s*$/im.test(next)) {
+    next = next.replace(/^Name:\s*pending\s*$/im, `Name: ${name}`);
+    next = next.replace(/^Branch:\s*pending\s*$/im, `Branch: ${branch}`);
+  }
+  // Planner used to emit this as the next human step; approve is illegal until
+  // plan-reviewer finishes, so a leftover line would be advertised mid-review.
+  next = next.replace(/^[ \t]*Next human step:.*\/orchestrate approve.*$/gim, "");
+  if (next !== text) writeText(file, next);
+}
+
 function applyFeatureIdentity(
   paths: Paths,
   plan: string,
   name: string,
   branch: string,
 ): string {
+  const src = paths.featureDir;
   const dest = promoteLiveFolder(paths, name);
   const namedPlan = join(dest, "plan.md");
   let next = upsertHeader(plan, "Name", name);
@@ -1815,6 +2114,7 @@ function applyFeatureIdentity(
     dir: dest,
     planPath: namedPlan,
   });
+  rewritePlanRunHandoff(paths, src, dest, name, branch);
   return next;
 }
 
@@ -1850,7 +2150,7 @@ export function ensureFeatureNamed(
   const branch = `feat/${name}`;
   const next = applyFeatureIdentity(paths, plan, name, branch);
   upsertStatusFile(paths, {
-    nextAction: `wait for /orchestrate approve ${name}`,
+    nextAction: "wait for plan-reviewer; do not approve yet",
   });
   return { plan: next, name, branch, assigned: true };
 }
@@ -1915,7 +2215,6 @@ async function resolvePaths(
     guessRepoFromCwd(cwd)
   ).replace(/\/+$/, "");
   const repoDir = join(ORCH_ROOT, repo);
-  migrateLegacyCurrent(repoDir);
   return {
     repo,
     gitRoot,
@@ -1926,28 +2225,6 @@ async function resolvePaths(
     handoffsDir: "",
     archiveDir: join(ORCH_ROOT, repo, "archive"),
   };
-}
-
-/** Drop leftover current/ symlink or fold a leftover current/ dir into pending-*. */
-function migrateLegacyCurrent(repoDir: string): void {
-  const current = join(repoDir, "current");
-  const st = lstatSafe(current);
-  if (!st) return;
-  if (st.isSymbolicLink()) {
-    unlinkSync(current);
-    return;
-  }
-  const planFile = join(current, "plan.md");
-  if (!existsSync(planFile)) return;
-  const plan = readText(planFile);
-  const named =
-    planHeaderField(plan, "Name") || nameFromTitle(featureTitle(plan, ""));
-  let destName =
-    named && !isPendingToken(named) ? named : `pending-${utcStamp()}`;
-  const dest = join(repoDir, destName);
-  if (existsSync(dest)) destName = `pending-${utcStamp()}`;
-  const finalDest = join(repoDir, destName);
-  if (!existsSync(finalDest)) renameSync(current, finalDest);
 }
 
 function planHeaderField(plan: string, name: string): string {
@@ -1984,6 +2261,34 @@ function isDraft(plan: string): boolean {
  */
 const TASK_SEP = "[—–:.-]";
 
+/** `- Worker: openai-codex/gpt-5.6-luna, thinking xhigh` or `openai-codex/gpt-5.6-luna:xhigh`. */
+export function parseTaskWorkerLine(body: string): { model?: string; thinking?: string } {
+  const wk = body.match(/-\s*Worker:\s*(.+)$/im);
+  const raw = (wk?.[1] ?? "").replace(/#.*$/, "").trim();
+  if (!raw) return {};
+  const named = raw.match(/^(.*?),\s*thinking\s+(\w+)\s*$/i);
+  if (named) {
+    return { model: named[1]?.trim(), thinking: named[2]?.toLowerCase() };
+  }
+  const colon = raw.indexOf(":");
+  if (colon > 0) {
+    return {
+      model: raw.slice(0, colon).trim(),
+      thinking: raw.slice(colon + 1).trim().toLowerCase() || undefined,
+    };
+  }
+  return { model: raw };
+}
+
+/** Planner templates write `todo`. The chain only starts `pending`. */
+export function normalizeTaskStatus(raw: string): string {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "in_progress" || s === "in-progress" || s === "started") return "in_progress";
+  if (s === "done" || s === "complete" || s === "completed") return "done";
+  if (s === "blocked") return "blocked";
+  return "pending";
+}
+
 export function parseTasks(plan: string): Task[] {
   const tasks: Task[] = [];
   const header = new RegExp(
@@ -2004,27 +2309,32 @@ export function parseTasks(plan: string): Task[] {
     const st = body.match(/-\s*Status:\s*(\w+)/i);
     const cx = body.match(/-\s*Complexity:\s*(simple|critical|complex)\b/i);
     const rawCx = cx?.[1]?.toLowerCase();
+    const worker = parseTaskWorkerLine(body);
     tasks.push({
       id: header.id,
       title: header.title,
-      status: (st?.[1] ?? "pending").toLowerCase(),
+      status: normalizeTaskStatus(st?.[1] ?? "pending"),
       complexity:
         rawCx === "critical" || rawCx === "complex"
           ? "critical"
           : rawCx === "simple"
             ? "simple"
             : undefined,
+      workerModel: worker.model,
+      workerThinking: worker.thinking,
     });
   }
   return tasks;
 }
 
 export type OverlayTodoStatus = "pending" | "in_progress" | "completed";
-export type OverlayTodoKind = "planner" | "plan-reviewer" | "task" | "qa";
+export type OverlayTodoKind = "feature" | "planner" | "plan-reviewer" | "approve" | "task" | "qa" | "pr";
 
-/** Reserved overlay ids so Task N keeps id N. */
+/** Reserved overlay ids so Task N keeps id N. Feature parent is 1000. */
+export const OVERLAY_FEATURE_ID = 1000;
 export const OVERLAY_PLANNER_ID = 1001;
 export const OVERLAY_REVIEWER_ID = 1002;
+export const OVERLAY_APPROVE_ID = 1003;
 
 export interface OverlayTodo {
   id: number;
@@ -2032,7 +2342,14 @@ export interface OverlayTodo {
   status: OverlayTodoStatus;
   activeForm?: string;
   blockedBy?: number[];
-  metadata?: { kind: OverlayTodoKind; taskId?: string; qaPass?: number };
+  owner?: string;
+  metadata?: {
+    kind: OverlayTodoKind;
+    taskId?: string;
+    qaPass?: number;
+    complexity?: "simple" | "critical";
+    worker?: string;
+  };
 }
 
 export interface OverlayTodoState {
@@ -2043,10 +2360,77 @@ export interface OverlayTodoState {
 export interface OverlayTodoSink {
   replaceState(sessionId: string, state: OverlayTodoState): void;
   getActiveRenderSession(): string;
+  setActiveRenderSession?(sessionId: string): void;
 }
+
+/** Same slot as `@juicesharp/rpiv-todo` so Feature state is the visible panel. */
+export const OVERLAY_WIDGET_KEY = "rpiv-todos";
 
 let overlaySink: OverlayTodoSink | undefined;
 let overlayPi: ExtensionAPI | undefined;
+
+type OverlayBinding = {
+  sessionId: string;
+  sessionFile?: string;
+  setWidget?: (key: string, value: unknown, opts?: { placement?: string }) => void;
+};
+
+/** One widget binding per Pi session. Never last-writer-wins. */
+const overlayBySession = new Map<string, OverlayBinding>();
+
+export function shortModelId(model: string): string {
+  const base = (model.split(":")[0] ?? model).trim();
+  const parts = base.split("/");
+  return (parts[parts.length - 1] ?? base).trim() || base;
+}
+
+function withAgentSuffix(subject: string, label: string): string {
+  return label ? `${subject} · ${label}` : subject;
+}
+
+/** Task row: `simple · tdd-worker gpt-5.6-luna:xhigh`. */
+export function overlayTaskAgentLabel(
+  complexity?: "simple" | "critical",
+  workerModel?: string,
+  workerThinking?: string,
+): string {
+  const cx = complexity ?? "simple";
+  const fallback = writerSpec(cx);
+  const model = shortModelId(workerModel || fallback.model);
+  const thinking = (workerThinking || fallback.thinking).toLowerCase();
+  return `${cx} · tdd-worker ${model}:${thinking}`;
+}
+
+export function overlayPipelineAgentLabel(
+  kind: Exclude<OverlayTodoKind, "task" | "feature">,
+): string {
+  if (kind === "planner") return "inherit:high";
+  if (kind === "plan-reviewer") return `${shortModelId(DEFAULT_QA_MODEL)}:high`;
+  if (kind === "approve") return "";
+  if (kind === "pr") return "ghl-pr-await";
+  return `${shortModelId(DEFAULT_FEATURE_QA_MODEL)}:high`;
+}
+
+/** Human Feature title, else the kebab Name. Empty until a real identity exists. */
+export function overlayFeatureLabel(plan: string, status: string): string {
+  const title = featureTitle(plan, "");
+  if (title && !isPlaceholderTitle(title)) return title;
+  return featureIdentityName(plan, status);
+}
+
+function finalizeFeatureParent(todos: OverlayTodo[]): OverlayTodo[] {
+  const feature = todos.find((t) => t.metadata?.kind === "feature");
+  if (!feature) return todos;
+  const kids = todos.filter((t) => t !== feature);
+  if (kids.length > 0 && kids.every((t) => t.status === "completed")) {
+    feature.status = "completed";
+  } else if (kids.some((t) => t.status === "in_progress")) {
+    feature.status = "in_progress";
+  } else {
+    feature.status = "pending";
+  }
+  return todos;
+}
 
 function planStatusToOverlay(status: string): OverlayTodoStatus {
   if (status === "done") return "completed";
@@ -2104,9 +2488,31 @@ function reviewerOverlayStatus(
   return "pending";
 }
 
+function approveOverlayStatus(
+  plan: string,
+  tasks: Task[],
+  review: PlanReviewState,
+  phase: string,
+): OverlayTodoStatus {
+  if (isApproved(plan)) return "completed";
+  if (
+    phase === "implementing" ||
+    phase === "feature-qa" ||
+    phase === "pr" ||
+    phase === "blocked" ||
+    phase === "paused" ||
+    phase === "done"
+  ) {
+    return "completed";
+  }
+  if (tasks.some((t) => t.status === "done" || t.status === "in_progress")) return "completed";
+  if (review === "done") return "in_progress";
+  return "pending";
+}
+
 /**
  * Deterministic rpiv-todo snapshot from plan.md + status.md.
- * Pipeline prefix: planner (1001), plan-reviewer (1002).
+ * Pipeline prefix: feature (1000), Plan draft (1001), Plan review (1002), Approve (1003).
  * Task N keeps id N; feature-qa pass i is max(task id)+i. No clocks, no prompts.
  */
 export function overlayTodosFromFeature(plan: string, status: string): OverlayTodo[] {
@@ -2118,32 +2524,69 @@ export function overlayTodosFromFeature(plan: string, status: string): OverlayTo
   const hasFeature = plan.trim().length > 0;
 
   if (hasFeature) {
+    const featureLabel = overlayFeatureLabel(plan, status);
+    if (featureLabel) {
+      todos.push({
+        id: OVERLAY_FEATURE_ID,
+        subject: featureLabel,
+        status: "pending",
+        metadata: { kind: "feature" },
+      });
+      used.add(OVERLAY_FEATURE_ID);
+    }
+
     const plannerStatus = plannerOverlayStatus(plan, status, tasks, review, phase);
     const planner: OverlayTodo = {
       id: OVERLAY_PLANNER_ID,
-      subject: "Planner",
+      subject: withAgentSuffix("Plan draft", overlayPipelineAgentLabel("planner")),
       status: plannerStatus,
-      metadata: { kind: "planner" },
+      owner: "planner",
+      metadata: { kind: "planner", worker: overlayPipelineAgentLabel("planner") },
     };
     if (plannerStatus === "in_progress") planner.activeForm = "writing Feature plan";
+    if (featureLabel) planner.blockedBy = [OVERLAY_FEATURE_ID];
     todos.push(planner);
     used.add(OVERLAY_PLANNER_ID);
 
     const reviewerStatus = reviewerOverlayStatus(plan, tasks, review, phase);
     const reviewer: OverlayTodo = {
       id: OVERLAY_REVIEWER_ID,
-      subject: "Plan reviewer",
+      subject: withAgentSuffix("Plan review", overlayPipelineAgentLabel("plan-reviewer")),
       status: reviewerStatus,
       blockedBy: [OVERLAY_PLANNER_ID],
-      metadata: { kind: "plan-reviewer" },
+      owner: "plan-reviewer",
+      metadata: { kind: "plan-reviewer", worker: overlayPipelineAgentLabel("plan-reviewer") },
     };
     if (reviewerStatus === "in_progress") reviewer.activeForm = "reviewing Feature plan";
     todos.push(reviewer);
     used.add(OVERLAY_REVIEWER_ID);
+
+    const approveStatus = approveOverlayStatus(plan, tasks, review, phase);
+    const approve: OverlayTodo = {
+      id: OVERLAY_APPROVE_ID,
+      subject: "Approve",
+      status: approveStatus,
+      blockedBy: [OVERLAY_REVIEWER_ID],
+      metadata: { kind: "approve" },
+    };
+    if (approveStatus === "in_progress") approve.activeForm = "waiting for /orchestrate approve";
+    todos.push(approve);
+    used.add(OVERLAY_APPROVE_ID);
   }
 
-  let prevId: number | undefined = hasFeature ? OVERLAY_REVIEWER_ID : undefined;
+  let prevId: number | undefined = hasFeature ? OVERLAY_APPROVE_ID : undefined;
   let anyTaskInProgress = false;
+  const showWork =
+    review === "done" ||
+    isApproved(plan) ||
+    phase === "implementing" ||
+    phase === "feature-qa" ||
+    phase === "pr" ||
+    phase === "blocked" ||
+    phase === "paused" ||
+    phase === "done" ||
+    tasks.some((t) => t.status === "done" || t.status === "in_progress");
+  if (!showWork) return finalizeFeatureParent(todos);
 
   for (const task of tasks) {
     const id = Number.parseInt(task.id, 10);
@@ -2151,11 +2594,18 @@ export function overlayTodosFromFeature(plan: string, status: string): OverlayTo
     used.add(id);
     const overlayStatus = planStatusToOverlay(task.status);
     if (overlayStatus === "in_progress") anyTaskInProgress = true;
+    const agent = overlayTaskAgentLabel(task.complexity, task.workerModel, task.workerThinking);
     const todo: OverlayTodo = {
       id,
-      subject: `Task ${task.id} — ${task.title}`,
+      subject: withAgentSuffix(`Task ${task.id} — ${task.title}`, agent),
       status: overlayStatus,
-      metadata: { kind: "task", taskId: task.id },
+      owner: "tdd-worker",
+      metadata: {
+        kind: "task",
+        taskId: task.id,
+        complexity: task.complexity ?? "simple",
+        worker: agent,
+      },
     };
     if (overlayStatus === "in_progress") todo.activeForm = `implementing Task ${task.id}`;
     if (prevId !== undefined) todo.blockedBy = [prevId];
@@ -2179,11 +2629,13 @@ export function overlayTodosFromFeature(plan: string, status: string): OverlayTo
       overlayStatus = "in_progress";
     }
     const label = cap === 1 ? "feature-qa" : `feature-qa ${i}/${cap}`;
+    const qaAgent = overlayPipelineAgentLabel("qa");
     const todo: OverlayTodo = {
       id,
-      subject: label,
+      subject: withAgentSuffix(label, qaAgent),
       status: overlayStatus,
-      metadata: { kind: "qa", qaPass: i },
+      owner: "feature-qa",
+      metadata: { kind: "qa", qaPass: i, worker: qaAgent },
     };
     if (overlayStatus === "in_progress") {
       todo.activeForm = cap === 1 ? "running feature-qa" : `running feature-qa ${i}/${cap}`;
@@ -2192,7 +2644,43 @@ export function overlayTodosFromFeature(plan: string, status: string): OverlayTo
     todos.push(todo);
     qaPrev = id;
   }
-  return todos;
+  const prNum = normalizePrNumber(statusField(status, "pr"));
+  if (phase === "pr" || (phase === "done" && prNum)) {
+    let prId = maxTaskId + cap + 1;
+    while (used.has(prId)) prId += 1;
+    used.add(prId);
+    const prStatus: OverlayTodoStatus = phase === "done" ? "completed" : "in_progress";
+    const prLabel = prNum ? `PR #${prNum}` : "Feature PR";
+    const prTodo: OverlayTodo = {
+      id: prId,
+      subject: withAgentSuffix(prLabel, overlayPipelineAgentLabel("pr")),
+      status: prStatus,
+      owner: "ghl-pr-await",
+      metadata: { kind: "pr", worker: overlayPipelineAgentLabel("pr") },
+    };
+    if (prStatus === "in_progress") {
+      const r = statusField(status, "await_round");
+      const tot = statusField(status, "await_round_total");
+      const reviewerProgress = formatReviewerProgress(
+        isPendingToken(r) ? undefined : r,
+        isPendingToken(tot) ? undefined : tot,
+      );
+      const worker = statusField(status, "worker_run_id");
+      const writerLive = Boolean(worker && !isPendingToken(worker));
+      const nextAction = statusField(status, "next_action");
+      const nextMatch = nextAction.match(/\bnext=([a-z0-9_]+)/i);
+      const next =
+        nextMatch?.[1] ||
+        (/same findings|disagreed|refused|queued for retry/i.test(nextAction)
+          ? "read_comments_and_fix"
+          : undefined);
+      const phase = waitChromePhase({ next, writerLive }) || "waiting for review";
+      prTodo.activeForm = reviewerProgress ? `${phase} · ${reviewerProgress}` : phase;
+    }
+    if (qaPrev !== undefined) prTodo.blockedBy = [qaPrev];
+    todos.push(prTodo);
+  }
+  return finalizeFeatureParent(todos);
 }
 
 export function projectOverlayTodos(plan: string, status: string): OverlayTodoState {
@@ -2201,26 +2689,162 @@ export function projectOverlayTodos(plan: string, status: string): OverlayTodoSt
   return { tasks, nextId: maxId + 1 };
 }
 
-export function setOverlayTodoSink(sink: OverlayTodoSink | undefined): void {
-  overlaySink = sink;
+export function overlayWidgetLines(todos: OverlayTodo[]): string[] {
+  if (todos.length === 0) return [];
+  const feature = todos.find((t) => t.metadata?.kind === "feature");
+  const rest = feature ? todos.filter((t) => t !== feature) : todos;
+  const done = rest.filter((t) => t.status === "completed").length;
+  const lines = [`Todos (${done}/${rest.length})`];
+  const textOf = (t: OverlayTodo): string => {
+    const glyph = t.status === "completed" ? "✓" : t.status === "in_progress" ? "◐" : "○";
+    let row = `${glyph} ${t.subject}`;
+    if (t.status === "in_progress" && t.activeForm) row += ` (${t.activeForm})`;
+    return row;
+  };
+  if (feature) lines.push(feature.subject);
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i];
+    if (!t) continue;
+    const last = i === rest.length - 1;
+    lines.push(`${last ? "└─" : "├─"} ${textOf(t)}`);
+  }
+  lines.push("");
+  return lines;
 }
 
-export function syncOverlayTodos(plan: string, status: string): OverlayTodoState {
+/** Last painted board per session. Pi's setWidget disposes and clears every
+ * above-editor widget, so a 1s heartbeat that republishes an identical board
+ * makes the async planner card disappear and redraw. */
+const lastOverlayPaint = new Map<string, string>();
+
+function publishOverlayWidget(sessionId: string, todos: OverlayTodo[]): boolean {
+  if (!sessionId) return false;
+  const ui = overlayBySession.get(sessionId)?.setWidget;
+  if (!ui) return false;
+  const lines = overlayWidgetLines(todos);
+  const fingerprint = lines.join("\n");
+  if (lastOverlayPaint.get(sessionId) === fingerprint) return false;
+  try {
+    // Component, not string[]: Pi clips string-array widgets at 10 lines
+    // (`MAX_WIDGET_LINES`) with "... (widget truncated)". A Feature board is
+    // already the Feature parent + planner + reviewer + approve + N tasks + QA.
+    ui(
+      OVERLAY_WIDGET_KEY,
+      lines.length === 0
+        ? undefined
+        : (_tui: unknown, _theme: unknown) => ({
+            render: () => lines,
+            invalidate: () => {},
+          }),
+      { placement: "aboveEditor" },
+    );
+    lastOverlayPaint.set(sessionId, fingerprint);
+    return true;
+  } catch {
+    /* stale ctx after /reload */
+    return false;
+  }
+}
+
+export function bindOverlayUi(ctx: {
+  hasUI?: boolean;
+  ui?: {
+    setWidget?: (key: string, value: unknown, opts?: { placement?: string }) => void;
+  };
+  sessionManager?: {
+    getSessionId?: () => string;
+    getSessionFile?: () => string | null | undefined;
+  };
+}): void {
+  const session = sessionIdentityFrom(ctx);
+  if (!session.id) return;
+  if (ctx.hasUI === false) {
+    overlayBySession.delete(session.id);
+    lastOverlayPaint.delete(session.id);
+    return;
+  }
+  overlayBySession.set(session.id, {
+    sessionId: session.id,
+    sessionFile: session.file,
+    setWidget:
+      typeof ctx.ui?.setWidget === "function"
+        ? (key, value, opts) => ctx.ui!.setWidget!(key, value, opts)
+        : undefined,
+  });
+  lastOverlayPaint.delete(session.id);
+}
+
+function bindOverlayFromCommand(ctx: ExtensionCommandContext | ExtensionContext): void {
+  bindOverlayUi({
+    hasUI: ctx.hasUI,
+    ui: {
+      setWidget: (key, value, opts) => {
+        (ctx.ui.setWidget as (k: string, v: unknown, o?: { placement?: string }) => void)(
+          key,
+          value,
+          opts,
+        );
+      },
+    },
+    sessionManager: ctx.sessionManager,
+  });
+}
+
+/** Re-read plan.md + status.md and paint the overlay. Call after every Task / QA pass. */
+export function refreshFeatureOverlay(
+  paths: Paths,
+  ctx?: ExtensionCommandContext | ExtensionContext,
+): OverlayTodoState {
+  if (ctx) bindOverlayFromCommand(ctx);
+  const status = readText(paths.statusFile);
+  const id = ctx ? sessionIdentityFrom(ctx).id : undefined;
+  return syncOverlayTodos(readText(paths.planFile), status, overlaySink, id);
+}
+
+export function syncOverlayTodos(
+  plan: string,
+  status: string,
+  sink: OverlayTodoSink | undefined = overlaySink,
+  sessionId?: string,
+): OverlayTodoState {
+  const id =
+    (sessionId ?? "").trim() ||
+    (statusField(status, "parent_session_id").trim() &&
+    !isPendingToken(statusField(status, "parent_session_id"))
+      ? statusField(status, "parent_session_id").trim()
+      : "");
+  // Landed: drop the board so this session is ordinary chat again.
+  if (statusField(status, "phase").toLowerCase() === "done") {
+    const empty = { tasks: [] as OverlayTodo[], nextId: 1 };
+    if (sink && id) sink.replaceState(id, empty);
+    if (id) publishOverlayWidget(id, []);
+    return empty;
+  }
   const snapshot = projectOverlayTodos(plan, status);
-  const sessionId = overlaySink?.getActiveRenderSession() ?? "";
-  if (overlaySink && sessionId) {
-    overlaySink.replaceState(sessionId, snapshot);
-    try {
-      overlayPi?.events?.emit("tool_execution_end", { toolName: "todo", isError: false });
-    } catch {
-      /* overlay refresh is best-effort */
+  const painted = id ? publishOverlayWidget(id, snapshot.tasks) : false;
+  if (sink && id) {
+    // Never setActiveRenderSession: that pointer is process-global and is how
+    // one Feature board appeared on every tab in the same pi process.
+    sink.replaceState(id, snapshot);
+    if (painted) {
+      try {
+        overlayPi?.events?.emit("tool_execution_end", { toolName: "todo", isError: false });
+      } catch {
+        /* overlay refresh is best-effort */
+      }
     }
   }
   return snapshot;
 }
 
 function syncOverlayTodosFromPaths(paths: Paths, statusText: string): void {
-  syncOverlayTodos(readText(paths.planFile), statusText);
+  const id = statusField(statusText, "parent_session_id");
+  syncOverlayTodos(
+    readText(paths.planFile),
+    statusText,
+    overlaySink,
+    id && !isPendingToken(id) ? id : undefined,
+  );
 }
 
 const RPIV_TODO_STORE = join(
@@ -2246,6 +2870,11 @@ async function bindRpivTodoOverlaySink(pi: ExtensionAPI): Promise<void> {
         overlaySink = {
           replaceState: mod.replaceState,
           getActiveRenderSession: mod.getActiveRenderSession,
+          setActiveRenderSession:
+            typeof (mod as { setActiveRenderSession?: unknown }).setActiveRenderSession ===
+            "function"
+              ? (mod as OverlayTodoSink).setActiveRenderSession
+              : undefined,
         };
         return;
       }
@@ -2255,12 +2884,56 @@ async function bindRpivTodoOverlaySink(pi: ExtensionAPI): Promise<void> {
   }
 }
 
+function clearOrchestrationOverlay(sessionId?: string): void {
+  const id = (sessionId ?? "").trim();
+  if (!id || isPendingToken(id)) return;
+  publishOverlayWidget(id, []);
+  overlaySink?.replaceState(id, { tasks: [], nextId: 1 });
+}
+
 function syncLiveFeatureOverlay(): void {
-  const rows = discoverAllFeatures().filter((row) => !row.archived);
-  const active = rows.filter(featureIsActive);
-  const row = active.length === 1 ? active[0] : defaultFeature(rows);
-  if (!row) return;
-  syncOverlayTodos(row.plan, row.status);
+  const all = discoverAllFeatures().filter((row) => !row.archived);
+  for (const [id, binding] of overlayBySession) {
+    const session: SessionIdentity = { id, file: binding.sessionFile };
+    const rows = all.filter((row) => sessionOwnsFeature(row.status, session));
+    // Landed Features are chat again: no board, no todos, no orchestration prompt.
+    const active = rows.filter(featureIsActive);
+    if (active.length === 0) {
+      clearOrchestrationOverlay(id);
+      continue;
+    }
+    const row = active.length === 1 ? active[0] : defaultFeature(active);
+    if (!row || statusField(row.status, "phase").toLowerCase() === "done") {
+      clearOrchestrationOverlay(id);
+      continue;
+    }
+    syncOverlayTodos(row.plan, row.status, overlaySink, id);
+  }
+}
+
+/** Re-read status.md so a merge written by another process cannot leave ◐ waiting.
+ * Unchanged boards must not call setWidget: Pi remounts every above-editor widget. */
+export const OVERLAY_HEARTBEAT_MS = 1_000;
+
+let overlayHeartbeat: ReturnType<typeof setInterval> | undefined;
+
+function armOverlayHeartbeat(): void {
+  if (overlayHeartbeat) return;
+  overlayHeartbeat = setInterval(() => {
+    if (overlayBySession.size === 0) {
+      if (overlayHeartbeat) {
+        clearInterval(overlayHeartbeat);
+        overlayHeartbeat = undefined;
+      }
+      return;
+    }
+    try {
+      syncLiveFeatureOverlay();
+    } catch {
+      /* overlay is best-effort */
+    }
+  }, OVERLAY_HEARTBEAT_MS);
+  overlayHeartbeat.unref?.();
 }
 
 export function setTaskStatusInPlan(plan: string, id: string, status: string): string {
@@ -2285,6 +2958,59 @@ export function reopenTasksThatNeverStarted(plan: string, handoffsDir: string): 
     next = setTaskStatusInPlan(next, task.id, "pending");
   }
   return next;
+}
+
+export type BlockedReconcile = "keep" | "done" | "pending";
+
+function taskHandoffLine(plan: string, id: string): string {
+  const m = taskSection(plan, id).match(/-\s*Handoff:\s*(.+)$/im);
+  return (m?.[1] ?? "").trim();
+}
+
+/**
+ * Resume used to refuse forever the moment any Task was `blocked`, even after
+ * the problem that blocked it was gone (Darwin Cargo.lock restored, worker
+ * already committed). The chain continues unless the Task still has a problem.
+ *
+ * - no handoff file → never ran → pending (same as reopenTasksThatNeverStarted)
+ * - `gate: red` → Command still failed → keep
+ * - tree still dirty → keep
+ * - dirty-commit block (no `gate:` on the Handoff line) + clean tree → done
+ * - `gate: green` + clean tree → done
+ * - `gate: none` (ungated worker failure) → keep
+ */
+export function blockedTaskReconcile(input: {
+  hasHandoffFile: boolean;
+  treeDirty: boolean;
+  handoffLine: string;
+}): BlockedReconcile {
+  const gate = (input.handoffLine.match(/\bgate:\s*(\w+)/i)?.[1] ?? "").toLowerCase();
+  if (gate === "red") return "keep";
+  if (!input.hasHandoffFile) return "pending";
+  if (input.treeDirty) return "keep";
+  if (!gate || gate === "green") return "done";
+  return "keep";
+}
+
+export function applyBlockedReconcile(
+  plan: string,
+  handoffsDir: string,
+  treeDirty: boolean,
+): { plan: string; changed: boolean } {
+  let next = plan;
+  let changed = false;
+  for (const task of parseTasks(plan)) {
+    if (task.status !== "blocked") continue;
+    const decision = blockedTaskReconcile({
+      hasHandoffFile: existsSync(join(handoffsDir, `task-${task.id}.md`)),
+      treeDirty,
+      handoffLine: taskHandoffLine(plan, task.id),
+    });
+    if (decision === "keep") continue;
+    next = setTaskStatusInPlan(next, task.id, decision);
+    changed = true;
+  }
+  return { plan: next, changed };
 }
 
 /**
@@ -2367,6 +3093,14 @@ export function upsertStatusFile(
     /** Tag of the `brief_finding` set last dispatched; `none` clears it. */
     lastFindings?: string;
     verdictFingerprint?: string;
+    /** Pi session id that is driving this Feature. */
+    parentSessionId?: string;
+    /** Pi session file that is driving this Feature (survives /reload). */
+    parentSessionFile?: string;
+    /** Reviewers who reviewed the current head, from the waiter's legacy `round=`. */
+    awaitRound?: string;
+    /** Observed reviewers, from the waiter's legacy `round_total=`. */
+    awaitRoundTotal?: string;
     tasks?: Task[];
   },
 ): void {
@@ -2380,7 +3114,18 @@ export function upsertStatusFile(
   // chain that was otherwise working.
   if (patch.phase) {
     const from = readFeaturePhase(text);
-    const refusal = phaseTransitionRefusal(from, patch.phase);
+    let refusal = phaseTransitionRefusal(from, patch.phase);
+    // A Feature that already has a PR number is in the PR loop. status.md can
+    // be reseeded to planning (empty file → seed template) and then the
+    // disagreement write of `phase: pr` used to be refused, parking the PR
+    // with chrome that watches and a reconciler that skips it.
+    if (
+      refusal &&
+      patch.phase === "pr" &&
+      normalizePrNumber(String(patch.pr ?? statusField(text, "pr") ?? ""))
+    ) {
+      refusal = undefined;
+    }
     if (refusal) {
       appendTransitionLog(paths, from, patch.phase, `REFUSED ${refusal}`);
       patch = {
@@ -2432,6 +3177,8 @@ export function upsertStatusFile(
       "plan_review: none",
       "reviewer_run_id: none",
       "reviewer_run_dir: none",
+      "parent_session_id: none",
+      "parent_session_file: none",
       "next_action: wait for user",
       "",
       "## Tasks",
@@ -2477,6 +3224,14 @@ export function upsertStatusFile(
   if (patch.verdictFingerprint !== undefined) {
     setField("verdict_fingerprint", patch.verdictFingerprint);
   }
+  if (patch.parentSessionId !== undefined) {
+    setField("parent_session_id", patch.parentSessionId);
+  }
+  if (patch.parentSessionFile !== undefined) {
+    setField("parent_session_file", patch.parentSessionFile);
+  }
+  if (patch.awaitRound !== undefined) setField("await_round", patch.awaitRound);
+  if (patch.awaitRoundTotal !== undefined) setField("await_round_total", patch.awaitRoundTotal);
   if (patch.nextAction) setField("next_action", patch.nextAction);
   if (patch.tasks) {
     const table = [
@@ -2501,6 +3256,24 @@ export function upsertStatusFile(
   const next = text.endsWith("\n") ? text : `${text}\n`;
   writeText(paths.statusFile, next);
   syncOverlayTodosFromPaths(paths, next);
+}
+
+/** Record that this chat — not this cwd, not this PR — is driving the Feature. */
+export function bindFeatureToSession(
+  paths: Paths,
+  ctx: {
+    sessionManager?: {
+      getSessionId?: () => string;
+      getSessionFile?: () => string | null | undefined;
+    };
+  },
+): void {
+  const session = sessionIdentityFrom(ctx);
+  if (!session.id && !session.file) return;
+  upsertStatusFile(paths, {
+    ...(session.id ? { parentSessionId: session.id } : {}),
+    ...(session.file ? { parentSessionFile: session.file } : {}),
+  });
 }
 
 function archiveFeature(paths: Paths): string {
@@ -2587,17 +3360,15 @@ const WRITER_TURN_BUDGET = { maxTurns: 220, graceTurns: 30 };
 export const QA_TURN_BUDGET = { maxTurns: 60, graceTurns: 10 };
 const PLANNER_TURN_BUDGET = { maxTurns: 80, graceTurns: 15 };
 const WRITER_MAX_CONCURRENCY = 2;
-const PLANNER_MODEL = "xai/grok-4.6:high";
+const PLANNER_MODEL = "inherit";
 export const MAX_QA_FINDINGS = 8;
-export const MAX_TASKS = 12;
 export const MAX_QA_PASS_CAP = 2;
 
 export function isAllowedPlannerModel(model: string): boolean {
   if (typeof model !== "string") return false;
   const trimmed = model.trim().toLowerCase();
   const base = trimmed.split(":")[0] ?? "";
-  const thinking = trimmed.split(":")[1] ?? "";
-  return base === "xai/grok-4.6" && thinking === "high";
+  return base === "inherit";
 }
 
 /** Cursor-billed ids that burned 1k–7k turn workers. Native `xai/grok-4.6` is not this. */
@@ -2613,7 +3384,7 @@ export function isForbiddenBillingModel(model: string): boolean {
 
 function defaultWriterModel(agent: string, thinking?: string): string {
   if (QA_AGENTS.has(agent)) return qaModelFor(agent, thinking);
-  return modelWithThinking(WORKERS.simple);
+  return writerModelFor("simple");
 }
 
 function turnCapFor(agent: string): { maxTurns: number; graceTurns: number } {
@@ -2641,7 +3412,7 @@ function clampTurnBudget(
   return { maxTurns, graceTurns };
 }
 
-/** Mutation writers must never get `contact_supervisor`. progress_update does not wait for a reply, so GLM loops it for thousands of turns. */
+/** Mutation writers must never get `contact_supervisor`. progress_update does not wait for a reply, so a writer can loop it for thousands of turns. */
 const MUTATION_WRITERS = new Set(["tdd-worker", "fixer"]);
 export const WRITER_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"] as const;
 export const WRITER_INTERCOM_OFF = { mode: "off" } as const;
@@ -2677,7 +3448,7 @@ function applyOneSpawn(params: Record<string, unknown>): {
     if (!isAllowedPlannerModel(model)) {
       params.model = PLANNER_MODEL;
       action = "pin";
-      reason = `pinned planner to ${PLANNER_MODEL} (refused ${model || "inherit"})`;
+      reason = `pinned planner to ${PLANNER_MODEL} (refused ${model || "unset"})`;
     }
     if (params.context === undefined) params.context = "fresh";
     const timeout = params.timeoutMs;
@@ -2708,7 +3479,7 @@ function applyOneSpawn(params: Record<string, unknown>): {
     // A QA agent is held to the narrower scope: only the billing half of
     // the id is corrected here. Thinking above high is capped separately.
     const allowed = QA_AGENTS.has(agent)
-      ? isAllowedQaModel(model)
+      ? isAllowedQaModel(model, undefined, agent)
       : isAllowedWriterModel(model);
     if (!allowed) {
       const pinned = defaultWriterModel(agent, model.split(":")[1]?.trim());
@@ -2763,9 +3534,10 @@ function nestedSpawnRecords(params: Record<string, unknown>): Record<string, unk
 }
 
 /**
- * Deterministic spawn policy: known writers/planner are pinned to the billed
- * model they are supposed to use; any other agent on Cursor Grok/Composer is
- * refused. Mutates `params` on pin/allow (caps). Reject leaves params as-is.
+ * Deterministic spawn policy: writers are pinned to the billed model they
+ * are supposed to use; planner inherits the parent session model; any other
+ * agent on Cursor Grok/Composer is refused. Mutates `params` on pin/allow
+ * (caps). Reject leaves params as-is.
  */
 export function applySpawnPolicy(params: Record<string, unknown>): {
   action: "allow" | "pin" | "reject";
@@ -2785,7 +3557,6 @@ export function applySpawnPolicy(params: Record<string, unknown>): {
 /** Parent-model `subagent` tool path — mutate input on pin, `{block}` on reject. */
 const PARENT_FORBIDDEN_AGENTS = new Set([
   "tdd-worker",
-  "fixer",
   "feature-qa",
   "qa-opus",
   "plan-reviewer",
@@ -2940,7 +3711,7 @@ export function isExcludedModelFailure(reason: string | undefined): boolean {
 
 function isSimpleWriterModel(model: unknown): boolean {
   if (typeof model !== "string") return false;
-  return (model.split(":")[0] ?? "").trim().toLowerCase() === WORKERS.simple.model;
+  return (model.split(":")[0] ?? "").trim().toLowerCase() === writerModelBase("simple");
 }
 
 function shouldRetryExcludedSimpleWriter(
@@ -2950,7 +3721,7 @@ function shouldRetryExcludedSimpleWriter(
   if (outcome.ok || outcome.stopped) return false;
   if (!isExcludedModelFailure(outcome.reason)) return false;
   if (params.agent !== "tdd-worker" && params.agent !== "fixer") return false;
-  const fallback = modelWithThinking(WORKERS.critical);
+  const fallback = writerModelFor("critical");
   if (typeof params.model === "string" && params.model === fallback) return false;
   return isSimpleWriterModel(params.model);
 }
@@ -2966,7 +3737,7 @@ export function runChild(
     if (!shouldRetryExcludedSimpleWriter(params, outcome)) return outcome;
     return awaitSpawn(
       pi,
-      { ...params, model: modelWithThinking(WORKERS.critical) },
+      { ...params, model: writerModelFor("critical") },
       onRunId,
     );
   });
@@ -3272,6 +4043,25 @@ export function taskRepoName(body: string, plan = ""): string {
   return planRepoName(plan);
 }
 
+/**
+ * Git repo the Feature PR is opened in.
+ *
+ * Orchestrator folder (`paths.repo` / plan `> Repo:`) can differ from every
+ * Task `- Repo:`. `ghl-pr-await` has no `--repo` flag — cwd origin is the PR
+ * — so this is also the worktree `git pr-await` / `gh pr create` must use.
+ */
+export function featurePrRepo(plan: string, fallback = ""): string {
+  const tasks = parseTasks(plan);
+  if (tasks.length) {
+    const repos = tasks.map(
+      (t) => taskRepoName(taskSection(plan, t.id), plan) || fallback,
+    );
+    const unique = [...new Set(repos.filter(Boolean))];
+    if (unique.length === 1) return unique[0]!;
+  }
+  return planRepoName(plan) || fallback;
+}
+
 function existingGitDir(dir: string): string {
   const cleaned = dir.replace(/\/+$/, "");
   return cleaned && existsSync(join(cleaned, ".git")) ? cleaned : "";
@@ -3319,10 +4109,20 @@ export async function ensureRepoWorktree(
   if (already) return already;
   const root = join(REF_ROOT, repo);
   if (!existsSync(root) || isHostBase(repo)) return "";
+  let created = "";
   try {
-    await pi.exec("git", ["wt", branch], { cwd: root, timeout: 180_000 });
+    const result = await pi.exec("git", ["wt", branch, "--yes"], {
+      cwd: root,
+      timeout: 180_000,
+    });
+    created = parseGitWtCreatedPath(`${result.stderr}\n${result.stdout}`);
   } catch {
-    return existingGitDir(preferred);
+    /* fall through to find/relocate */
+  }
+  const found = await findExistingWorktree(pi, root, branch);
+  for (const dir of [preferred, created, found]) {
+    const accepted = await acceptWorktreeDir(pi, root, dir ?? "", repo, branch);
+    if (accepted) return accepted;
   }
   return existingGitDir(preferred);
 }
@@ -3395,9 +4195,69 @@ export async function porcelainStatus(
   try {
     const out = await pi.exec("git", ["status", "--porcelain"], { cwd, timeout: 30_000 });
     if (out.code !== 0) return undefined;
-    return out.stdout.trim();
+    // Do not trim leading spaces: porcelain XY codes start with a space for
+    // worktree-only edits (` M Cargo.lock`). trim() turned that into
+    // `M Cargo.lock` and slice(3) into `argo.lock`.
+    let text = out.stdout;
+    while (text.endsWith("\n") || text.endsWith("\r")) text = text.slice(0, -1);
+    return text;
   } catch {
     return undefined;
+  }
+}
+
+/** Paths from `git status --porcelain`. Empty lines dropped. */
+export function porcelainPaths(porcelain: string): string[] {
+  return porcelain
+    .split("\n")
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean);
+}
+
+/** Path segments that are generated output, never Feature work. */
+const TOOLCHAIN_NOISE_SEGMENTS = new Set([
+  "node_modules",
+  "target",
+  ".vite",
+  "criterion",
+]);
+
+/**
+ * Local toolchain files a commit hook will refuse, plus generated trees that
+ * cargo/vitest rewrite or delete in the worktree.
+ *
+ * Darwin cargo rewrites `Cargo.lock` on every test run; icemining's hook then
+ * blocks the commit. `target/` and `node_modules/` show up the same way when a
+ * worktree drops criterion/vite caches that were accidentally tracked.
+ * Treating any of that as Feature dirt wedges PR open after QA.
+ */
+export function isToolchainNoisePath(file: string): boolean {
+  const norm = file.replace(/\\/g, "/");
+  const parts = norm.split("/").filter(Boolean);
+  const base = parts[parts.length - 1] ?? file;
+  if (base === "Cargo.lock") return true;
+  return parts.some((part) => TOOLCHAIN_NOISE_SEGMENTS.has(part));
+}
+
+export function meaningfulDirtyPaths(porcelain: string): string[] {
+  return porcelainPaths(porcelain).filter((file) => !isToolchainNoisePath(file));
+}
+
+async function restorePaths(
+  pi: ExtensionAPI,
+  cwd: string,
+  files: string[],
+  extra: string[] = [],
+): Promise<boolean> {
+  if (files.length === 0) return true;
+  try {
+    const out = await pi.exec("git", ["restore", ...extra, "--", ...files], {
+      cwd,
+      timeout: 30_000,
+    });
+    return out.code === 0;
+  } catch {
+    return false;
   }
 }
 
@@ -3407,7 +4267,8 @@ export async function porcelainStatus(
  * Only the first: once a Task has run, a dirty tree is this Feature's own
  * work-in-progress and the commit gate below owns it. Before then, anything
  * uncommitted belongs to someone else, and committing it under a Task's
- * message would attribute a stranger's edits to this plan.
+ * message would attribute a stranger's edits to this plan. Toolchain noise
+ * (`Cargo.lock`) is not someone else's work.
  */
 export function firstTaskBlockedByDirtyTree(
   tasks: Task[],
@@ -3415,10 +4276,8 @@ export function firstTaskBlockedByDirtyTree(
 ): string | undefined {
   if (porcelain === undefined || !porcelain.trim()) return undefined;
   if (tasks.some((t) => t.status !== "pending")) return undefined;
-  const files = porcelain
-    .split("\n")
-    .map((line) => line.slice(3).trim())
-    .filter(Boolean);
+  const files = meaningfulDirtyPaths(porcelain);
+  if (files.length === 0) return undefined;
   const shown = files.slice(0, 8).join(", ");
   return (
     `dirty worktree: ${files.length} uncommitted file(s) before Task 1 — ${shown}` +
@@ -3426,11 +4285,19 @@ export function firstTaskBlockedByDirtyTree(
   );
 }
 
+/** Darwin pre-commit hook text. Never a Feature block — the lock is ops-canonical. */
+export function isDarwinLockCommitRefusal(stderr: string): boolean {
+  return /Cargo\.lock must not be committed from macOS/i.test(stderr);
+}
+
 /**
  * Close the commit gate for one writer.
  *
- * `git add -A` is deliberate: a writer's untracked new files are as much of
- * the Task as its edits, and leaving them behind would push a half-Task.
+ * Real Task files are added and committed by path. `Cargo.lock` is never in
+ * that pathspec: Darwin cargo rewrites it, and the macOS hook refuses a
+ * staged lock. Restoring the lock is best-effort hygiene, not a gate.
+ * Untracked new files still land — they appear in porcelain and are added
+ * by path, not via `git add -A`.
  */
 export async function ensureWriterCommit(
   pi: ExtensionAPI,
@@ -3440,20 +4307,42 @@ export async function ensureWriterCommit(
   const before = await porcelainStatus(pi, cwd);
   if (before === undefined) return { state: "unknown", reason: "git status --porcelain failed" };
   if (!before) return { state: "clean", reason: "" };
+  const noise = porcelainPaths(before).filter((file) => isToolchainNoisePath(file));
+  const real = meaningfulDirtyPaths(before);
+  if (real.length === 0) {
+    await restorePaths(pi, cwd, noise, ["--staged", "--worktree"]);
+    return { state: "clean", reason: "" };
+  }
   try {
-    const add = await pi.exec("git", ["add", "-A"], { cwd, timeout: 120_000 });
+    const add = await pi.exec("git", ["add", "--", ...real], { cwd, timeout: 120_000 });
     if (add.code !== 0) {
-      return { state: "dirty", reason: `git add -A failed: ${(add.stderr || "").trim()}` };
+      return { state: "dirty", reason: `git add failed: ${(add.stderr || "").trim()}` };
     }
-    const commit = await pi.exec("git", ["commit", "-m", message], { cwd, timeout: 120_000 });
+    await restorePaths(pi, cwd, noise, ["--staged"]);
+    const commit = await pi.exec(
+      "git",
+      ["commit", "-m", message, "--", ...real],
+      { cwd, timeout: 120_000 },
+    );
     if (commit.code !== 0) {
-      return { state: "dirty", reason: `git commit failed: ${(commit.stderr || "").trim()}` };
+      const stderr = (commit.stderr || "").trim();
+      if (isDarwinLockCommitRefusal(stderr)) {
+        await restorePaths(pi, cwd, noise, ["--staged", "--worktree"]);
+        const leftover = await porcelainStatus(pi, cwd);
+        if (!leftover || meaningfulDirtyPaths(leftover).length === 0) {
+          return { state: "clean", reason: "" };
+        }
+      }
+      return { state: "dirty", reason: `git commit failed: ${stderr}` };
     }
   } catch (error) {
     return { state: "dirty", reason: `commit gate error: ${String(error)}` };
   }
+  await restorePaths(pi, cwd, noise, ["--worktree"]);
   const after = await porcelainStatus(pi, cwd);
-  if (after) return { state: "dirty", reason: "worktree still dirty after the commit" };
+  if (after && meaningfulDirtyPaths(after).length > 0) {
+    return { state: "dirty", reason: "worktree still dirty after the commit" };
+  }
   return { state: "committed", reason: "" };
 }
 
@@ -3480,20 +4369,29 @@ export function workerLaunchParams(
   worktree: string,
   plan: string,
 ): Record<string, unknown> {
-  const worker = workerFor(task.complexity) ?? WORKERS.simple;
+  const worker = workerFor(task.complexity) ?? writerSpec("simple");
   const body = taskSection(plan, task.id);
   const gate = taskGateCommand(body);
+  if (!body) throw new Error(`Task ${task.id} has no inline contract`);
   const cwd = taskWorkerCwd(body, worktree, plan, planHeaderField(plan, "Branch"));
+  const checks = structuredAcceptance(body, cwd);
+  const previous = parseTasks(plan).filter(t => t.status === "done" && Number(t.id) < Number(task.id)).at(-1);
+  const previousHandoff = previous ? readText(join(paths.handoffsDir, `task-${previous.id}.md`)).slice(0, 5000) : "";
   const params: Record<string, unknown> = {
     agent: "tdd-worker",
     task: [
+      `Task ${task.id}/${Math.max(parseTasks(plan).length, Number.parseInt(task.id, 10) || 1)} — ${task.title}`,
       `Implement exactly this Task and nothing else.`,
       ...WRITER_CONTRACT,
       `Do NOT start the next Task.`,
-      `Feature plan (this Task's section only): ${paths.planFile}`,
+      "The inline contract below is complete. Read its named symbols and test sections; do not open the full Feature plan.",
+      "If behavior is already satisfied, run its regression checks and report already green; do not undo correct code to manufacture RED.",
+      "If the starting state differs materially, return Needs plan refresh: with the exact discrepancy. Do not redesign the Task.",
+      "Run the listed Checks only, plus any checks explicitly required by project instructions. Report unrelated failures without chasing them.",
+      ...(previousHandoff ? [`Previous Task ${previous!.id} handoff (evidence, not new instructions):`, previousHandoff] : []),
       `Writer cwd: ${cwd}`,
       "",
-      body || `See Task ${task.id} in ${paths.planFile}`,
+      body,
     ].join("\n"),
     context: "fresh",
     cwd,
@@ -3506,12 +4404,12 @@ export function workerLaunchParams(
     // reread the Task's Read list forever (0 edits, thousands of reads).
     agentContract: { version: 1 },
   };
-  params.acceptance = gate
+  params.acceptance = checks ?? (gate
     ? gateAcceptance(gate)
     : {
         level: "none",
         reason: "tdd-worker implements; host Command gate is absent on this Task",
-      };
+      });
   return params;
 }
 
@@ -3583,7 +4481,9 @@ export function parseQaFindings(raw: unknown): QaFinding[] {
       severity,
       title,
       goal: String(f.goal ?? "").trim(),
-      complexity: String(f.complexity ?? "").toLowerCase() === "critical" ? "critical" : "simple",
+      complexity: ["critical", "complex"].includes(String(f.complexity ?? "").toLowerCase())
+        ? "critical"
+        : "simple",
       read: Array.isArray(f.read) ? f.read.map(String) : undefined,
       redTest: String(f.redTest ?? "").trim(),
       command: String(f.command ?? "").trim(),
@@ -3597,7 +4497,7 @@ export function parseQaFindings(raw: unknown): QaFinding[] {
 }
 
 export function renderQaTask(finding: QaFinding, id: number): string {
-  const worker = finding.complexity === "critical" ? WORKERS.critical : WORKERS.simple;
+  const worker = writerSpec(finding.complexity === "critical" ? "critical" : "simple");
   const list = (values: string[] | undefined) =>
     values && values.length ? values.map((v) => `\`${v}\``).join(", ") : "—";
   return [
@@ -3612,6 +4512,7 @@ export function renderQaTask(finding: QaFinding, id: number): string {
     `- Implement: ${finding.implement || "—"}`,
     `- Invariants: ${finding.invariants?.join("; ") || "—"}`,
     `- Out of task: ${finding.outOfTask?.join("; ") || "—"}`,
+    `- Acceptance: [\`${finding.command}\` green]`,
     finding.evidence ? `- QA evidence: ${finding.evidence}` : "",
     `- Handoff: (orchestrator fills)`,
     "",
@@ -3727,14 +4628,19 @@ export async function drivePrAwait(
     (round && round !== "none" ? `, reviewer round ${round}` : "");
   uiNotify(ctx, `PR ${pr} — await (${label})`, "info");
   const next = parseKeyedField(output, "next").toLowerCase();
+  const handshakeUrl =
+    output.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/)?.[0] ||
+    parseKeyedField(output, "url") ||
+    undefined;
+  const recordedPr = handshakeUrl || pr;
   if (next === "done") {
-    upsertStatusFile(paths, { phase: "done", pr, nextAction: "landed" });
+    upsertStatusFile(paths, { phase: "done", pr: recordedPr, nextAction: "landed" });
     return { done: true, next, output, round };
   }
   if (next === "stop") {
     upsertStatusFile(paths, {
       phase: "pr",
-      pr,
+      pr: recordedPr,
       nextAction: `pr-await next=stop (${label}) — confirm merged or closed unmerged`,
     });
     return { done: false, next, output, round };
@@ -3742,11 +4648,18 @@ export async function drivePrAwait(
   // yield / poll_again / missing next= (handshake timeout or empty print):
   // the waiter owns hours-long review. Never fail the Feature. Never prompt.
   if (next === "yield" || next === "poll_again" || !next) {
+    const awaitRound = parseKeyedField(output, "round");
+    const awaitRoundTotal = parseKeyedField(output, "round_total");
     upsertStatusFile(paths, {
       phase: "pr",
-      pr,
+      pr: recordedPr,
       nextAction: `pr-await next=yield — ${label} — ghl-pr-await owns the wait (0 tokens)`,
+      ...(awaitRound ? { awaitRound } : {}),
+      ...(awaitRoundTotal ? { awaitRoundTotal } : {}),
     });
+    // Command entry may have had no PRs yet. Arm recovery at the transition,
+    // independently of whether the latch extension is installed or watching.
+    armReconcileTimer(pi, ctx);
     uiNotify(ctx, 
       !next
         ? `PR ${pr}: git pr-await handshake returned no next= (${label}). Waiter owns the review (hours). Not failing the Feature.`
@@ -3757,24 +4670,23 @@ export async function drivePrAwait(
     // absorb never sees this handshake. Without an observed latch the parent
     // never watches, merge never wakes, and status.md stays on yield forever
     // (icemining#2197).
-    const url =
-      output.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/)?.[0] ||
-      parseKeyedField(output, "url") ||
-      undefined;
-    const slug = url?.match(/github\.com\/([^\s/]+\/[^\s/]+)\/pull\//)?.[1];
+    const slug = handshakeUrl?.match(/github\.com\/([^\s/]+\/[^\s/]+)\/pull\//)?.[1];
     armObservedLatch(ctx, {
       pr,
       cwd: worktree,
       lastNext: next || "yield",
-      url: url || undefined,
+      url: handshakeUrl || undefined,
       slug,
       head: parseKeyedField(output, "head") || undefined,
-    });
+      sessionId: sessionIdentityFrom(ctx).id,
+      round: parseKeyedField(output, "round") || undefined,
+      roundTotal: parseKeyedField(output, "round_total") || undefined,
+    }, pi.events);
     return { done: false, next: next || "yield", output, round, silent: true };
   }
   upsertStatusFile(paths, {
     phase: "pr",
-    pr,
+    pr: recordedPr,
     nextAction: `pr-await next=${next} — ${label}`,
   });
   return { done: false, next, output, round };
@@ -3870,6 +4782,26 @@ export function fixerSettleAction(input: {
   return "fail";
 }
 
+function gitHeadsMatch(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  return a === b || a.startsWith(b) || b.startsWith(a);
+}
+
+/**
+ * A fixer that commits nothing is only a disagreement when the verdict was
+ * against the head it settled on. If the waiter handed an older head and the
+ * branch already moved, doing nothing is correct — re-await the new head.
+ */
+export function fixerNoopIsStaleVerdict(input: {
+  verdictHead: string;
+  localAfter: string;
+  remoteAfter: string;
+}): boolean {
+  const current = input.localAfter || input.remoteAfter;
+  if (!input.verdictHead || !current) return false;
+  return !gitHeadsMatch(input.verdictHead, current);
+}
+
 /** What code does about a judgment `next=` on a Feature-owned PR. */
 export type FeaturePrAction =
   /** `yield` / `poll_again` / no verdict — the waiter owns the rest, 0 tokens. */
@@ -3886,17 +4818,10 @@ export type FeaturePrAction =
   | "confirm"
   /** The loop is over: code says so on the PR and stops. */
   | "disagree"
+  /** Unused: same-head `read_comments_and_fix` spawns. Kept so old status files stay accepted. */
+  | "ack"
   /** A writer already holds this Feature; a second one would race it. */
   | "refuse";
-
-/**
- * Fix-writers one Feature PR may spend before code stops arguing.
- *
- * PR 275 consumed seven fixers and PR 2178 consumed seven; nothing implemented
- * the spec's "until the orchestrator disagrees with the reviewers" (F6), so the
- * loop only ever ended when the bots gave up or something else broke.
- */
-export const FIX_ROUND_CAP = 6;
 
 /**
  * The reviewers' finding set, from the waiter's own `brief_finding` lines.
@@ -3980,9 +4905,10 @@ export function classifyFeaturePrNext(
     // termination rules below: a held Feature queues the verdict for retry,
     // and spending it on a disagreement would throw the round away.
     if (state.chainLocked || state.workerLive) return "refuse";
-    // The loop ends at merge or at disagreement, and nothing else (F6).
+    // pr-await said a fix is needed. Same findings on the same head is still
+    // that judgment — spawn. Only the same findings on a *new* head (fixer
+    // moved the branch, reviewers unmoved) is disagreement.
     if (state.findingsRepeated) return "disagree";
-    if (fixSpawnCount(state.prRound) >= FIX_ROUND_CAP) return "disagree";
     return "spawn_writer";
   }
   if (verdict === "investigate_dead_reviewers") return "reawait";
@@ -4030,7 +4956,7 @@ export function reviewFixLaunchParams(
     cwd: worktree,
     // A review fix touches already-reviewed code on an open PR; that is the
     // critical writer's job, not the cheap one's.
-    model: modelWithThinking(WORKERS.critical),
+    model: writerModelFor("critical"),
     output: join(paths.handoffsDir, `pr-fix-${pr}-${spawn}.md`),
     outputMode: "inline",
     timeoutMs: CHILD_TIMEOUT_MS,
@@ -4239,50 +5165,30 @@ export async function pushFeatureBranch(
  * parks with a `next_action` a human can act on.
  */
 export async function recordFeatureDisagreement(
-  pi: ExtensionAPI,
+  _pi: ExtensionAPI,
   ctx: ExtensionContext,
   paths: Paths,
   pr: string,
-  worktree: string,
+  _worktree: string,
   input: { reason: string; handoff?: string; head?: string; findings?: string[] },
 ): Promise<void> {
   const head = input.head || statusField(readText(paths.statusFile), "pr_head");
   const shortHead = head && !isPendingToken(head) ? head.slice(0, 12) : "";
-  const body = [
-    `Orchestrator: stopping the automated fix loop on this PR.`,
-    "",
-    `Reason: ${input.reason}.`,
-    ...(shortHead ? ["", `Head at the time: \`${shortHead}\`.`] : []),
-    ...(input.findings?.length
-      ? ["", "Findings still open:", ...input.findings.map((f) => `- ${f}`)]
-      : []),
-    "",
-    "Merge this PR if you agree with the code as it stands, or reply here and re-run `/orchestrate resume`.",
-  ].join("\n");
-
-  let posted = false;
-  try {
-    const r = await pi.exec("gh", ["pr", "comment", pr, "--body", body], {
-      cwd: worktree,
-      timeout: 60_000,
-    });
-    posted = r.code === 0;
-  } catch {
-    posted = false;
-  }
-
+  // Reviewers are bots. Do not `gh pr comment` at them. The operator sees this
+  // in-session; `/orchestrate resume` is how they retry.
   upsertStatusFile(paths, {
     phase: "pr",
     pr,
     ...(shortHead ? { prHead: head } : {}),
-    nextAction:
-      `disagreed${shortHead ? ` at ${shortHead}` : ""} — ${input.reason}; merge or reply on the PR`,
+    nextAction: `disagreed${shortHead ? ` at ${shortHead}` : ""} — ${input.reason}`,
   });
-  uiNotify(ctx,
+  uiNotify(
+    ctx,
     `PR ${pr} — the fix loop stopped: ${input.reason}.\n` +
-      (posted ? "A comment explaining that is on the PR.\n" : "Could not post the PR comment.\n") +
+      (shortHead ? `Head: ${shortHead}\n` : "") +
+      (input.findings?.length ? `Open findings:\n${input.findings.map((f) => `- ${f}`).join("\n")}\n` : "") +
       (input.handoff ? `Handoff: ${input.handoff}\n` : "") +
-      "Merge it yourself if you agree with the code as it stands.",
+      `/orchestrate resume to try another fixer round.`,
     "info",
   );
 }
@@ -4293,7 +5199,7 @@ export async function recordFeatureDisagreement(
  * again — that is how a later review round still gets a fixer.
  *
  * The spawn is counted on disk *before* the child starts, so a session that
- * dies mid-fix cannot hand the next one a free round against the cap.
+ * dies mid-fix cannot hand the next one an uncounted round label.
  */
 async function runReviewFixWriter(
   pi: ExtensionAPI,
@@ -4387,9 +5293,31 @@ async function runReviewFixWriter(
     return;
   }
   if (settle === "disagree") {
-    // The branch did not move: the remaining finding is a product call, not a
-    // code gap. Re-awaiting would re-dispatch the same head and burn another
-    // round, so the disagreement is posted on the PR and the loop stops.
+    const verdictSha = verdictHead(result.output);
+    const current = after.local || after.remote || before.remote;
+    if (
+      fixerNoopIsStaleVerdict({
+        verdictHead: verdictSha,
+        localAfter: after.local,
+        remoteAfter: after.remote,
+      })
+    ) {
+      // The waiter asked about an older head. This round correctly did nothing.
+      // Re-await so reviewers see the head that already answered them.
+      upsertStatusFile(paths, {
+        phase: "pr",
+        pr,
+        nextAction: `fixer round ${spawn} skipped a stale-head verdict; re-awaiting ${current.slice(0, 12)}`,
+      });
+      uiNotify(
+        ctx,
+        `PR ${pr} — fixer round ${spawn} did not re-patch; the verdict was against an older head.\nRe-awaiting current head.`,
+        "info",
+      );
+      await awaitAndDispatch(pi, ctx, paths, pr, worktree, { holdsChainLock: true, depth: 0 });
+      return;
+    }
+    // Current-head verdict, branch unmoved: remaining finding is a product call.
     await recordFeatureDisagreement(pi, ctx, paths, pr, worktree, {
       reason: `fixer round ${spawn} changed nothing on the branch`,
       handoff,
@@ -4420,8 +5348,8 @@ async function runReviewFixWriter(
   // Exactly one `git pr-await`, in code. The writer is forbidden from waiting,
   // and the parent is never handed the review to work through itself. A
   // judgment `next=` here is another round, not the end of the Feature.
-  // depth 0: a completed fix round is a new cycle, not deeper recursion. What
-  // bounds *this* loop is the round cap in `classifyFeaturePrNext` (F6).
+  // depth 0: a completed fix round is a new cycle, not deeper recursion. The
+  // loop ends at merge or at repeated findings (`classifyFeaturePrNext`, F6).
   await awaitAndDispatch(pi, ctx, paths, pr, worktree, { holdsChainLock: true, depth: 0 });
 }
 
@@ -4451,8 +5379,8 @@ export async function dispatchFeaturePrVerdict(
   // The reviewers' own finding set, and the head they raised it against. The
   // same set on a *different* head means a fixer pushed and changed nobody's
   // mind — the disagreement the spec asks for, and the only thing that ends
-  // the loop short of a merge (F6). The same set on the *same* head is just
-  // the verdict arriving twice and must not stop anything.
+  // the loop short of a merge (F6). Same set on the same head is still
+  // `read_comments_and_fix`: spawn, unless a writer is already live.
   const head = verdictHead(result.output);
   const findings = parseBriefFindings(result.output);
   const findingsTagNow = findingsTag(findings);
@@ -4468,7 +5396,7 @@ export async function dispatchFeaturePrVerdict(
 
   const action = classifyFeaturePrNext(result.next, {
     prRound: statusField(status, "pr_round"),
-    chainLocked: opts.holdsChainLock ? false : RUNNING_CHAINS.has(paths.featureDir),
+    chainLocked: opts.holdsChainLock ? false : RUNNING_CHAINS.size > 0,
     workerLive: featureWorkerLive(status),
     findingsRepeated,
   });
@@ -4506,7 +5434,10 @@ export async function dispatchFeaturePrVerdict(
     // the writer runs.
     // Saying so once is information; saying it 120 times is noise.
     if (already !== fingerprint) {
-      uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next), "warning");
+      const session = sessionIdentityFrom(ctx);
+      if (!session.id || sessionOwnsFeature(status, session)) {
+        uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next), "warning");
+      }
     }
     return action;
   }
@@ -4525,14 +5456,28 @@ export async function dispatchFeaturePrVerdict(
 
   const spent = fixSpawnCount(statusField(status, "pr_round"));
 
+  if (action === "ack") {
+    // Spend so the reconciler does not treat this as a refused retry.
+    accept();
+    upsertStatusFile(paths, {
+      pr,
+      nextAction:
+        `pr-await next=${result.next || "(none)"} — same findings on this head; not another fixer`,
+    });
+    return action;
+  }
+
   if (action === "disagree") {
     // Spend the verdict: the loop is over, and leaving it undelivered would
     // have the reconciler re-raise the same disagreement every 60 seconds.
     accept();
+    const already = statusField(status, "next_action");
+    const shortHead = head && !isPendingToken(head) ? head.slice(0, 12) : "";
+    if (/^disagreed\b/.test(already) && (!shortHead || already.includes(shortHead))) {
+      return action;
+    }
     await recordFeatureDisagreement(pi, ctx, paths, pr, worktree, {
-      reason: findingsRepeated
-        ? `the same ${findings.length} finding${findings.length === 1 ? "" : "s"} came back on a new head after fixer round ${spent}`
-        : `${spent} fixer rounds is the cap`,
+      reason: `the same ${findings.length} finding${findings.length === 1 ? "" : "s"} came back on a new head after fixer round ${spent}`,
       head: head || undefined,
       findings,
     });
@@ -4574,7 +5519,20 @@ export async function dispatchFeaturePrVerdict(
     // branch, so phase may still be `pr` / `next=yield`. Always land here.
     accept();
     upsertStatusFile(paths, { phase: "done", pr, nextAction: "landed" });
-    uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
+    const statusNow = readText(paths.statusFile);
+    // One closer: status.md is done, waiter is dead, owning session is woken.
+    // lastCtx must not inherit another session's Feature toast (session bleed).
+    stopWaiterForPr(pr, undefined, paths.repo);
+    const parentId = statusField(statusNow, "parent_session_id");
+    notifyLatchTerminal({
+      pr,
+      state: "merged",
+      sessionId: parentId && !isPendingToken(parentId) ? parentId : undefined,
+    }, pi.events);
+    const session = sessionIdentityFrom(ctx);
+    if (!session.id || sessionOwnsFeature(statusNow, session)) {
+      uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
+    }
     return action;
   }
 
@@ -4588,6 +5546,18 @@ export async function dispatchFeaturePrVerdict(
     // `refuse` returns above, so only `confirm`/`notify` reach here. The
     // ternary that used to test for it was dead: a refusal is warned about at
     // its own branch, which is where F4's "the finding vanished" note lives.
+    if (action === "confirm") {
+      const statusNow = readText(paths.statusFile);
+      stopWaiterForPr(pr, undefined, paths.repo);
+      const parentId = statusField(statusNow, "parent_session_id");
+      notifyLatchTerminal({
+        pr,
+        state: "closed",
+        sessionId: parentId && !isPendingToken(parentId) ? parentId : undefined,
+      }, pi.events);
+      const session = sessionIdentityFrom(ctx);
+      if (session.id && !sessionOwnsFeature(statusNow, session)) return action;
+    }
     uiNotify(ctx, featurePrVerdictNotice(action, pr, result.next, spent), "info");
     return action;
   }
@@ -4634,9 +5604,16 @@ export async function dispatchFeaturePrVerdictForOwner(
   owner: FeaturePrOwner,
   result: { next: string; output: string; round?: string },
 ): Promise<FeaturePrAction> {
+  const recovered = recoverFeatureWorktree({
+    repo: owner.repo,
+    name: owner.name,
+    worktree: owner.worktree,
+    branch: statusField(readText(owner.statusFile), "branch"),
+  });
+  const worktree = recovered || owner.worktree;
   // No worktree, nowhere to run a writer. Refusing beats launching a child
   // whose cwd is empty.
-  if (!owner.worktree) return "refuse";
+  if (!worktree) return "refuse";
   const repoDir = dirname(owner.dir);
   const paths = bindFeature(
     {
@@ -4652,15 +5629,21 @@ export async function dispatchFeaturePrVerdictForOwner(
     owner.dir,
   );
   // Branch-recovered ownership must stick: the next verdict looks at `pr:`.
-  if (!normalizePrNumber(statusField(readText(paths.statusFile), "pr"))) {
-    upsertStatusFile(paths, { pr: owner.pr, nextAction: `pr-await ${owner.pr}` });
+  const missingPr = !normalizePrNumber(statusField(readText(paths.statusFile), "pr"));
+  const restoredWt = Boolean(recovered && recovered !== owner.worktree);
+  if (missingPr || restoredWt) {
+    upsertStatusFile(paths, {
+      pr: owner.pr,
+      ...(restoredWt ? { worktree: recovered, phase: "pr" } : {}),
+      ...(missingPr ? { nextAction: `pr-await ${owner.pr}` } : {}),
+    });
   }
   return dispatchFeaturePrVerdict(
     pi,
     ctx as ExtensionCommandContext,
     paths,
     owner.pr,
-    owner.worktree,
+    worktree,
     result,
   );
 }
@@ -4710,7 +5693,7 @@ async function featurePrState(
     try {
       const result = await pi.exec(
         "gh",
-        ["pr", "view", owner.pr, "--json", "state,mergedAt,headRefOid"],
+        ghPrViewArgs(owner.pr, owner.slug, "state,mergedAt,headRefOid"),
         { cwd, timeout: 20_000 },
       );
       if (result.code !== 0) continue;
@@ -4744,19 +5727,31 @@ export async function reconcileLiveFeaturePrs(
 ): Promise<ReconcileResult | undefined> {
   try {
     return await reconcileFeaturePrs({
-      listFeatures: () => listFeaturePrOwners(),
+      listFeatures: () =>
+        listFeaturePrOwners().map((owner) => {
+          const worktree = recoverFeatureWorktree({
+            repo: owner.repo,
+            name: owner.name,
+            worktree: owner.worktree,
+            branch: statusField(readText(owner.statusFile), "branch"),
+          });
+          return worktree && worktree !== owner.worktree ? { ...owner, worktree } : owner;
+        }),
       prState: (owner) => featurePrState(pi, owner),
-      undeliveredVerdicts: (owner) => undeliveredWaiterVerdicts(owner.pr),
+      undeliveredVerdicts: (owner) =>
+        undeliveredWaiterVerdicts(owner.pr, undefined, owner.slug || owner.repo),
       dispatch: (owner, verdict) =>
         dispatchFeaturePrVerdictForOwner(pi, ctx as ExtensionContext, owner, verdict),
-      driverRunning: (owner) => isDriverRunning(owner.pr),
+      driverRunning: (owner) =>
+        isDriverRunning(owner.pr, undefined, undefined, owner.slug || owner.repo),
       ensureWaiter: (owner) => {
         // The waiter's own `--state` file, never the extension's latch copy,
         // and never a path this extension then writes to (F20).
-        const paths = waiterPaths(owner.repo, owner.pr);
+        const gitRepo = githubRepoShortName(owner.slug) || owner.repo;
+        const paths = waiterPaths(gitRepo, owner.pr);
         const cwd =
           (owner.worktree && existsSync(owner.worktree) && owner.worktree) ||
-          join(REF_ROOT, owner.repo);
+          join(REF_ROOT, gitRepo);
         if (!existsSync(cwd)) return;
         spawnDetachedWaiter({
           stateFile: paths.manual[0]!,
@@ -4806,6 +5801,11 @@ function armReconcileTimer(pi: ExtensionAPI, ctx: ExtensionContext): void {
   if (reconcileTimer) return;
   reconcileTimer = setInterval(() => {
     void reconcileLiveFeaturePrs(pi, ctx).then(() => {
+      try {
+        syncLiveFeatureOverlay();
+      } catch {
+        /* overlay is best-effort */
+      }
       // Stop the timer once the last PR phase is over.
       try {
         if (listFeaturePrOwners().length === 0 && reconcileTimer) {
@@ -4824,12 +5824,18 @@ function armReconcileTimer(pi: ExtensionAPI, ctx: ExtensionContext): void {
  * The Feature chain
  * ------------------------------------------------------------------ */
 
-/** Feature dirs with a chain in flight. One writer per Feature, enforced. */
+/** Feature dirs with a chain in flight. One chain in the process, enforced. */
 const RUNNING_CHAINS = new Set<string>();
 
 /**
- * Run `body` only if this Feature has no chain in flight; `false` means it was
- * refused and `body` never ran.
+ * Run `body` only if no chain is in flight anywhere in this process; `false`
+ * means it was refused and `body` never ran.
+ *
+ * Occupancy is process-wide, not per Feature. A per-dir lock is how a fixer
+ * on Feature A and a planner on Feature B ran in the same parent session at
+ * once: different keys, both acquired, both children live. One parent, one
+ * chain. The key is still the Feature dir so release matches acquire after a
+ * rename.
  *
  * The lock has to be taken before anything else touches the Feature. The TUI
  * fires a slash command without awaiting the previous one, and the guard used
@@ -4855,7 +5861,7 @@ export async function withChainLock(
   featureDir: string,
   body: () => Promise<unknown>,
 ): Promise<boolean> {
-  if (RUNNING_CHAINS.has(featureDir)) return false;
+  if (RUNNING_CHAINS.size > 0) return false;
   RUNNING_CHAINS.add(featureDir);
   try {
     await body();
@@ -4926,6 +5932,7 @@ async function runFeatureChain(
   // flight. Without this the loop below would pick that Task first and run
   // it a second time over work that is already on the branch.
   if (!(await reconcileOrphanTask(pi, ctx, paths, name, worktree))) return;
+  refreshFeatureOverlay(paths, ctx);
   for (;;) {
     let plan = readText(paths.planFile);
     const reopened = reopenTasksThatNeverStarted(plan, paths.handoffsDir);
@@ -4933,6 +5940,15 @@ async function runFeatureChain(
       writeText(paths.planFile, reopened);
       plan = reopened;
       uiNotify(ctx, `Reopened Task(s) that never started (no handoff).`, "info");
+    }
+    const porcelain = await porcelainStatus(pi, worktree);
+    const treeDirty = porcelain === undefined || Boolean(porcelain.trim());
+    const recovered = applyBlockedReconcile(plan, paths.handoffsDir, treeDirty);
+    if (recovered.changed) {
+      writeText(paths.planFile, recovered.plan);
+      plan = recovered.plan;
+      uiNotify(ctx, `Blocked Task problem is gone — continuing the chain.`, "info");
+      refreshFeatureOverlay(paths, ctx);
     }
     const tasks = parseTasks(plan);
 
@@ -4969,8 +5985,7 @@ async function runFeatureChain(
         return;
       }
 
-      const worker = workerFor(task.complexity) ?? WORKERS.simple;
-      writeText(paths.planFile, setTaskStatusInPlan(plan, task.id, "in_progress"));
+      const worker = workerFor(task.complexity) ?? writerSpec("simple");
       const planNow = readText(paths.planFile);
       const body = taskSection(planNow, task.id);
       const branch = planHeaderField(planNow, "Branch");
@@ -5001,6 +6016,15 @@ async function runFeatureChain(
         return;
       }
 
+      const readiness = await ensureTaskBaseline(paths, { id: task.id, body, cwd: writerCwd }, async reason => {
+        uiNotify(ctx, `Task ${task.id} needs plan reconciliation: ${reason}. Reviewing the execution checkout before dispatch.`, "info");
+        upsertStatusFile(paths, { nextAction: `Reconcile Task ${task.id}: ${reason}` });
+        return reviewPlan(pi, ctx, paths, name, writerCwd);
+      });
+      if (readiness === "blocked") return;
+      if (readiness === "refreshed") continue; // Reviewer may have regrouped pending Tasks.
+      if (isPaused(readText(paths.statusFile))) return;
+      writeText(paths.planFile, setTaskStatusInPlan(readText(paths.planFile), task.id, "in_progress"));
       upsertStatusFile(paths, {
         phase: "implementing",
         activeTask: task.id,
@@ -5008,6 +6032,7 @@ async function runFeatureChain(
         nextAction: `tdd-worker Task ${task.id} (${worker.short})`,
         tasks: parseTasks(planNow),
       });
+      refreshFeatureOverlay(paths, ctx);
       uiNotify(ctx, 
         `Task ${task.id} — ${task.title}\n${worker.short} · ${task.complexity ?? "simple (default)"}\ncwd ${writerCwd}`,
         "info",
@@ -5032,6 +6057,7 @@ async function runFeatureChain(
 
       const after = readText(paths.planFile);
       const handoff = join(paths.handoffsDir, `task-${task.id}.md`);
+      recordTaskHandoff(paths, task, outcome);
       // A child this extension stopped (`/orchestrate pause now`) is not a
       // failed Task. Leaving it `blocked` would make `/orchestrate resume`
       // hit the blocked guard above and refuse forever.
@@ -5047,7 +6073,7 @@ async function runFeatureChain(
           nextAction: "/orchestrate resume",
           tasks: parseTasks(readText(paths.planFile)),
         });
-        uiNotify(ctx, 
+        uiNotify(ctx,
           `Task ${task.id} stopped and left pending on ${name}.\n/orchestrate resume re-runs it from the start.`,
           "info",
         );
@@ -5084,6 +6110,26 @@ async function runFeatureChain(
         uiNotify(ctx, `Task ${task.id} was not committed by its worker; code committed it.`, "info");
       }
 
+      const mismatch = workerPlanMismatch(outcome);
+      if (mismatch) {
+        const refreshFile = join(paths.handoffsDir, `task-${task.id}-refresh-count`);
+        const attempts = Number(readText(refreshFile).trim()) || 0;
+        const exhausted = attempts >= 2;
+        writeText(paths.planFile, setTaskStatusInPlan(readText(paths.planFile), task.id, exhausted ? "blocked" : "pending"));
+        upsertStatusFile(paths, {
+          phase: exhausted ? "blocked" : "implementing", activeTask: "none", workerRunId: "none", workerRunDir: "none", taskBase: "none",
+          nextAction: `Task ${task.id} needs plan refresh: ${mismatch}${exhausted ? "; automatic reconciliation limit reached" : ""}`,
+          tasks: parseTasks(readText(paths.planFile)),
+        });
+        if (exhausted) {
+          uiNotify(ctx, `Task ${task.id} still disagrees with its plan after two reconciliations: ${mismatch}. See ${handoff}.`, "error");
+          return;
+        }
+        writeText(refreshFile, String(attempts + 1));
+        if (!await reviewPlan(pi, ctx, paths, name, writerCwd)) return;
+        continue;
+      }
+
       // Fingerprint after the child, before deciding fail vs continue. A
       // harness fail with a changed worktree is a false fail when
       // autoAdvanceOnLanded is on (default): the work landed, so the next
@@ -5093,7 +6139,7 @@ async function runFeatureChain(
       // A Task with a runnable `- Command:` was graded by the host, so
       // `outcome.ok` is a verified fact about the code and not the child's
       // opinion of itself. That changes what a failure means (F13).
-      const gated = Boolean(taskGateCommand(body));
+      const gated = Boolean(taskChecks(body)?.length || taskGateCommand(body));
       const gateResult = taskGateResult({ gated, ok: outcome.ok });
       const handoffLine = `${handoff}  gate: ${gateResult}`;
       if (!outcome.ok) {
@@ -5115,9 +6161,13 @@ async function runFeatureChain(
             activeTask: "none",
             tasks: parseTasks(readText(paths.planFile)),
           });
-          uiNotify(ctx, 
-            `Task ${task.id} succeeded; harness reported failed. Work landed — continuing.\n` +
-              `Handoff: ${handoff}`,
+          refreshFeatureOverlay(paths, ctx);
+          uiNotify(
+            ctx,
+            formatTodoProgress(
+              paths,
+              `Task ${task.id} succeeded; harness reported failed. Work landed — continuing.\nHandoff: ${handoff}`,
+            ),
             "info",
           );
           if (isPaused(readText(paths.statusFile))) {
@@ -5158,6 +6208,7 @@ async function runFeatureChain(
         return;
       }
 
+      recordCompletedInputs(paths, { id: task.id, body, cwd: writerCwd }, worktree);
       const settle = settleTaskOutcome({
         ok: outcome.ok,
         stopped: outcome.stopped,
@@ -5180,9 +6231,13 @@ async function runFeatureChain(
           activeTask: "none",
           tasks: parseTasks(readText(paths.planFile)),
         });
-        uiNotify(ctx, 
-          `Task ${task.id} done (worktree unchanged — host-side edits still count). Next Task.\n` +
-            `Handoff: ${handoff}`,
+        refreshFeatureOverlay(paths, ctx);
+        uiNotify(
+          ctx,
+          formatTodoProgress(
+            paths,
+            `Task ${task.id} done (worktree unchanged — host-side edits still count). Next Task.\nHandoff: ${handoff}`,
+          ),
           "info",
         );
         if (isPaused(readText(paths.statusFile))) {
@@ -5204,7 +6259,12 @@ async function runFeatureChain(
         activeTask: "none",
         tasks: parseTasks(readText(paths.planFile)),
       });
-      uiNotify(ctx, `Task ${task.id} done (gate: ${gateResult}).`, "info");
+      refreshFeatureOverlay(paths, ctx);
+      uiNotify(
+        ctx,
+        formatTodoProgress(paths, `Task ${task.id} done (gate: ${gateResult}).`),
+        "info",
+      );
 
       if (isPaused(readText(paths.statusFile))) {
         upsertStatusFile(paths, { phase: "paused", nextAction: "/orchestrate resume" });
@@ -5216,13 +6276,27 @@ async function runFeatureChain(
 
     // ---- No Tasks left: QA owed? ----
     const status = readText(paths.statusFile);
+    const unfinished = tasks.filter((t) => t.status !== "done");
+    if (unfinished.length) {
+      upsertStatusFile(paths, {
+        phase: "implementing",
+        nextAction: `Task ${unfinished[0]!.id} is ${unfinished[0]!.status} — not feature-qa`,
+      });
+      uiNotify(
+        ctx,
+        `Not starting feature-qa: Task ${unfinished[0]!.id} is ${unfinished[0]!.status}.`,
+        "error",
+      );
+      return;
+    }
     if (needsFeatureQa(status)) {
       const { pass, cap } = qaPassState(status);
       upsertStatusFile(paths, {
         phase: "feature-qa",
         nextAction: `feature-qa pass ${pass + 1}/${cap}`,
       });
-      uiNotify(ctx, `All Tasks done on ${name}. feature-qa ${pass + 1}/${cap} (xai/grok-4.6 high)…`, "info");
+      refreshFeatureOverlay(paths, ctx);
+      uiNotify(ctx, `All Tasks done on ${name}. feature-qa ${pass + 1}/${cap} (${qaModelFor("feature-qa").replace(":", " ")})…`, "info");
 
       let added = await runFeatureQa(pi, ctx, paths, name, worktree);
       // One automatic retry (F12). A QA child that dies in transport or misses
@@ -5236,12 +6310,27 @@ async function runFeatureChain(
       // a failed QA satisfy the cap, and the next `/orchestrate resume` would
       // walk straight past QA into the PR.
       if (added < 0) return; // QA itself failed twice; runFeatureQa already reported.
-      upsertStatusFile(paths, { qaPass: String(pass + 1) });
+      upsertStatusFile(paths, {
+        qaPass: String(pass + 1),
+        tasks: parseTasks(readText(paths.planFile)),
+      });
+      refreshFeatureOverlay(paths, ctx);
       if (added > 0) {
-        uiNotify(ctx, `feature-qa added ${added} remediation Task(s). Continuing.`, "info");
+        uiNotify(
+          ctx,
+          formatTodoProgress(
+            paths,
+            `feature-qa added ${added} remediation Task(s). Next tdd-worker implements them.`,
+          ),
+          "info",
+        );
         continue;
       }
-      uiNotify(ctx, "feature-qa found nothing to fix.", "info");
+      uiNotify(
+        ctx,
+        formatTodoProgress(paths, "feature-qa found nothing to fix."),
+        "info",
+      );
       continue;
     }
 
@@ -5323,7 +6412,7 @@ export async function reconcileOrphanTask(
     snapshot,
     landed,
     autoAdvanceOnLanded(readText(paths.statusFile)),
-    Boolean(taskGateCommand(taskSection(readText(paths.planFile), task.id))),
+    Boolean(taskChecks(taskSection(readText(paths.planFile), task.id))?.length || taskGateCommand(taskSection(readText(paths.planFile), task.id))),
   );
   const plan = readText(paths.planFile);
   const cleared = { workerRunId: "none", workerRunDir: "none", taskBase: "none" } as const;
@@ -5397,9 +6486,9 @@ export async function reconcileOrphanTask(
 
 /**
  * The QA child's launch contract. Its model comes from `qaModelFor`, which
- * reads `orchestrate.json` — the reviewer model is configured in one place,
- * and the spawn policy checks that same value, so a launch cannot disagree
- * with the scope it will be judged against.
+ * reads `orchestrate.json` — `qaReviewer` for feature-qa and qa-opus —
+ * and the spawn policy checks that same value, so a launch
+ * cannot disagree with the scope it will be judged against.
  */
 export function qaLaunchParams(
   paths: Paths,
@@ -5559,22 +6648,6 @@ export function parseOpenedPr(text: string): { pr: string; url?: string } | unde
   return labeled?.[1] ? { pr: labeled[1] } : undefined;
 }
 
-export function resolveOpenedPr(input: {
-  structured?: { opened?: boolean; pr?: unknown; url?: unknown } | null;
-  summary?: string;
-  handoff?: string;
-}): { pr: string; url?: string } | undefined {
-  const fromStruct = normalizePrNumber(input.structured?.pr);
-  if (fromStruct) {
-    const resolved: { pr: string; url?: string } = { pr: fromStruct };
-    if (typeof input.structured?.url === "string" && input.structured.url.trim()) {
-      resolved.url = input.structured.url.trim();
-    }
-    return resolved;
-  }
-  return parseOpenedPr(input.summary ?? "") || parseOpenedPr(input.handoff ?? "");
-}
-
 /** Current-branch PR already on GitHub. One-shot; the waiter still owns merge. */
 export async function discoverBranchPr(
   pi: ExtensionAPI,
@@ -5682,12 +6755,17 @@ export async function openFeaturePr(
     }
   };
 
-  // 1. Nothing uncommitted. A writer that edited and did not commit produces a
-  // PR that is missing the work it was opened for (F11).
+  // 1. Nothing uncommitted except toolchain noise. Darwin Cargo.lock is not
+  // Feature work and is not pushed; a writer that edited and did not commit
+  // real files still produces a PR missing that work (F11).
   const porcelain = await git(["status", "--porcelain"]);
   if (porcelain.code === 0 && String(porcelain.stdout ?? "").trim()) {
-    const files = String(porcelain.stdout).trim().split("\n").slice(0, 8).join("; ");
-    return { reason: `uncommitted changes in ${worktree}: ${files}` };
+    const text = String(porcelain.stdout);
+    const real = meaningfulDirtyPaths(text);
+    if (real.length > 0) {
+      const files = real.slice(0, 8).join("; ");
+      return { reason: `uncommitted changes in ${worktree}: ${files}` };
+    }
   }
 
   // 2. Something to review. `origin/<base>` is refreshed first, or the count
@@ -5753,8 +6831,24 @@ async function landFeaturePr(
   name: string,
   worktree: string,
 ): Promise<void> {
-  let pr = normalizePrNumber(statusField(readText(paths.statusFile), "pr"));
+  const status = readText(paths.statusFile);
+  const blocked = featurePrDriveBlocked(status);
+  if (blocked) {
+    uiNotify(ctx, `${name}: ${blocked}`, "info");
+    return;
+  }
+  const plan = readText(paths.planFile);
+  const branch =
+    statusField(status, "branch") || planHeaderField(plan, "Branch") || "";
+  const prRepo = featurePrRepo(plan, paths.repo);
+  if (prRepo && prRepo !== paths.repo) {
+    const right = await ensureRepoWorktree(pi, prRepo, branch);
+    if (right) worktree = right;
+  }
+  let pr = normalizePrNumber(statusField(status, "pr"));
   let url: string | undefined;
+  const recorded = statusField(status, "pr");
+  if (/https:\/\/github\.com\//i.test(recorded)) url = recorded.trim();
 
   // Resume / a previous open that did not record the number: branch is source of truth.
   if (!pr) {
@@ -5790,7 +6884,7 @@ async function landFeaturePr(
     }
   }
 
-  upsertStatusFile(paths, { pr, nextAction: `pr-await ${pr}` });
+  upsertStatusFile(paths, { pr: url || pr, nextAction: `pr-await ${pr}` });
   uiNotify(
     ctx,
     `PR ${pr}${url ? ` — ${url}` : ""} is open. Handing to ghl-pr-await (event-driven, 0 tokens).`,
@@ -5827,26 +6921,6 @@ async function landFeaturePr(
   });
 }
 
-export function gitWorkflowBlock(paths: Paths, worktree?: string): string {
-  const farm = worktreeFarmFor(paths.repo);
-  const wt = worktree || `(status.md worktree — must be under ${basename(farm)})`;
-  const refNote = isReferenceCheckout(paths.gitRoot)
-    ? `${paths.gitRoot} is a **reference checkout** (read-only). Do not use it as cwd.`
-    : `${paths.gitRoot} may be used only to run \`git wt\`; product work still happens in ${basename(farm)}.`;
-  return `## Feature git-workflow — role split
-
-Canonical skill: ${GIT_WORKFLOW_SKILL}
-Cite that path. Do not paste wt/await/land steps into a handoff.
-
-**Worktree:** REQUIRED cwd \`${wt}\` under \`${farm}/\` or another \`~/Dev/git/*-wt/\` farm. Never a reference checkout. ${refNote}
-Parent already ran \`git wt <branch>\` (or reused the farm). Do **not** \`git wt\` again. If \`${wt}\` is missing or is a reference checkout: **STOP**. Do not implement in ${paths.gitRoot}.
-tdd-worker and fixer must NOT \`git wt\`, must NOT open a PR, must NOT \`git pr-await\`.
-
-**After Tasks + QA cap:** code runs \`gh pr create\` (not a tdd-worker) and \`git pr-await\` once. A judgment \`next=\` on this Feature's PR (\`read_comments_and_fix\`, \`investigate_dead_reviewers\`, \`fix_command_or_environment\`) is then dispatched by this extension, not by you: a review fix spawns one \`fixer\` in the Feature worktree, and code runs \`git pr-await\` once after that writer settles. A later undelivered \`read_comments_and_fix\` spawns another fixer — code keeps doing that until the waiter lands or the user merges. Never stop while review data still says there are current-head findings to fix. The parent session stays idle — it does not repair review findings and does not run \`git pr-await\` itself. Never \`gh pr merge\`. Never \`git worktree add\`. Never pipe/timeout/--once on \`git pr-await\`.
-One Feature = one worktree = one branch = one PR. Never a draft. Never a PR per Task. If a Task is blocked, stop.
-`;
-}
-
 /** Phases in which a Feature actually owns a writer and a branch. */
 const IDLE_PARENT_PHASES = new Set(["implementing", "feature-qa", "pr"]);
 
@@ -5874,7 +6948,39 @@ function samePath(a: string, b: string): boolean {
  *
  * `root` is injectable so tests never walk the live `~/orchestrator`.
  */
-export function liveFeatureNeedsIdleParent(cwd: string, root?: string): boolean {
+function featureVisibleInCwd(
+  row: { live: boolean; status: string },
+  cwd: string,
+  gitRoot: string,
+  session: SessionIdentity | undefined,
+  mode: "idle" | "parent",
+): boolean {
+  if (!row.live) return false;
+  const identified = Boolean(session?.id || session?.file);
+  if (identified && !sessionOwnsFeature(row.status, session ?? {})) return false;
+  const worktree = statusField(row.status, "worktree");
+  const hasWt = Boolean(worktree) && !isPendingToken(worktree);
+  const inWorktree = hasWt && samePath(cwd, worktree);
+  const inRoot = samePath(cwd, gitRoot);
+  if (!identified) {
+    // No session identity: only the Feature worktree is unambiguous. The repo
+    // root is shared by every chat in the project.
+    return Boolean(inWorktree);
+  }
+  if (mode === "idle") {
+    // F8: Stay idle belongs to the writer cwd. The owning parent sits in the
+    // reference checkout and must still be allowed to talk.
+    if (hasWt) return Boolean(inWorktree);
+    return inRoot;
+  }
+  return Boolean(inWorktree || inRoot);
+}
+
+export function liveFeatureNeedsIdleParent(
+  cwd: string,
+  root?: string,
+  session?: SessionIdentity,
+): boolean {
   if (!cwd) return false;
   // `repoKey` is the one that resolves a worktree farm (`ice-wt/feat-foo` →
   // `icemining`); `guessRepoFromCwd` deliberately returns "" for a farm, which
@@ -5894,13 +7000,105 @@ export function liveFeatureNeedsIdleParent(cwd: string, root?: string): boolean 
   };
   const gitRoot = join(REF_ROOT, repo);
   return discoverFeatures(paths).some((row) => {
-    if (!row.live) return false;
     const phase = (statusField(row.status, "phase") || "").toLowerCase();
     if (!IDLE_PARENT_PHASES.has(phase)) return false;
-    const worktree = statusField(row.status, "worktree");
-    if (worktree && !isPendingToken(worktree)) return samePath(cwd, worktree);
-    // No worktree recorded: the repo root is the only place it can be working.
-    return samePath(cwd, gitRoot);
+    return featureVisibleInCwd(row, cwd, gitRoot, session, "idle");
+  });
+}
+
+/** This cwd's repo has a live Feature whose plan-reviewer is still in flight. */
+export function liveFeaturePlanReviewRunning(
+  cwd: string,
+  root?: string,
+  session?: SessionIdentity,
+): boolean {
+  if (!cwd) return false;
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir,
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(repoDir, "archive"),
+  };
+  const gitRoot = join(REF_ROOT, repo);
+  return discoverFeatures(paths).some((row) => {
+    if (planReviewState(row.status) !== "running") return false;
+    return featureVisibleInCwd(row, cwd, gitRoot, session, "parent");
+  });
+}
+
+/**
+ * Orchestrate parent sits in the reference checkout, not the Feature worktree.
+ * Unlike Stay idle (F8), this prompt must reach the reference-checkout parent
+ * so it does not reprint the overlay as markdown after every Task, including
+ * when the chain is blocked or paused waiting for resume.
+ */
+export function liveFeatureTaskChain(
+  cwd: string,
+  root?: string,
+  session?: SessionIdentity,
+): boolean {
+  if (!cwd) return false;
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir,
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(repoDir, "archive"),
+  };
+  const gitRoot = join(REF_ROOT, repo);
+  return discoverFeatures(paths).some((row) => {
+    const phase = (statusField(row.status, "phase") || "").toLowerCase();
+    if (
+      phase !== "implementing" &&
+      phase !== "feature-qa" &&
+      phase !== "blocked" &&
+      phase !== "paused" &&
+      phase !== "pr"
+    ) {
+      return false;
+    }
+    return featureVisibleInCwd(row, cwd, gitRoot, session, "parent");
+  });
+}
+
+/** Plan-reviewer finished; human has not approved. Overlay is the board. */
+export function liveFeatureAwaitingApprove(
+  cwd: string,
+  root?: string,
+  session?: SessionIdentity,
+): boolean {
+  if (!cwd) return false;
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir,
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(repoDir, "archive"),
+  };
+  const gitRoot = join(REF_ROOT, repo);
+  return discoverFeatures(paths).some((row) => {
+    if (planReviewState(row.status) !== "done") return false;
+    if (!isDraft(row.plan) || isApproved(row.plan)) return false;
+    return featureVisibleInCwd(row, cwd, gitRoot, session, "parent");
   });
 }
 
@@ -5909,71 +7107,257 @@ export function liveFeatureNeedsIdleParent(cwd: string, root?: string): boolean 
  * models skip the read (git-workflow-guard.ts documents that). Citing the path
  * is not enough — this block is the skill, inlined, for the sessions that need it.
  */
+/** This session owns a Feature sitting in `phase: pr`. Code owns the wait. */
+export function liveFeatureAwaitingPr(
+  cwd: string,
+  root?: string,
+  session?: SessionIdentity,
+): boolean {
+  if (!cwd) return false;
+  const repo = repoKey(cwd) || guessRepoFromCwd(cwd) || repoNameFromGitRoot(cwd) || "";
+  if (!repo) return false;
+  const repoDir = join(root ?? ORCH_ROOT, repo);
+  const paths: Paths = {
+    repo,
+    gitRoot: cwd,
+    repoDir,
+    featureDir: "",
+    planFile: "",
+    statusFile: "",
+    handoffsDir: "",
+    archiveDir: join(repoDir, "archive"),
+  };
+  const gitRoot = join(REF_ROOT, repo);
+  return discoverFeatures(paths).some((row) => {
+    if ((statusField(row.status, "phase") || "").toLowerCase() !== "pr") return false;
+    return featureVisibleInCwd(row, cwd, gitRoot, session, "parent");
+  });
+}
+
 export function parentGitWorkflowAppend(input: {
   featureLive?: boolean;
   latchWake?: boolean;
+  planReviewRunning?: boolean;
+  taskChain?: boolean;
+  awaitingApprove?: boolean;
+  awaitingPr?: boolean;
+  featureLanded?: boolean;
 }): string | undefined {
-  if (!input.featureLive && !input.latchWake) return undefined;
-  const parts = [
-    `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`,
-  ];
+  if (
+    !input.featureLive &&
+    !input.latchWake &&
+    !input.planReviewRunning &&
+    !input.taskChain &&
+    !input.awaitingApprove &&
+    !input.awaitingPr &&
+    !input.featureLanded
+  ) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  if (input.featureLanded) {
+    parts.push(
+      [
+        "A Feature PR this session owned just landed in code.",
+        "One short confirmation to the user.",
+        "Do not use tools. Do not read files. Do not reprint the overlay.",
+        "Do not run git pr-land or git wt-rm.",
+      ].join(" "),
+    );
+  }
+  if ((input.featureLive || input.latchWake) && !input.featureLanded) {
+    parts.push(
+      `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`,
+    );
+  }
   if (input.featureLive) {
     parts.push(FORBIDDEN);
     parts.push(
       "A live /orchestrate Feature owns PR work in this session. Stay idle: do not implement product code, do not repair review findings, do not run git pr-await. Code dispatches one fixer per current-head verdict and keeps dispatching while review data still says read_comments_and_fix.",
     );
   }
+  if (input.planReviewRunning) {
+    parts.push(
+      [
+        "plan-reviewer is still running. Stay quiet.",
+        "Do NOT summarize the plan as a Task table, todo list, or slice board.",
+        "Do NOT suggest or run /orchestrate approve.",
+        "Do NOT present Approve with: or an approve command.",
+        "One short line is enough: plan-reviewer is running; wait.",
+        "The rpiv-todo overlay already shows Plan draft, Plan review, and Approve. Do not reprint it. Planned Tasks appear on the overlay only after plan_review is done.",
+      ].join(" "),
+    );
+  }
+  if (input.taskChain) {
+    parts.push(
+      [
+        "A Feature is running Tasks in this repo.",
+        "The rpiv-todo overlay above the editor is the todo list (each Task shows simple|critical and tdd-worker model:thinking).",
+        "Do not reprint it as markdown, a table, or a slice board.",
+        "Do not call the todo tool — code projects Feature state into the overlay.",
+        "Do not spawn tdd-worker; the extension does.",
+      ].join(" "),
+    );
+  }
+  if (input.awaitingApprove) {
+    parts.push(
+      [
+        "plan-reviewer is done. Waiting for the human to approve.",
+        "The rpiv-todo overlay above the editor is the board.",
+        "Do NOT summarize the plan as a Task table, todo list, or slice board.",
+        "Do not call the todo tool.",
+        "Do not start Tasks. The TUI card and /orchestrate approve are the next step.",
+      ].join(" "),
+    );
+  }
+  if (input.awaitingPr) {
+    parts.push(
+      [
+        "This session owns a Feature whose PR is still open.",
+        "Code owns git pr-await, review-fix writers, and land.",
+        "Do not report the Feature done while the PR is open.",
+        "Do not stop, yield-and-forget, or start unrelated work that abandons this wait.",
+        "If you are about to stop, stay idle: the next user message is injected by code (pr-latch) when the PR merges, closes, or needs a fixer.",
+        "When pr-latch says the PR merged, confirm that to the user. Do not run git pr-land or git wt-rm.",
+      ].join(" "),
+    );
+  }
   return parts.join("\n\n");
 }
 
-export function plannerLaunchParams(paths: Paths, objective: string): Record<string, unknown> {
+export function plannerLaunchParams(paths: Paths, objective: string, baseline = ""): Record<string, unknown> {
   return {
     agent: "planner",
-    task: plannerBody(paths, objective),
+    task: plannerBody(paths, objective, baseline),
     context: "fresh",
+    // Every other launcher pins its child's cwd; the planner's was unset, so it
+    // inherited whatever the session was rooted at and opened a
+    // home-directory grep that timed out and lost the run. Planning reads the
+    // reference checkout — it never edits it (`git wt` is the writer's job).
+    cwd: paths.gitRoot,
     model: PLANNER_MODEL,
     output: join(paths.handoffsDir, "plan-run.md"),
     outputMode: "inline",
     timeoutMs: CHILD_TIMEOUT_MS,
     turnBudget: PLANNER_TURN_BUDGET,
+    // `planner.md` declares `acceptanceRole: writer` and this task says
+    // "overwrite plan.md", so an omitted acceptance is inferred as `checked` —
+    // whose required evidence includes `tests-added`. A planner forbidden from
+    // touching product code cannot produce that, so it was rejected on every
+    // run; `planned.ok` came back false and the plan path returned before
+    // naming the Feature or starting plan-reviewer. The plan files were
+    // complete and the Feature was stranded at `pending` anyway.
+    acceptance: {
+      level: "none",
+      reason: "planner writes plan.md/status.md only; no product code, no tests",
+    },
   };
 }
 
-function plannerBody(paths: Paths, objective: string): string {
-  return `You are \`planner\` on xai/grok-4.6 thinking high. Do NOT implement product code.
+/** git wt starts at the remote default branch, not a dirty canonical HEAD. */
+export async function planningBase(pi: ExtensionAPI, cwd: string): Promise<string> {
+  const fetch = await pi.exec("git", ["fetch", "origin"], { cwd, timeout: 120_000 });
+  if (fetch.code !== 0) throw new Error(`Cannot refresh planning base: ${fetch.stderr}`);
+  const ref = `refs/remotes/origin/${await defaultBaseBranch(pi, cwd)}`;
+  const result = await pi.exec("git", ["rev-parse", "--verify", `${ref}^{commit}`], { cwd, timeout: 30_000 });
+  if (result.code !== 0 || !/^[a-f0-9]{40,64}$/.test(result.stdout.trim())) throw new Error("Cannot resolve the execution base commit");
+  return result.stdout.trim();
+}
+
+function reviewedTasks(paths: Paths, worktree: string): ReviewedTask[] {
+  const plan = readText(paths.planFile);
+  return parseTasks(plan).filter(t => t.status !== "done").map(t => {
+    const body = taskSection(plan, t.id);
+    return { id: t.id, body, cwd: taskWorkerCwd(body, worktree, plan, planHeaderField(plan, "Branch")) };
+  });
+}
+
+function baselineFile(paths: Paths): string { return join(paths.featureDir, "plan-baseline.json"); }
+
+/** A stale packet returns to the reviewer before any writer is launched. */
+export async function ensureTaskBaseline(
+  paths: Paths, task: ReviewedTask, refresh: (reason: string) => Promise<boolean>,
+): Promise<"ready" | "refreshed" | "blocked"> {
+  const mismatch = baselineMismatch(readPlanBaseline(baselineFile(paths)), task);
+  if (!mismatch) return "ready";
+  return await refresh(mismatch) ? "refreshed" : "blocked";
+}
+
+export function workerHandoffText(outcome: ChildOutcome): string {
+  const results = outcome.raw?.results;
+  const texts = Array.isArray(results)
+    ? results.map(r => typeof r?.output === "string" && !r.output.startsWith("Output saved to:") ? r.output : typeof r?.summary === "string" ? r.summary : "").filter(Boolean)
+    : [];
+  return texts.join("\n\n") || outcome.summary || outcome.reason || "No inline worker handoff was returned.";
+}
+
+export function workerPlanMismatch(outcome: ChildOutcome): string {
+  const value = workerHandoffText(outcome).match(/^\s*Needs plan refresh:\s*(.+)$/im)?.[1]?.trim() ?? "";
+  return /^(none|no|n\/a)\b/i.test(value) ? "" : value;
+}
+
+function recordTaskHandoff(paths: Paths, task: Task, outcome: ChildOutcome): void {
+  const text = workerHandoffText(outcome);
+  writeText(join(paths.handoffsDir, `task-${task.id}.md`), `# Task ${task.id} — ${task.title}\n\n${text}\n`);
+}
+
+function recordCompletedInputs(paths: Paths, completed: ReviewedTask, worktree: string): void {
+  const baseline = readPlanBaseline(baselineFile(paths));
+  if (!baseline) return;
+  acceptCompletedDependency(baseline, completed, reviewedTasks(paths, worktree).filter(t => t.id !== completed.id));
+  writePlanBaseline(baselineFile(paths), baseline);
+}
+
+function plannerBody(paths: Paths, objective: string, baseline: string): string {
+  return `You are \`planner\` on the parent session model (inherit) with thinking high. Do NOT implement product code.
 Do NOT write plan files inside the git worktree. Do NOT use enter_plan_mode.
 
 Objective:
 ${objective}
+
+${baseline ? `Planning source commit: ${baseline}. Read tracked code/specs with \`rtk git show ${baseline}:path\` and discover files with \`rtk git ls-tree -r --name-only ${baseline}\`. The canonical working directory may be dirty or behind upstream; its file contents are NOT this baseline. Never call a source inventory stale until comparing it to this commit. Record this commit in the plan header.` : isHostBase(paths.repo) ? "Host-only source: read the supplied host directory. Code snapshots it into an isolated Git lane before review; there is no upstream remote to resolve." : "Resolve and record the intended upstream base commit before reading product code. If it differs from this checkout, use git show <commit>:path; do not plan from stale working files."}
 
 Durable location (mandatory):
 - ${paths.planFile}
 - ${paths.statusFile}
 - ${paths.handoffsDir}/
 
-This is one **Feature** (one branch, one PR) made of sequential **Tasks** (tdd-worker slices). 4–5 Tasks is typical; never more than ${MAX_TASKS}.
+This is one **Feature** (one branch, one PR) made of sequential **Tasks** (tdd-worker slices). Use as few coherent Tasks as the remaining work needs. Multiple acceptance scenarios may belong to one Task; there is no target Task count.
 
 The \`# Feature:\` title must be short and concrete (3–6 words). It becomes the unique Name and \`feat/<name>\` branch **after** you write the plan. Do **not** slug this objective. Leave \`> Name: pending\` and \`> Branch: pending\`.
 
 Every Task needs \`- Complexity: simple|critical\` **and** a matching \`- Worker: <model>, thinking <level>\` line so the plan and \`/todos\` show what will run.
-- **Most Tasks are simple** → \`Worker: ${WORKERS.simple.model}, thinking ${WORKERS.simple.thinking}\`
-- **critical** only when extra risk is identified (be extra careful) → \`Worker: ${WORKERS.critical.model}, thinking ${WORKERS.critical.thinking}\`
+- **Most Tasks are simple** → \`Worker: ${writerSpec("simple").model}, thinking ${writerSpec("simple").thinking}\`
+- **critical** only when extra risk is identified (be extra careful) → \`Worker: ${writerSpec("critical").model}, thinking ${writerSpec("critical").thinking}\`
 Do **not** derive Complexity from keyword lists or file counts.
 
-\`- Command:\` is executed on the host as this Task's red/green gate, so write it
-as **one single-line fenced command and nothing else** — no prose, no "then:",
-no "(red → green)" annotation, no second command in the same line. Caveats,
-platform notes, and multi-step recipes belong in \`- Implement:\` or \`- Red test:\`.
-A Task with no single runnable command must leave \`- Command:\` empty; it then
-falls back to evidence-based acceptance instead of running your sentence in a shell.
+Every Task must have \`- Checks:\` followed by a fenced JSON array. All entries are host-enforced, not prose.
+Each check has id, repository-relative cwd, argv (argument array, no shell pipeline), and runner (vitest, node, cargo, or command).
+Test checks require minTests >= 1. Named selections also need tests (exact names) and maxTests to detect accidental full-suite runs.
+Use direct \`pnpm exec vitest run\`, not \`pnpm test --\`. For cargo use one substring filter per check, never regex alternation. The host adds Vitest JSON / Node TAP reporting; do not add reporter flags.
+Non-test checks use runner: command and a reason. Separate focused RED/GREEN checks from final regression checks. Include all required checks here; Acceptance describes their verifiable meaning only.
+
 Examples of **simple**: add match arms + tests, TTL constants, inspector strings, pin a dep, rename, fixture.
 Examples of **critical**: money/accounting/payouts, auth/secrets, TOCTOU/races, hot-path/zero-alloc, wire/schema, hard to unwind.
 
 After each phase, append a few lines to ${paths.handoffsDir}/plan-progress.md so a human can tail progress. Write the real \`# Feature:\` title into plan.md as soon as you know it; do not leave the file as \`(planning)\` until the very end.
 
+Search scope — two roots, and nothing above them:
+- \`${paths.gitRoot}\` (the code; read it, never edit it)
+- \`${paths.featureDir}\` (this Feature's durable files)
+
+Never grep, find, or glob \`${homedir()}\`, \`~\`, or \`/\`. Those two roots have no
+common parent but the home directory, so a search "across the project" is a
+whole-home scan: minutes of nothing, and it has already lost a planning run.
+A file you cannot find under either root does not exist for this Feature — say
+so in \`plan-progress.md\` and move on. Never widen the search to locate it.
+
 ### Phase 1 — Spec & Context Discovery
-Read every spec referenced in AGENTS.md that is relevant. Cite anchors; do not paste specs.
-Read adjacent code. Identify reuse vs new. Planning may read a reference checkout; do not edit it.
+Read AGENTS.md and relevant referenced specs at the recorded source commit using git show; for a host-only Feature without Git, read them under \`${paths.gitRoot}\`.
+Most repos have no AGENTS.md — when this one does not, skip this step. Do not search for
+one outside \`${paths.gitRoot}\`; the copy in the home directory is not this repo's.
+Cite anchors; do not paste specs.
+Read adjacent code at the recorded baseline. Inventory existing behavior, missing behavior, and coverage gaps separately. Planning may inspect a reference checkout; do not edit it.
 
 ### Phase 2 — Clarification
 Use \`contact_supervisor\` (need_decision) until scope, contracts, and acceptance are clear. If already unambiguous, proceed.
@@ -5981,18 +7365,23 @@ Use \`contact_supervisor\` (need_decision) until scope, contracts, and acceptanc
 ### Phase 3 — Deep Analysis
 Architecture fit, impact/blast radius, correctness/invariants, security, performance, failure & concurrency.
 
-### Phase 4 — Tasks for one fresh \`tdd-worker\` (${WORKERS.simple.short}; ${WORKERS.critical.short} when critical)
-A Task is too big if: more than 10 named files to read; two ownership seams; contract > ~150 lines; you cannot name the exact files and the exact failing test; red+green cannot be one focused test command.
+### Phase 4 — Tasks for one fresh \`tdd-worker\` (${writerSpec("simple").short}; ${writerSpec("critical").short} when critical)
+Group by coherent code change and shared orientation, not one Task per test. Split at ownership boundaries or when the worker would need to make architecture decisions.
+Each task packet should contain roughly 30–80 useful lines: verified starting behavior, remaining delta, symbol-level reads, ordered implementation steps, tests with expected failure, and executable checks. File count alone is not a context budget.
+Resolve design choices in planning. Do not postpone a natural implementation merely to keep a later test red. A test for existing correct behavior is regression coverage, not an implementation Task.
 Sequential Tasks share **one** feature worktree (one writer). No per-Task PR.
-Each Task **must** be an H3 heading \`### Task N — title\` (em dash) or \`### Task N: title\` (colon). A numbered list under \`## Tasks\` is invisible to \`/orchestrate approve\`.
+Each Task **must** be an H3 heading \`### Task N — title\` (em dash) or \`### Task N: title\` (colon). A numbered list under \`## Tasks\` is invisible to the Task parser.
+TDD is mandatory for new or changed behavior: \`- Red test:\` states the exact test and expected behavioral failure. Existing behavior uses \`- Kind: verify\` with regression evidence; never manufacture a failure by removing correct code.
 
 ### Phase 5 — Write the living Feature plan + status
 Overwrite ${paths.planFile}:
 
-\`\`\`markdown
+\`\`\`\`markdown
 # Feature: [short 3–6 word title]
 
 > Status: DRAFT — awaiting approval
+> Baseline: ${baseline || "[exact upstream commit]"}
+> Readiness: pending
 > Name: pending
 > Branch: pending
 > Repo: ${paths.repo}
@@ -6018,16 +7407,24 @@ Overwrite ${paths.planFile}:
 ### Task 1 — [title]
 - Status: pending
 - Complexity: simple | critical
-- Worker: ${WORKERS.simple.model}, thinking ${WORKERS.simple.thinking}   # or ${WORKERS.critical.short} if critical
+- Worker: ${writerSpec("simple").model}, thinking ${writerSpec("simple").thinking}   # or ${writerSpec("critical").short} if critical
+- Kind: implement | verify
 - Goal: [one sentence]
-- Read: [\`file\`, \`file\`]
+- Files: ["src/file.ts", "test/file.test.ts", "package.json"]
+- Depends on: []
+- Starting state: [what already exists at the baseline; anticipated changes from named dependencies]
+- Read: [file::symbol and test::fixture/describe; bounded sections, not entire large files]
 - Do not read: [...]
 - Red test: [\`path::test\` proving X including rejection]
 - Repo: ${paths.repo}   # or icemining-devops / coins-minimal when this Task is not the Feature worktree
-- Command: \`rtk cargo test -p crate --lib the_test\`
-- Implement: [smallest change]
+- Implement: [ordered steps: exact symbols to change, existing helpers to reuse, assertions to update]
+- Checks:
+\`\`\`json
+[{"id":"focused","cwd":".","argv":["cargo","test","-p","crate","--lib","the_test"],"runner":"cargo","tests":["the_test"],"minTests":1,"maxTests":1}]
+\`\`\`
 - Invariants: […]
 - Out of task: […]
+- Acceptance: [all Checks pass; explain the behavior each proves]
 - Handoff: (orchestrator fills)
 
 ## Design Decisions
@@ -6038,13 +7435,16 @@ Overwrite ${paths.planFile}:
 
 ## Out of Scope
 - […]
-\`\`\`
+\`\`\`\`
 
-Also overwrite ${paths.statusFile} with repo/plan/feature, name: pending, branch: pending, phase: planning, active_task: none, worktree: none, pr: none, next_action: wait for named approve after # Feature: title exists, and a Tasks table.
+Also overwrite ${paths.statusFile} with repo/plan/feature, name: pending, branch: pending, phase: planning, active_task: none, worktree: none, pr: none, next_action: wait for plan-reviewer after # Feature: title exists, and a Tasks table.
 
-TDD: every Task is preceded by a described failing test; prove correctness and rejection; cite spec anchors.
+TDD is mandatory for implementation Tasks. Verification Tasks may start green:
+- For Kind: implement, \`- Red test:\` names the exact failing test (path, behavior, expected failure). For Kind: verify, name the regression tests and state that they may already pass. No placeholders.
+- \`- Implement:\` gives the smallest coherent change. Group related tests; do not require a separate worker for each scenario.
+- \`- Acceptance:\` refers to the executable Checks. Include relevant source, test, fixture, configuration, lockfile and instruction inputs in Files, including intended new files. Depends on lists earlier Tasks whose declared edits the Starting state anticipates. Other input changes force a stronger-agent review before dispatch.
 Present ${paths.planFile}. Stop. Do not implement.
-The next human step is \`/orchestrate approve <kebab-of-# Feature: title>\` — always the specific name, never a bare \`/orchestrate approve\`.
+Do not mention \`/orchestrate approve\`. Code starts plan-reviewer after you stop; the human approves only after that child finishes.
 `;
 }
 
@@ -6057,7 +7457,16 @@ export function reviewLaunchParams(
     agent: "plan-reviewer",
     task: [
       `Review ${paths.planFile} against the real code and specs for Feature ${featureName}.`,
-      `Apply high-confidence corrections to that plan.md now (wrong files, missing red tests, oversized Tasks, broken invariants, stale title).`,
+      `Review trigger: ${statusField(readText(paths.statusFile), "next_action") || "initial plan review"}. Read relevant completed/current Task handoffs in ${paths.handoffsDir}; fold verified facts and known baseline failures into the affected packets.`,
+      `Set > Readiness: ready only after all execution decisions are settled and every pending Task has executable Checks; otherwise set > Readiness: blocked and explain the missing decision. Preserve the plan's approval state.`,
+      `Apply high-confidence corrections to that plan.md now (wrong files, missing red tests, red tests out of scope, oversized Tasks, broken invariants, stale title, missing or unverifiable Acceptance).`,
+      `For every implementation Task, a real TDD red test exists (path, behavior, expected failure), in scope for this Task only; - Acceptance: is present, concrete, and verifiable through structured Checks. Existing behavior is Kind: verify and may already be green.`,
+      `Execution checkout: ${cwd}. Read its actual code. Resolve the input plan versus this checkout before approving recipes. Preserve existing ordering/security behavior unless the approved goal explicitly changes it.`,
+      `You may merge, remove, or regroup pending Tasks. Do not preserve a task count or delay a natural implementation to keep a later test red. Preserve completed Task IDs/status and their work.`,
+      `Each pending Task needs Kind (implement|verify), Files (JSON array of repo-relative source/test/config inputs), Depends on (JSON array of earlier task IDs), Starting state (already present plus expected dependency changes), symbol-level Read, precise remaining implementation steps, and Checks (fenced JSON array). Settle design choices; the worker should not reconstruct them.`,
+      `Checks entries: id, cwd (repo-relative), argv (no shell), runner (vitest|node|cargo|command). Tests require minTests >= 1; named selections require tests and maxTests. Command checks require reason. All required Acceptance commands must be Checks entries. Use direct pnpm exec vitest run; never pnpm test --. Cargo filters are substrings, not regex alternatives.`,
+      `Validate runner selection against an existing test in the same package when possible. Record actual selection/count and baseline failures. New tests need an expected failure assertion, not a claim that a nonexistent test ran. Do not chase unrelated suite failures or use shell pipelines that mask exit codes.`,
+      `Read only named code/specs in the execution checkout and this Feature directory, plus explicitly supplied external spec paths; do not search parent directories.`,
       `Do not implement product code. Do not edit anything outside ${dirname(paths.planFile)}.`,
       `Low-confidence / product decisions: contact_supervisor or an Open questions section — do not guess.`,
     ].join("\n"),
@@ -6068,6 +7477,15 @@ export function reviewLaunchParams(
     outputMode: "inline",
     timeoutMs: CHILD_TIMEOUT_MS,
     turnBudget: QA_TURN_BUDGET,
+    // Same defect as the planner: `plan-reviewer.md` is also
+    // `acceptanceRole: writer` and this task says "apply corrections to
+    // plan.md now", so an omitted acceptance infers `checked` and demands
+    // `tests-added` from a child that only edits a plan. A good review would
+    // have been recorded as `plan_review: failed`.
+    acceptance: {
+      level: "none",
+      reason: "plan-reviewer edits plan.md only; no product code, no tests",
+    },
   };
 }
 
@@ -6075,41 +7493,48 @@ export function reviewLaunchParams(
  * Await plan-reviewer. Never returns until that child settles. Callers must
  * hold the Feature chain lock so approve cannot start a writer in parallel.
  */
-async function reviewPlan(
+export async function reviewPlan(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   paths: Paths,
   featureName: string,
+  executionCwd?: string,
 ): Promise<boolean> {
   const branch =
     statusField(readText(paths.statusFile), "branch") ||
     planHeaderField(readText(paths.planFile), "Branch");
-  const existingWt =
-    (!isPendingToken(branch) &&
-      (await findExistingWorktree(pi, paths.gitRoot, branch))) ||
-    "";
-  const cwd =
-    existingWt && isAllowedWorktreePath(existingWt, paths.repo)
-      ? existingWt
-      : paths.gitRoot;
+  const cwd = executionCwd || await ensureFeatureWorktree(pi, ctx, paths, branch);
+  if (!cwd) return false;
+  const sourceDirs = [...new Set([cwd, ...reviewedTasks(paths, cwd).map(t => t.cwd)])];
+  const sourceStates = new Map(await Promise.all(sourceDirs.map(async dir => [dir, await worktreeFingerprint(pi, dir)] as const)));
+  const beforeReview = sourceStates.get(cwd)!;
+  if ([...sourceStates.values()].some(state => !state || state.split("\n").slice(1).some(line => line.trim()))) {
+    uiNotify(ctx, "Plan review needs a clean execution worktree. Existing edits are preserved; no reviewer or worker started.", "error");
+    return false;
+  }
+  const completed = parseTasks(readText(paths.planFile)).filter(t => t.status === "done");
+  const wasApproved = isApproved(readText(paths.planFile));
+  const reviewParams = reviewLaunchParams(paths, cwd, featureName);
+  reviewParams.task = `${reviewParams.task}\nExecution source commit: ${beforeReview.split("\n")[0]}. Reconcile all remaining recipes if the plan's baseline differs. Record this commit in the Baseline header.`;
+  reviewParams.task += `\nAdditional permitted execution roots (each pinned for this review):\n${[...sourceStates].map(([dir, state]) => `${dir} at ${state.split("\n")[0]}`).join("\n")}`;
   mkdirSync(paths.handoffsDir, { recursive: true });
   upsertStatusFile(paths, {
     phase: "reviewing",
     planReview: "running",
     reviewerRunId: "none",
     reviewerRunDir: "none",
-    nextAction: `plan-reviewer (xai/grok-4.6 high); wait to finish before Tasks`,
+    nextAction: `plan-reviewer (cursor/grok-4.6 high); do not approve until it finishes`,
   });
   uiNotify(
     ctx,
-    `Review ${featureName} (xai/grok-4.6 high) — high-confidence plan edits only\nread cwd ${cwd}`,
+    `Review ${featureName} (cursor/grok-4.6 high) — high-confidence plan edits only\nread cwd ${cwd}`,
     "info",
   );
   const review = await runChildInPhase(
     pi,
     ctx,
     "review",
-    reviewLaunchParams(paths, cwd, featureName),
+    reviewParams,
     // Recorded so a reviewer that dies with its session can be settled from
     // its own on-disk lifecycle file instead of wedging the Feature (F14).
     (runId) => upsertStatusFile(paths, { reviewerRunId: runId, reviewerRunDir: asyncRunDir(runId) }),
@@ -6129,12 +7554,42 @@ async function reviewPlan(
     );
     return false;
   }
+  try {
+    const tasksNow = reviewedTasks(paths, cwd);
+    for (const dir of new Set([cwd, ...tasksNow.map(t => t.cwd)])) {
+      if (!sourceStates.has(dir) || sourceStates.get(dir) !== await worktreeFingerprint(pi, dir)) {
+        throw new Error("execution checkout changed during review; review must be repeated on stable inputs");
+      }
+    }
+    const afterTasks = parseTasks(readText(paths.planFile));
+    if (planHeaderField(readText(paths.planFile), "Readiness") !== "ready") {
+      throw new Error("reviewer did not mark execution readiness ready");
+    }
+    if (completed.some(done => !afterTasks.some(t => t.id === done.id && t.status === "done" && t.title === done.title))) {
+      throw new Error("review changed completed Task identities or status");
+    }
+    const head = beforeReview.split("\n")[0]!;
+    const baseline = capturePlanBaseline(head, tasksNow.map(t => ({ ...t, sourceCommit: sourceStates.get(t.cwd)!.split("\n")[0] })));
+    const reviewed = upsertHeader(readText(paths.planFile), "Baseline", head);
+    writeText(paths.planFile, wasApproved ? markPlanApproved(reviewed) : reviewed);
+    writePlanBaseline(baselineFile(paths), baseline);
+  } catch (error) {
+    upsertStatusFile(paths, {
+      phase: "reviewing", planReview: "failed", reviewerRunId: "none", reviewerRunDir: "none",
+      nextAction: `plan readiness failed: ${String(error)}; /orchestrate review ${featureName}`,
+    });
+    uiNotify(ctx, `Plan is not ready for workers: ${String(error)}`, "error");
+    return false;
+  }
+  // Stay in `reviewing` until approve. `planning → implementing` is illegal;
+  // `reviewing → implementing` is the designed move. Resetting to planning
+  // here left Features APPROVED with Task 1 running and phase stuck.
   upsertStatusFile(paths, {
-    phase: "planning",
+    phase: "reviewing",
     planReview: "done",
     reviewerRunId: "none",
     reviewerRunDir: "none",
-    nextAction: `wait for /orchestrate approve ${featureName}`,
+    nextAction: wasApproved ? "continue remaining Tasks" : `wait for /orchestrate approve ${featureName}`,
   });
   return true;
 }
@@ -6220,6 +7675,13 @@ async function beginImplementation(
     );
     return;
   }
+  if (opts.approve) {
+    const blocked = approveBlockedByPlanReview(readText(paths.statusFile));
+    if (blocked) {
+      uiNotify(ctx, blocked, "error");
+      return;
+    }
+  }
   // The TUI fires a slash command without awaiting the previous one, so a
   // second `approve`/`resume`/`qa` would start a second chain over the same
   // plan.md and the same single-writer worktree. The lock is taken here —
@@ -6238,11 +7700,6 @@ async function beginImplementation(
           : `No Tasks found in ${paths.planFile}`,
         "error",
       );
-      return;
-    }
-    const tooMany = taskCountError(tasks.length);
-    if (tooMany) {
-      uiNotify(ctx, tooMany, "error");
       return;
     }
     // F16: APPROVED is written last, once nothing left can refuse — the
@@ -6265,6 +7722,7 @@ async function beginImplementation(
       worktree,
       tasks,
     });
+    refreshFeatureOverlay(paths, ctx);
 
     // An explicit `/orchestrate implement <task>` re-opens one Task, then the
     // chain carries on from there like any other run.
@@ -6290,7 +7748,8 @@ async function beginImplementation(
     if (!reconcilePlanReview(ctx, paths)) return;
 
     // Deterministic: never start tdd-worker until plan-reviewer has settled.
-    // If the user approved during review, wait here (run it) instead of overlapping.
+    // Approve itself is refused unless plan_review is done; resume/implement
+    // still run the reviewer here if the field is none/failed.
     if (needsPlanReview(readText(paths.planFile), readText(paths.statusFile))) {
       uiNotify(ctx, `Plan review is required before Tasks. Running plan-reviewer first…`, "info");
       const ok = await reviewPlan(pi, ctx, paths, named.name);
@@ -6341,8 +7800,8 @@ ${loc}
 /orchestrate pause now       also stop the running child immediately
 /orchestrate resume          unpause + continue auto loop
 /orchestrate status          all Features, Tasks, PRs
-/orchestrate review [feature]  xai/grok-4.6 high plan review; high-confidence plan edits
-/orchestrate qa [feature]      end QA: qa-opus xai/grok-4.6 high (auto feature-qa is xai/grok-4.6 high after Tasks 1..N)
+/orchestrate review [feature]  cursor/grok-4.6 high plan review; high-confidence plan edits
+/orchestrate qa [feature]      end QA: qa-opus cursor/grok-4.6 high (auto feature-qa is cursor/grok-4.6 high after Tasks 1..N)
 /orchestrate implement [feature] [task]   escape hatch: re-open one Task
 /orchestrate pr [feature]                 escape hatch: land the Feature PR
 
@@ -6356,18 +7815,21 @@ the session is never asked to implement; pr_round counts those fix writers.
 One chain per Feature: a second approve/resume while one is running is refused.
 autoAdvanceOnLanded (orchestrate.json, default true): harness fail + landed
 work → next Task. Override per Feature with auto_advance_on_landed in status.md.
-qaModel (orchestrate.json) is the ONE place the reviewer model is set — it
-drives feature-qa, qa-opus, and plan-reviewer launches and the spawn-policy
-pin alike. Changing it also needs modelScope.agents.* in settings.json.
+qaReviewer (orchestrate.json) is feature-qa and qa-opus (cursor/grok-4.6:high).
+planReviewer is plan-reviewer (cursor/grok-4.6:high). tddWorkerSimple / tddWorkerCritical
+are tdd-worker pins (openai-codex/gpt-5.6-luna xhigh). Planner inherits this session's model (\`inherit\`) and is not
+pinned to xai/grok-4.6. Changing those models also needs modelScope.agents.* in
+settings.json.
 Approve/resume/implement first settle a Task an earlier (now dead) session
 left in_progress: its run's own status.json plus git evidence decide done /
 re-run / blocked, and a worker that is still live is waited on, never doubled.
 
-Overlay: rpiv-todo /todos mirrors planner → plan-reviewer → Tasks → feature-qa.
+Overlay: Feature todos (complexity + tdd-worker model:thinking) are projected into the rpiv-todo panel.
 Approve is a TUI card after plan-reviewer finishes, not a fence. Tasks never overlap review.`;
 }
 
 export default function orchestrateExtension(pi: ExtensionAPI): void {
+  registerFeaturePrDispatch((ctx, owner, verdict) => dispatchFeaturePrVerdictForOwner(pi, ctx, owner, verdict), pi.events);
   overlayPi = pi;
   void loadCapabilityCeiling();
   void bindRpivTodoOverlaySink(pi);
@@ -6390,13 +7852,26 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
   // registration that silently replaced the overlay republish would be a very
   // quiet bug.
   pi.on("session_start", async (_event, ctx) => {
-    republishOverlay();
     lastCtx = ctx;
+    bindOverlayFromCommand(ctx);
+    republishOverlay();
+    armOverlayHeartbeat();
     // The durable half of the PR phase. A session starting anywhere is enough
     // to notice a merged PR, or a verdict the session that opened the PR never
     // lived to see (F1, F8).
     void reconcileLiveFeaturePrs(pi, ctx);
     armReconcileTimer(pi, ctx);
+  });
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (reconcileTimer) {
+      clearInterval(reconcileTimer);
+      reconcileTimer = undefined;
+    }
+    const id = sessionIdentityFrom(ctx).id;
+    if (id) {
+      overlayBySession.delete(id);
+      lastOverlayPaint.delete(id);
+    }
   });
   pi.on("session_compact", republishOverlay);
   pi.on("session_tree", republishOverlay);
@@ -6417,9 +7892,19 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       (typeof (ctx as { cwd?: string }).cwd === "string" && (ctx as { cwd?: string }).cwd) ||
       process.cwd();
     const prompt = typeof event.prompt === "string" ? event.prompt : "";
+    const session = sessionIdentityFrom(ctx);
+    const featureLanded =
+      /pr-latch:/.test(prompt) && /is complete|did not land/.test(prompt);
     const extra = parentGitWorkflowAppend({
-      featureLive: liveFeatureNeedsIdleParent(cwd),
-      latchWake: /pr-latch:|read_comments_and_fix/.test(prompt),
+      featureLive:
+        !featureLanded && liveFeatureNeedsIdleParent(cwd, undefined, session),
+      latchWake:
+        !featureLanded && /pr-latch:|read_comments_and_fix/.test(prompt),
+      planReviewRunning: liveFeaturePlanReviewRunning(cwd, undefined, session),
+      taskChain: !featureLanded && liveFeatureTaskChain(cwd, undefined, session),
+      awaitingApprove: liveFeatureAwaitingApprove(cwd, undefined, session),
+      awaitingPr: !featureLanded && liveFeatureAwaitingPr(cwd, undefined, session),
+      featureLanded,
     });
     if (!extra) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${extra}` };
@@ -6499,6 +7984,11 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         const plan = readText(feat.planFile);
         if (!plan.trim()) {
           uiNotify(ctx, `No plan at ${feat.planFile}`, "error");
+          return;
+        }
+        const blockedReview = approveBlockedByPlanReview(readText(feat.statusFile));
+        if (blockedReview) {
+          uiNotify(ctx, blockedReview, "error");
           return;
         }
         // F16: validate → lock → APPROVED → chain. Everything that can refuse
@@ -6593,7 +8083,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
             workerRunId: "none",
             nextAction: "/orchestrate resume",
           });
-          uiNotify(ctx, 
+          uiNotify(ctx,
             stopped
               ? `Stopped the running child and paused. /orchestrate resume to continue.`
               : `Pause armed; no live child to stop (worker_run_id=${runId || "none"}).`,
@@ -6601,7 +8091,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
           );
           return;
         }
-        uiNotify(ctx, 
+        uiNotify(ctx,
           inflight
             ? `Pause armed. Task ${inflight.id} will finish; next Task will not start.\n` +
                 `/orchestrate pause now <name> stops the running child immediately.`
@@ -6617,17 +8107,43 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         // Where the interruption suspended this Feature, when it recorded it.
         // Read before `pause: off`, which does not move the phase but is the
         // kind of write that makes ordering easy to get wrong later.
-        const restore = resumePhase(readText(feat.statusFile));
+        const statusNow = readText(feat.statusFile);
+        const restore = resumePhase(statusNow);
+        const openPr = normalizePrNumber(statusField(statusNow, "pr"));
         upsertStatusFile(feat, { pause: "off" });
 
         // A Feature interrupted at `pr` has every Task done, so deriving its
         // phase from the plan sends it back through the implementation chain
-        // — past a PR that is already open. The PR phase has an owner; hand it
-        // back to that owner instead.
-        if (restore === "pr") {
+        // — past a PR that is already open. Same if status.md was reseeded to
+        // planning while `pr:` still names an open pull request.
+        if (restore === "pr" || openPr) {
+          const wt = recoverFeatureWorktree({
+            repo: feat.repo,
+            name: basename(feat.featureDir),
+            worktree: statusField(statusNow, "worktree"),
+            branch: statusField(statusNow, "branch") || planHeaderField(readText(feat.planFile), "Branch"),
+          });
           uiNotify(ctx, `Resuming ${basename(feat.featureDir)} at its open PR`, "info");
-          upsertStatusFile(feat, { phase: "pr", nextAction: "resumed — reconciling the PR" });
+          // Explicit resume is the human saying try again. `ack` parks same
+          // findings on the same head so a waiter re-emit does not spawn
+          // forever; leaving last_findings set would make resume a no-op.
+          upsertStatusFile(feat, {
+            phase: "pr",
+            nextAction: "resumed — reconciling the PR",
+            lastFindings: "none",
+            ...(wt ? { worktree: wt } : {}),
+          });
           await reconcileLiveFeaturePrs(pi, ctx);
+          const waitCwd =
+            wt || statusField(readText(feat.statusFile), "worktree");
+          if (openPr && waitCwd && !isPendingToken(waitCwd)) {
+            armObservedLatch(ctx, {
+              pr: openPr,
+              cwd: waitCwd,
+              lastNext: "yield",
+              sessionId: sessionIdentityFrom(ctx).id,
+            }, pi.events);
+          }
           return;
         }
         uiNotify(
@@ -6646,7 +8162,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         const rows = discoverFeatures(paths);
         const row = want ? matchFeature(rows, want) : defaultFeature(rows);
         if (!row) {
-          uiNotify(ctx, 
+          uiNotify(ctx,
             want
               ? `No Feature matching "${want}". /orchestrate status to list.`
               : `No Feature to QA. /orchestrate <objective> first.`,
@@ -6664,8 +8180,8 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
           planHeaderField(row.plan, "Branch");
         const worktree = await ensureFeatureWorktree(pi, ctx, featPaths, branch);
         if (!worktree) return;
-        uiNotify(ctx, 
-          `End QA ${row.name} (qa-opus, xai/grok-4.6 high) → remediation Tasks\ncwd ${worktree}`,
+        uiNotify(ctx,
+          `End QA ${row.name} (qa-opus, ${qaModelFor("qa-opus").replace(":", " ")}) → remediation Tasks\ncwd ${worktree}`,
           "info",
         );
         let added = -1;
@@ -6685,11 +8201,22 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         }
         if (added < 0) return;
         if (added === 0) {
-          uiNotify(ctx, `qa-opus found nothing to fix on ${row.name}.`, "info");
+          refreshFeatureOverlay(featPaths, ctx);
+          uiNotify(
+            ctx,
+            formatTodoProgress(featPaths, `qa-opus found nothing to fix on ${row.name}.`),
+            "info",
+          );
           return;
         }
-        uiNotify(ctx, 
-          `qa-opus added ${added} remediation Task(s). Running them, then the Feature PR…`,
+        upsertStatusFile(featPaths, { tasks: parseTasks(readText(featPaths.planFile)) });
+        refreshFeatureOverlay(featPaths, ctx);
+        uiNotify(
+          ctx,
+          formatTodoProgress(
+            featPaths,
+            `qa-opus added ${added} remediation Task(s). Next tdd-worker implements them.`,
+          ),
           "info",
         );
         await beginImplementation(pi, ctx, featPaths);
@@ -6701,7 +8228,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         const rows = discoverFeatures(paths);
         const row = want ? matchFeature(rows, want) : defaultFeature(rows);
         if (!row) {
-          uiNotify(ctx, 
+          uiNotify(ctx,
             want
               ? `No Feature matching "${want}". /orchestrate status to list.`
               : `No Feature to review. /orchestrate <objective> first.`,
@@ -6728,7 +8255,15 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         }
         if (!reviewOk) return;
         presentDraftApproveCards(pi, ctx, featPaths);
-        uiNotify(ctx, `Review finished. ${featPaths.planFile}`, "info");
+        uiNotify(
+          ctx,
+          formatReviewReadyMessage(
+            featPaths,
+            row.name,
+            statusField(readText(featPaths.statusFile), "branch") || `feat/${row.name}`,
+          ),
+          "info",
+        );
         return;
       }
 
@@ -6744,7 +8279,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       // wording collides with a management verb.
       const objective = objectiveFrom(head, rest, raw);
       if (!objective) {
-        uiNotify(ctx, 
+        uiNotify(ctx,
           `/orchestrate plan <objective> — describe what to build.`,
           "error",
         );
@@ -6778,7 +8313,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       } else if (decision.action === "select") {
         const bases = listFeatureBases();
         if (!ctx.hasUI || !bases.length) {
-          uiNotify(ctx, 
+          uiNotify(ctx,
             `cwd is not a known Feature base (${cwd}).\ncd to a ~/Dev/git/<repo> checkout, ~/.pi/agent/extensions, or /orchestrate approve <name>.`,
             "error",
           );
@@ -6795,7 +8330,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
         }
       }
       if (!chosen) {
-        uiNotify(ctx, 
+        uiNotify(ctx,
           `cwd is not a known Feature base (${cwd}).\ncd to a ~/Dev/git/<repo> checkout, ~/.pi/agent/extensions, or /orchestrate approve <name>.`,
           "error",
         );
@@ -6803,45 +8338,52 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       }
       applyBase(paths, chosen);
       writeLastBase(chosen);
-      const feat = bindFeature(paths, join(paths.repoDir, `pending-${utcStamp()}`));
-      seedFeature(feat, objective);
-      uiNotify(ctx, 
-        `Planning a new Feature → ${feat.planFile}\n` +
-          (NAMED_VERBS.has(head)
-            ? `Read as an objective, not the "${head}" subcommand (/orchestrate status to manage live Features).\n`
-            : "") +
-          `Name/folder assigned after the planner writes # Feature: (not from the objective). Other Features stay put.`,
-        "info",
-      );
-      const planned = await runChildInPhase(pi, ctx, "plan", plannerLaunchParams(feat, objective));
-      if (!planned.ok) {
-        uiNotify(ctx, 
-          `Planner did not complete (${planned.reason ?? planned.state ?? "failed"}). Plan remains DRAFT.\n${feat.planFile}`,
-          "error",
-        );
-        return;
-      }
-      // F15: this is the only place a Feature is named. Naming renames the
-      // folder out from under whoever holds the old path, so it runs exactly
-      // once, after the planner child has exited, inside the chain lock. The
-      // lock key is the pre-rename `featureDir`, which is what the `finally`
-      // releases — `feat` is rebound by the rename, the captured string is not.
+      // Occupancy first: a fixer (or any other chain) in flight must refuse a
+      // new planner before seedFeature writes a pending folder. The lock key is
+      // the pre-rename dir; `feat` is rebound by naming, the captured string is not.
+      const pendingDir = join(paths.repoDir, `pending-${utcStamp()}`);
+      let feat: Paths | undefined;
       let named: { plan: string; name: string; branch: string } | undefined;
       let reviewOk = false;
-      const pendingDir = feat.featureDir;
+      let plannerOk = false;
       const ran = await withChainLock(pendingDir, async () => {
+        feat = bindFeature(paths, pendingDir);
+        seedFeature(feat, objective);
+        bindFeatureToSession(feat, ctx);
+        uiNotify(ctx,
+          `Planning a new Feature → ${feat.planFile}\n` +
+            (NAMED_VERBS.has(head)
+              ? `Read as an objective, not the "${head}" subcommand (/orchestrate status to manage live Features).\n`
+              : "") +
+            `Name/folder assigned after the planner writes # Feature: (not from the objective).`,
+          "info",
+        );
+        let baseline = "";
+        if (!isHostBase(feat.repo)) {
+          try { baseline = await planningBase(pi, feat.gitRoot); }
+          catch (error) { uiNotify(ctx, String(error), "error"); return; }
+        }
+        const planned = await runChildInPhase(pi, ctx, "plan", plannerLaunchParams(feat, objective, baseline));
+        if (!planned.ok) {
+          uiNotify(ctx,
+            `Planner did not complete (${planned.reason ?? planned.state ?? "failed"}). Plan remains DRAFT.\n${feat.planFile}`,
+            "error",
+          );
+          return;
+        }
+        plannerOk = true;
+        // F15: name exactly once, after the planner child has exited, still
+        // inside this lock. Naming renames the folder out from under anyone
+        // still writing to the pending path.
         named = ensureFeatureNamed(feat, readText(feat.planFile));
         if (isPendingToken(named.name)) return;
         reviewOk = await reviewPlan(pi, ctx, feat, named.name);
       });
       if (!ran) {
-        uiNotify(
-          ctx,
-          `A chain is already running on ${basename(pendingDir)}. plan-reviewer did not start.`,
-          "warning",
-        );
+        uiNotify(ctx, "A chain is already running. Not starting planner.", "warning");
         return;
       }
+      if (!plannerOk || !feat) return;
       if (!named || isPendingToken(named.name)) {
         uiNotify(
           ctx,
@@ -6852,11 +8394,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       }
       if (!reviewOk) return;
       presentDraftApproveCards(pi, ctx, feat);
-      uiNotify(
-        ctx,
-        `Plan reviewed: ${feat.planFile}\nName ${named.name} (${named.branch}). Waiting on /orchestrate approve ${named.name}. This session is idle.`,
-        "info",
-      );
+      uiNotify(ctx, formatReviewReadyMessage(feat, named.name, named.branch), "info");
     },
   });
 }
