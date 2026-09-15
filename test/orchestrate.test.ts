@@ -2886,7 +2886,7 @@ test("L4: the skill still leaves a solo session its own latch, verdict, and fix"
   // not the retired `<PR>` spelling.
   assert.match(
     src,
-    /`git pr-await <N>` \*\*once\*/,
+    /`git pr-await <N>` \*\*once\*\*/,
     "a solo session still opens exactly one wait",
   );
   assert.match(
