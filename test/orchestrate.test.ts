@@ -2882,9 +2882,11 @@ test("P5 F17: the writer contract the skill used to carry is owned by code", () 
 test("L4: the skill still leaves a solo session its own latch, verdict, and fix", () => {
   const src = readFileSync(GIT_WORKFLOW_SKILL, "utf8");
 
+  // The skill's waiter contract spells the argument `<N>` (a decimal number),
+  // not the retired `<PR>` spelling.
   assert.match(
     src,
-    /`git pr-await <PR>` \*\*once\*\*/,
+    /`git pr-await <N>` \*\*once\*\*/,
     "a solo session still opens exactly one wait",
   );
   assert.match(
