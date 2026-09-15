@@ -11,7 +11,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { isApproved, parseTasks, taskGateCommand } from "../src/lib/plan-tasks.ts";
+import {
+  findTaskFileOverlaps,
+  isApproved,
+  parseTasks,
+  taskGateCommand,
+  taskPlanMetrics,
+} from "../src/lib/plan-tasks.ts";
 
 test("plan-tasks: colon headings parse and a numbered list under ## Tasks is rejected", () => {
   const colonPlan = [
@@ -102,5 +108,77 @@ test("plan-tasks: isApproved only matches Status that begins with approved", () 
     isApproved("> Status: not approved"),
     false,
     "a Status that merely contains approved is not approved",
+  );
+});
+
+const FANOUT_PLAN = [
+  "# Feature: Fanout sizing",
+  "",
+  "### Task 1 — Parser seam",
+  "",
+  "- Status: pending",
+  "- Complexity: simple",
+  "- Read: [`src/a.ts::parse`, `test/a.test.ts::basic`]",
+  '- Files: ["src/a.ts", "test/a.test.ts"]',
+  "- Depends on: []",
+  "- Implement: move the parser",
+  "",
+  "### Task 2 — Overlay seam",
+  "",
+  "- Status: pending",
+  "- Complexity: simple",
+  "- Read: [`src/b.ts::render`]",
+  '- Files: ["src/b.ts", "src/a.ts"]',
+  '- Depends on: ["1"]',
+  "- Implement: move the overlay",
+  "",
+  "### Task 3 — Docs only",
+  "",
+  "- Status: pending",
+  "- Complexity: simple",
+  "- Read: [`README.md`]",
+  '- Files: ["README.md"]',
+  "- Depends on: []",
+  "- Implement: note the seams",
+  "",
+  "## Design Decisions",
+  "| Decision | Choice | Rationale |",
+  "",
+].join("\n");
+
+test("plan-tasks: taskPlanMetrics sizes contracts and reads Files/Depends on", () => {
+  const metrics = taskPlanMetrics(FANOUT_PLAN);
+  assert.equal(metrics.length, 3, "one row per Task");
+  assert.deepEqual(metrics[0]?.files, ["src/a.ts", "test/a.test.ts"]);
+  assert.deepEqual(metrics[0]?.dependsOn, []);
+  assert.equal(metrics[0]?.readSymbols, 2, "two backtick spans in Read");
+  assert.equal(metrics[1]?.readSymbols, 1);
+  assert.ok((metrics[0]?.sectionLines ?? 0) > 5, "contract lines are counted");
+});
+
+test("plan-tasks: findTaskFileOverlaps reports pairs and declared edges", () => {
+  const overlaps = findTaskFileOverlaps(FANOUT_PLAN);
+  assert.equal(overlaps.length, 1, "only Tasks 1+2 share a file");
+  assert.deepEqual(overlaps[0], {
+    a: "1",
+    b: "2",
+    files: ["src/a.ts"],
+    declared: true,
+  });
+});
+
+test("plan-tasks: undeclared overlap is flagged and prose Files reads as []", () => {
+  const plan = FANOUT_PLAN.replace('- Depends on: ["1"]', "- Depends on: []");
+  const overlaps = findTaskFileOverlaps(plan);
+  assert.equal(overlaps.length, 1);
+  assert.equal(overlaps[0]?.declared, false, "missing edge is visible to the reviewer");
+  const prose = FANOUT_PLAN.replace(
+    '- Files: ["README.md"]',
+    "- Files: the docs and whatever else looks relevant",
+  );
+  assert.deepEqual(
+    taskPlanMetrics(prose)[2]?.files,
+    [],
+    "prose Files never counts as a scope",
   );
 });

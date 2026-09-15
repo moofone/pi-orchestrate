@@ -128,6 +128,89 @@ export function taskCountError(n: number): string | undefined {
   return undefined;
 }
 
+/* ------------------------------------------------------------------ *
+ * Fan-out sizing checklist (planner Phase 4: too-small rule, disjoint
+ * `- Files:`, dep-explicit `- Depends on:`).
+ *
+ * Pure and advisory: no gate reads this. The plan-reviewer applies the
+ * same rules by hand; these helpers let a human (or later CI) compute
+ * exactly what the reviewer is asked to check — per-Task contract size
+ * and which Task pairs share input files without a declared edge.
+ * ------------------------------------------------------------------ */
+
+export interface TaskPlanMetric {
+  id: string;
+  title: string;
+  /** Non-empty lines in the Task section: the worker's contract size. */
+  sectionLines: number;
+  /** Entries in `- Files:`; [] when the planner left it out or malformed. */
+  files: string[];
+  /** Entries in `- Depends on:`; [] when disjoint or omitted. */
+  dependsOn: string[];
+  /** Backtick spans in `- Read:`: the orientation load. */
+  readSymbols: number;
+}
+
+/** First `[...]` JSON array on a `- <name>:` line; [] on prose or absence. */
+function taskJsonList(body: string, name: string): string[] {
+  const line = body.match(new RegExp(`^-\\s*${name}:\\s*(.*)$`, "im"))?.[1] ?? "";
+  const bracket = line.match(/\[[\s\S]*\]/)?.[0];
+  if (!bracket) return [];
+  try {
+    const parsed: unknown = JSON.parse(bracket);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+      .map((entry) => entry.trim());
+  } catch {
+    return [];
+  }
+}
+
+export function taskPlanMetrics(plan: string): TaskPlanMetric[] {
+  return parseTasks(plan).map((task) => {
+    const body = taskSection(plan, task.id);
+    const readLine = body.match(/^-\s*Read:.*$/im)?.[0] ?? "";
+    return {
+      id: task.id,
+      title: task.title,
+      sectionLines: body.split("\n").filter((line) => line.trim().length > 0).length,
+      files: taskJsonList(body, "Files"),
+      dependsOn: taskJsonList(body, "Depends on").filter((id) => /^\d+$/.test(id)),
+      readSymbols: (readLine.match(/`[^`]+`/g) ?? []).length,
+    };
+  });
+}
+
+export interface TaskFileOverlap {
+  a: string;
+  b: string;
+  files: string[];
+  /** The later Task names the earlier in `- Depends on:`. */
+  declared: boolean;
+}
+
+/** Task pairs sharing `- Files:` entries. The reviewer merges, regroups, or requires an edge. */
+export function findTaskFileOverlaps(plan: string): TaskFileOverlap[] {
+  const metrics = taskPlanMetrics(plan);
+  const out: TaskFileOverlap[] = [];
+  for (let i = 0; i < metrics.length; i++) {
+    for (let j = i + 1; j < metrics.length; j++) {
+      const earlier = metrics[i]!;
+      const later = metrics[j]!;
+      const shared = earlier.files.filter((file) => later.files.includes(file));
+      if (shared.length === 0) continue;
+      out.push({
+        a: earlier.id,
+        b: later.id,
+        files: [...new Set(shared)].sort(),
+        declared: later.dependsOn.includes(earlier.id),
+      });
+    }
+  }
+  return out;
+}
+
 /** The `### Task N — …` (or `### Task N: …`) block, verbatim, as the child's contract. */
 export function taskSection(plan: string, id: string): string {
   const start = plan.search(

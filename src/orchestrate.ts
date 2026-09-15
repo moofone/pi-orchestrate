@@ -6111,7 +6111,7 @@ Durable location (mandatory):
 - ${paths.statusFile}
 - ${paths.handoffsDir}/
 
-This is one **Feature** (one branch, one PR) made of sequential **Tasks** (tdd-worker slices). 4–5 Tasks is typical; never more than ${MAX_TASKS}.
+This is one **Feature** (one branch, one PR) made of sequential **Tasks** (tdd-worker slices). 5–8 Tasks is typical where the work allows; never more than ${MAX_TASKS}.
 
 The \`# Feature:\` title must be short and concrete (3–6 words). It becomes the unique Name and \`feat/<name>\` branch **after** you write the plan. Do **not** slug this objective. Leave \`> Name: pending\` and \`> Branch: pending\`.
 
@@ -6143,6 +6143,8 @@ Architecture fit, impact/blast radius, correctness/invariants, security, perform
 
 ### Phase 4 — Tasks for one fresh \`tdd-worker\` (${WORKERS.simple.short}; ${WORKERS.critical.short} when critical)
 A Task is too big if: more than 10 named files to read; two ownership seams; contract > ~150 lines; you cannot name the exact files and the exact failing test; red+green cannot be one focused test command.
+A Task is too small if: one trivial edit with no dedicated test, or a contract that folds into a sibling touching the same files. Merge it — every Task pays a full worker spawn (fresh orientation, commit, handoff), so tiny Tasks burn fixed cost for nothing.
+Prefer Tasks with disjoint \`- Files:\` wherever there is no true data dependency. \`- Depends on:\` lists only real data dependencies (shared files/semantics), never mere ordering — leave it \`[]\` for disjoint Tasks. The chain runs Tasks in order; disjoint Tasks review faster and stay wave-ready.
 Sequential Tasks share **one** feature worktree (one writer). No per-Task PR.
 Each Task **must** be an H3 heading \`### Task N — title\` (em dash) or \`### Task N: title\` (colon). A numbered list under \`## Tasks\` is invisible to \`/orchestrate approve\`.
 
@@ -6182,6 +6184,8 @@ Overwrite ${paths.planFile}:
 - Goal: [one sentence]
 - Read: [\`file\`, \`file\`]
 - Do not read: [...]
+- Files: ["src/file.ts", "test/file.test.ts"]   # every input including intended new files; JSON array of repo-relative paths
+- Depends on: []   # earlier Task ids this Task builds on; [] when disjoint
 - Red test: [\`path::test\` proving X including rejection]
 - Repo: ${paths.repo}   # or icemining-devops / coins-minimal when this Task is not the Feature worktree
 - Command: \`rtk cargo test -p crate --lib the_test\`
@@ -6218,7 +6222,7 @@ export function reviewLaunchParams(
     agent: "plan-reviewer",
     task: [
       `Review ${paths.planFile} against the real code and specs for Feature ${featureName}.`,
-      `Apply high-confidence corrections to that plan.md now (wrong files, missing red tests, oversized Tasks, broken invariants, stale title).`,
+      `Apply high-confidence corrections to that plan.md now (wrong files, missing red tests, oversized Tasks, tiny Tasks sharing files with a sibling — merge them, Tasks sharing - Files: without a - Depends on: edge — regroup or declare it, broken invariants, stale title).`,
       `Do not implement product code. Do not edit anything outside ${dirname(paths.planFile)}.`,
       `Low-confidence / product decisions: contact_supervisor or an Open questions section — do not guess.`,
     ].join("\n"),
