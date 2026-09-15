@@ -3769,9 +3769,23 @@ export async function ensureSessionFixerCommitGate(
     return { state: "unknown", reason: "could not read the session fixer porcelain baseline" };
   }
   const touched = porcelainChangedPaths(before, after, platform);
+  const baselinePaths = new Set(porcelainPathSignatures(before, platform).keys());
+  const ambiguous = touched.filter((path) => baselinePaths.has(path));
+  const committable = touched.filter((path) => !baselinePaths.has(path));
+  const ambiguousNotice = ambiguous.length > 0
+    ? `ambiguous fixer paths (already dirty at baseline; left uncommitted): ${ambiguous.join(", ")}`
+    : "";
   let gate: { state: CommitGateState; reason: string } = { state: "clean", reason: "" };
-  if (touched.length > 0) {
-    gate = await ensureWriterCommit(pi, cwd, message, platform, touched);
+  if (committable.length > 0) {
+    // A path that was already dirty may contain both the user's work and the
+    // fixer's work. Never attempt a partial-hunk commit to disambiguate it.
+    gate = await ensureWriterCommit(pi, cwd, message, platform, committable);
+  }
+  if (ambiguousNotice) {
+    gate = {
+      state: gate.state === "unknown" ? "unknown" : "dirty",
+      reason: gate.reason ? `${ambiguousNotice}; ${gate.reason}` : ambiguousNotice,
+    };
   }
   const settled = await porcelainStatus(pi, cwd);
   if (settled === undefined) {
@@ -3784,7 +3798,8 @@ export async function ensureSessionFixerCommitGate(
       (path) => !isCommitGateIgnoredPath(path, platform) && !writeSetsOverlap(touched, [path]),
     ));
   if (outside.length > 0) {
-    return { state: "dirty", reason: "unrelated pre-existing paths remain dirty after the session fixer" };
+    const reason = "unrelated pre-existing paths remain dirty after the session fixer";
+    return { state: "dirty", reason: ambiguousNotice ? `${ambiguousNotice}; ${reason}` : reason };
   }
   return gate;
 }

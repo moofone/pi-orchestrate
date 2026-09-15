@@ -3817,6 +3817,39 @@ test("session fixer gate leaves pre-existing unrelated dirt uncommitted", async 
   assert.ok(mutation.every((call) => !call.includes("unrelated.ts")), mutation.join(" | "));
 });
 
+test("session fixer gate leaves baseline-dirty touched paths ambiguous while committing clean paths", async () => {
+  const calls: string[] = [];
+  let committed = false;
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    if (cmd === "git" && args[0] === "status") {
+      return {
+        code: 0,
+        stdout: committed ? " M src/pre-existing.ts\n" : "MM src/pre-existing.ts\n M src/fix.ts\n",
+        stderr: "",
+      };
+    }
+    if (cmd === "git" && args[0] === "commit") {
+      assert.ok(args.includes(":(literal)src/fix.ts"), args.join(" "));
+      assert.ok(!args.includes(":(literal)src/pre-existing.ts"), args.join(" "));
+      committed = true;
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const gate = await orch.ensureSessionFixerCommitGate(
+    pi as never,
+    "/tmp/session-gate-wt",
+    "fix: review session moofone/pi-orchestrate#21",
+    " M src/pre-existing.ts\n",
+  );
+  assert.equal(gate.state, "dirty");
+  assert.match(gate.reason, /ambiguous/i);
+  assert.match(gate.reason, /src\/pre-existing\.ts/);
+  const mutation = calls.filter((call) => call.startsWith("git add") || call.startsWith("git commit"));
+  assert.ok(mutation.every((call) => !call.includes("src/pre-existing.ts")), mutation.join(" | "));
+  assert.ok(mutation.some((call) => call.includes("src/fix.ts")), mutation.join(" | "));
+});
+
 test("phase allowlist: every legacy launch's own agent sits inside its phase", () => {
   const violation = phaseAgentViolationFn();
   const paths = promptContractPaths();
