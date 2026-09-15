@@ -171,6 +171,20 @@ export function packPathGroups(keys: readonly string[], cap: number): string[][]
 export function parseFilesScalar(body: string): string[] {
   const raw = (String(body ?? "").match(/^-\s*Files:\s*(.+?)\s*$/im)?.[1] ?? "").trim();
   if (!raw || /^(pending|none|tbd|todo)$/i.test(raw)) return [];
+  // The planner template emits a JSON array (`["src/a.ts", "t/b.ts"]`).
+  // Parse it as JSON first: a non-array, a non-string element, or any
+  // invalid path makes the whole declaration unknown/solo.
+  if (raw.startsWith("[")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+    if (!Array.isArray(parsed)) return [];
+    if (parsed.some((part) => typeof part !== "string" || normalizeWritePath(part) === null)) return [];
+    return normalizeWriteSet(parsed as string[]);
+  }
   const parts = raw.split(/[\s,;]+/).filter(Boolean);
   // A partially usable declaration is not a scope: admitting the normalized
   // subset would let the writer run concurrently while its malformed path is

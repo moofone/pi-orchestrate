@@ -147,6 +147,17 @@ test("write-sets: parseFilesScalar reads - Files:, absent means solo", () => {
   assert.deepEqual(parseFilesScalar("### Task 1\n- Files: src/a.ts, src/b.ts\n"), ["src/a.ts", "src/b.ts"]);
   assert.deepEqual(parseFilesScalar("### Task 1\n- Status: pending\n"), []);
   assert.deepEqual(parseFilesScalar("- Files: none"), []);
+  // Planner template form: a JSON array of repo-relative paths.
+  assert.deepEqual(parseFilesScalar('- Files: ["src/a.ts", "test/a.test.ts"]'), [
+    "src/a.ts",
+    "test/a.test.ts",
+  ]);
+  assert.deepEqual(parseFilesScalar("- Files: []"), []);
+  // Any unusable element voids the whole declaration (unknown/solo).
+  assert.deepEqual(parseFilesScalar('- Files: ["src/a.ts", "../escape"]'), []);
+  assert.deepEqual(parseFilesScalar('- Files: ["src/a.ts", 7]'), []);
+  assert.deepEqual(parseFilesScalar('- Files: ["src/a.ts",'), []);
+  assert.deepEqual(parseFilesScalar("- Files: {} "), []);
 });
 
 test("write-sets: malformed Files declarations become unknown instead of a partial scope", () => {
