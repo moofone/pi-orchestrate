@@ -3634,6 +3634,9 @@ export function firstWaveTaskBlockedByDirtyTree(
   scopedPaths: readonly string[],
   platform: NodeJS.Platform = process.platform,
 ): string | undefined {
+  if (porcelain === undefined) {
+    return "tree state unreadable before Task wave — no writers started; retry when git status is readable.";
+  }
   return firstTaskBlockedByDirtyTree(
     tasks,
     porcelainOutsideWriteSet(porcelain, scopedPaths),

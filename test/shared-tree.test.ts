@@ -217,6 +217,24 @@ test("shared-tree: wave F11 blocks dirt outside the wave scope", () => {
   assert.match(source.slice(start, end), /firstWaveTaskBlockedByDirtyTree/);
 });
 
+test("shared-tree: unreadable wave baseline blocks before any writer spawn", () => {
+  const tasks = [
+    { id: "1", title: "a", status: "pending" },
+    { id: "2", title: "b", status: "pending" },
+  ] as never;
+  const blocked = orch.firstWaveTaskBlockedByDirtyTree(tasks, undefined, ["src/a.ts", "src/b.ts"]);
+  assert.match(blocked ?? "", /tree state unreadable/i);
+  assert.match(blocked ?? "", /no writers started/i);
+
+  const source = readFileSync(ORCH_SRC, "utf8");
+  const start = source.indexOf("async function runTaskBatch");
+  const end = source.indexOf("\nasync function runChainTaskOnce", start);
+  const batch = source.slice(start, end);
+  const guard = batch.indexOf("if (dirtyFirst)");
+  const spawn = batch.indexOf("runChainTaskOnce", guard);
+  assert.ok(guard >= 0 && spawn > guard, "unreadable baseline must be checked before any child spawn");
+});
+
 test("shared-tree: wave dirt backstop blocks a Task before resume can reach QA", () => {
   const source = readFileSync(ORCH_SRC, "utf8");
   const start = source.indexOf("async function runTaskBatch");
