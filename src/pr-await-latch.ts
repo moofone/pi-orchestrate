@@ -43,7 +43,7 @@ import {
 	type FSWatcher,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { readPhase, sessionOwnsFeature, statusValue } from "./lib/feature-state.ts";
 
 import {
@@ -154,6 +154,14 @@ export function defaultSpawnDriver(stateFile: string, known?: LatchState): { pid
 
 function resultText(result: unknown): string {
 	if (typeof result === "string") return result;
+	if (result && typeof result === "object") {
+		const value = result as { content?: unknown; output?: unknown };
+		if (Array.isArray(value.content)) {
+			return value.content.filter((part) => part?.type === "text" && typeof part.text === "string")
+				.map((part) => part.text).join("\n");
+		}
+		if (typeof value.output === "string") return value.output;
+	}
 	try {
 		return JSON.stringify(result) ?? "";
 	} catch {
@@ -229,6 +237,7 @@ type LatchSlot = {
 	terminalWoken: boolean;
 	lastActionableFingerprint: string | undefined;
 	lastRefusedFingerprint: string | undefined;
+	actionableWakeInFlight: boolean;
 	deferralActive: boolean;
 	/** True only after this session has seen the waiter's `--state` file. */
 	waiterStateSeen: boolean;
@@ -258,6 +267,7 @@ function newLatchSlot(sessionId: string): LatchSlot {
 		terminalWoken: false,
 		lastActionableFingerprint: undefined,
 		lastRefusedFingerprint: undefined,
+		actionableWakeInFlight: false,
 		deferralActive: false,
 		waiterStateSeen: false,
 		holdCtx: undefined,
@@ -663,7 +673,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			next === "read_comments_and_fix"
 				? "Dispatch a fixer child (subagent tool, agent: fixer, cwd: your worktree) with this verdict. Solo mode uses the same fixer as /orchestrate; do not invoke /orchestrate. The child validates and commits without pushing; after a successful handoff, push once, then git pr-await once. Do not implement it yourself."
 				: next === "investigate_dead_reviewers"
-					? "Restart reviewers, then git pr-await once."
+					? "Investigate and repair the failed reviewer, not the waiter. A confused/bailed reaction is a failure, not an active review. Do not post another blind retry comment or re-await without verifying that reviewer recovery actually started. If recovery is blocked, report the concrete blocker rather than waiting silently."
 					: next === "fix_command_or_environment"
 						? "Fix env, then git pr-await once."
 						: "Act on this verdict, then git pr-await once.";
@@ -1111,9 +1121,24 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		}
 		// Solo: the wake itself is the delivery; the session dispatches the shared
 		// fixer child (git-workflow skill) instead of implementing the findings.
-		st().lastActionableFingerprint = fp;
-		for (const path of candidates) markVerdictDelivered(path, fp);
-		wakeParent(ctx, actionableResumeText(held, hit.lastNext, hit.verdict));
+		const slot = st();
+		if (slot.actionableWakeInFlight) return;
+		if (held.origin !== "observed" && !slot.deferralActive) return;
+		slot.actionableWakeInFlight = true;
+		try {
+			await pi.sendUserMessage(actionableResumeText(held, hit.lastNext, hit.verdict),
+				ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+			// A delayed delivery must not acknowledge a later handoff/session.
+			if (slot.latch?.generation !== held.generation) return;
+			slot.lastActionableFingerprint = fp;
+			slot.lastRefusedFingerprint = undefined;
+			for (const path of candidates) markVerdictDelivered(path, fp);
+		} catch (error) {
+			slot.lastRefusedFingerprint = fp;
+			notify(ctx, `pr-latch: recovery wake failed (${String(error)}); verdict retained for retry.`);
+		} finally {
+			slot.actionableWakeInFlight = false;
+		}
 	}
 
 	function notify(ctx: ExtensionContext, text: string): void {
@@ -1163,7 +1188,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	}
 
 	function absorb(command: string, output: string, ctx: ExtensionContext): void {
-		const cwd = trailingCd(command, /\b(?:git\s+pr-|gh\s+pr\s+)/) ?? ctx.cwd;
+		const call = parseAwaitCall(command);
+		const shellCwd = trailingCd(command, /\b(?:git\s+(?:-C\s+)?|gh\s+pr\s+)/) ?? ctx.cwd;
+		const cwd = call?.cwd ? resolve(shellCwd, call.cwd) : shellCwd;
 		if (cwd.startsWith(REPO_ROOT)) seenCwds.add(cwd);
 
 		// pr-land --continue N must not retarget the latch. That is how a
@@ -1171,7 +1198,6 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		// something else.
 		if (/\bgit\s+pr-land\b/.test(command) && !/\bgit\s+pr-await\b/.test(command)) return;
 
-		const call = parseAwaitCall(command);
 		const created = /\bgh\s+pr\s+create\b/.test(command)
 			? output.match(/github\.com\/[^\s/]+\/[^\s/]+\/pull\/(\d+)/)?.[1]
 			: undefined;
@@ -1180,6 +1206,12 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (!pr) return;
 
 		const next = parseField(output, "next");
+		if (call && next === "yield") {
+			// An explicit new wait must not inherit the previous attempt's
+			// suppression when the same reviewer fails on the same head again.
+			st().lastActionableFingerprint = undefined;
+			st().lastRefusedFingerprint = undefined;
+		}
 		const cursor = parseField(output, "cursor") ?? call?.cursor;
 		const head = parseField(output, "head");
 		const round = parseField(output, "round");
@@ -1511,7 +1543,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (!command) return;
 		const cwd = trailingCd(command);
 		if (cwd) seenCwds.add(cwd);
-		if (/\bgit\s+pr-await\b|\bgh\s+pr\s+create\b/.test(command)) {
+		if ((parseAwaitCall(command) && /\bpr-await\b/.test(command)) || /\bgh\s+pr\s+create\b/.test(command)) {
 			pendingCommands.set(event.toolCallId, command);
 		}
 	}));

@@ -113,6 +113,7 @@ function harness(
 		chromeMs?: number;
 		featureOwnedPr?: any;
 		onFeatureActionable?: any;
+		sendUserMessage?: () => Promise<void>;
 		/** Present-and-undefined selects the production pid probe. */
 		driverRunning?: any;
 	} = {},
@@ -150,6 +151,7 @@ function harness(
 			return execImpl(cmd, args, opts);
 		},
 		sendUserMessage: async (text: string, options?: { deliverAs?: string }) => {
+			if (extraHooks.sendUserMessage) await extraHooks.sendUserMessage();
 			wakes.push(text);
 			wakeModes.push(options?.deliverAs);
 		},
@@ -244,7 +246,7 @@ function harness(
 			handlers.input?.({ text, source }, ctx),
 		bash: async (command: string, output: string) => {
 			await handlers.tool_execution_start({ toolName: "bash", toolCallId: "tc", args: { command } }, ctx);
-			await handlers.tool_execution_end({ toolCallId: "tc", result: { output }, isError: false }, ctx);
+			await handlers.tool_execution_end({ toolCallId: "tc", result: { content: [{ type: "text", text: output }] }, isError: false }, ctx);
 		},
 		cleanup: () => {
 			handlers.session_shutdown?.({}, ctx);
@@ -257,6 +259,62 @@ const ok = (stdout: string) => ({ stdout, stderr: "", code: 0, killed: false });
 const OPEN = ok('{"state":"OPEN","mergedAt":null}');
 const MERGED = ok('{"state":"MERGED","mergedAt":"2026-08-24T21:44:34Z"}');
 const CLOSED = ok('{"state":"CLOSED","mergedAt":null}');
+
+const CONFUSED_VERDICT = "status=reviewers_dead\nnext=investigate_dead_reviewers\npr=2142\nhead=47e2b0ad8afaaf5e3a0a29c689fe2b26e0b36016\nbot=grok-local-review[bot] reaction=confused bailed=true";
+const HOTFIX_YIELD_OUTPUT = "status=handed_off\nnext=yield\npr=2142\ninstruction=stop_talking";
+
+function writeConfused(dir: string, elapsed = 1248): void {
+	writeFileSync(waiterState(dir), JSON.stringify({ pr: "2142", lastNext: "investigate_dead_reviewers", verdict: CONFUSED_VERDICT + `\nelapsed_seconds=${elapsed}`, verdictDelivered: false }));
+}
+
+test("PR533 hotfix: documented git -C handoff preserves worktree and text-block yield", async () => {
+	const target = join(homedir(), "Dev", "git", "icemining-devops");
+	assert.deepEqual(parseAwaitCall(`rtk git -C '${target}' pr-await 2142`), { pr: "2142", cursor: undefined, cwd: target });
+	const h = harness((cmd) => cmd === "gh" ? OPEN : ok(REAL_OUTPUT));
+	try {
+		await h.start();
+		await h.bash(`rtk git -C '${target}' pr-await 2142`, HOTFIX_YIELD_OUTPUT);
+		const saved = JSON.parse(readFileSync(join(h.dir, `pi-${h.sessionId}.latch.json`), "utf8"));
+		assert.equal(saved.cwd, target);
+		assert.equal(saved.lastNext, "yield");
+	} finally { h.cleanup(); }
+});
+
+test("PR533 hotfix: same-head confused failure wakes again after explicit rehandoff", async () => {
+	const h = harness((cmd) => cmd === "gh" ? OPEN : ok(REAL_OUTPUT));
+	try {
+		await h.start(); await h.bash(`cd ${REPO} && git pr-await 2142`, HOTFIX_YIELD_OUTPUT);
+		writeConfused(h.dir); await h.settle(); await sleep(80);
+		assert.equal(h.wakes.length, 1);
+		assert.match(h.wake(), /failed reviewer, not the waiter/);
+		await h.settle(); await sleep(80); assert.equal(h.wakes.length, 1);
+		await h.bash(`rtk git -C ${REPO} pr-await 2142`, HOTFIX_YIELD_OUTPUT);
+		writeConfused(h.dir, 1286); await h.settle(); await sleep(80);
+		assert.equal(h.wakes.length, 2, "same-head retry failure must not inherit first-wake suppression");
+		writeConfused(h.dir, 1300); await h.settle(); await sleep(80);
+		assert.equal(h.wakes.length, 2, "ordinary clock-only updates must not produce a wake storm");
+	} finally { h.cleanup(); }
+});
+
+test("PR533 hotfix: confused chrome is failed, never waiting for reviewers", () => {
+	assert.equal(waitPhaseFromNext("investigate_dead_reviewers"), "reviewer failed — recovery required");
+});
+
+test("PR533 hotfix: rejected wake preserves verdict for retry", async () => {
+	let fail = true;
+	const h = harness((cmd) => cmd === "gh" ? OPEN : ok(REAL_OUTPUT), REPO, {
+		sendUserMessage: async () => { if (fail) throw new Error("test wake unavailable"); },
+	});
+	try {
+		await h.start(); await h.bash(`cd ${REPO} && git pr-await 2142`, HOTFIX_YIELD_OUTPUT);
+		writeConfused(h.dir); await h.settle(); await sleep(80);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(JSON.parse(readFileSync(waiterState(h.dir), "utf8")).verdictDelivered, false);
+		fail = false; await h.settle(); await sleep(80);
+		assert.equal(h.wakes.length, 1);
+		assert.equal(JSON.parse(readFileSync(waiterState(h.dir), "utf8")).verdictDelivered, true);
+	} finally { h.cleanup(); }
+});
 
 test("parseField: reads every field off the real multi-line output", () => {
 	assert.equal(parseField(REAL_OUTPUT, "status"), "reviewer_active");

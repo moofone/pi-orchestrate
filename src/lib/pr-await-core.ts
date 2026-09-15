@@ -375,7 +375,7 @@ export function waitPhaseFromNext(next: string | undefined): string {
 	const n = String(next ?? "").trim().toLowerCase();
 	if (!n || n === "yield" || n === "poll_again") return "waiting for review";
 	if (n === "read_comments_and_fix") return "fixing";
-	if (n === "investigate_dead_reviewers") return "waiting for reviewers";
+	if (n === "investigate_dead_reviewers") return "reviewer failed — recovery required";
 	if (n === "fix_command_or_environment") return "fixing environment";
 	if (n === "git_pr_land" || n === "git_pr_land_continue") return "landing";
 	if (n === "done") return "done";
@@ -639,10 +639,11 @@ export function parseField(text: string, field: string): string | undefined {
 	return undefined;
 }
 
-export function parseAwaitCall(command: string): { pr: string; cursor?: string } | undefined {
-	const m = command.match(/\bgit\s+pr-(?:await|land)\s+([^\n;|&]*)/);
+export function parseAwaitCall(command: string): { pr: string; cursor?: string; cwd?: string } | undefined {
+	const m = command.match(/\bgit\s+(?:-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s+)?pr-(?:await|land)\s+([^\n;|&]*)/);
 	if (!m) return undefined;
-	const tokens = (m[1] ?? "").trim().split(/\s+/).filter(Boolean);
+	const cwd = m[1] ?? m[2] ?? m[3];
+	const tokens = (m[4] ?? "").trim().split(/\s+/).filter(Boolean);
 	let pr: string | undefined;
 	let cursor: string | undefined;
 	for (let i = 0; i < tokens.length; i++) {
@@ -661,7 +662,7 @@ export function parseAwaitCall(command: string): { pr: string; cursor?: string }
 		}
 		if (!pr && /^\d+$/.test(token)) pr = token;
 	}
-	return pr ? { pr, cursor } : undefined;
+	return pr ? { pr, cursor, ...(cwd ? { cwd } : {}) } : undefined;
 }
 
 export function trailingCd(command: string, upTo?: RegExp): string | undefined {
