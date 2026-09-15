@@ -128,13 +128,34 @@ export type SpawnDriver = (argv: string[]) => { pid?: number };
  */
 export const WATCH_BACKSTOP_MS = 10 * 60_000;
 
-function persistLaunchRun(intent: LaunchIntent, runId: string): void {
+async function sessionFixerPorcelainBaseline(
+	pi: ExtensionAPI,
+	cwd: string,
+): Promise<string | undefined> {
+	try {
+		const result = await pi.exec("git", ["status", "--porcelain"], { cwd, timeout: 30_000 });
+		if (result.code !== 0) return undefined;
+		let porcelain = String(result.stdout ?? "");
+		while (porcelain.startsWith("\n")) porcelain = porcelain.slice(1);
+		while (porcelain.endsWith("\n")) porcelain = porcelain.slice(0, -1);
+		return porcelain;
+	} catch {
+		return undefined;
+	}
+}
+
+function persistLaunchRun(
+	intent: LaunchIntent,
+	runId: string,
+	preFixPorcelain?: string,
+): void {
 	const store = createReviewStore(stateDir());
 	for (const ob of store.list()) {
 		if (ob.launch?.idempotencyKey !== intent.idempotencyKey && ob.launch?.runId !== runId) continue;
 		if (!ob.launch) continue;
 		ob.launch.runId = runId;
 		ob.launch.worktree = ob.launch.worktree || intent.worktree || ob.worktree;
+		if (preFixPorcelain !== undefined) ob.launch.preFixPorcelain = preFixPorcelain;
 		if (ob.writer) {
 			ob.writer.runId = runId;
 			store.reserveWriter(ob.pr, ob.writer);
@@ -817,6 +838,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					}
 					return { runId: `feature-${intent.idempotencyKey}`, recovered: false, completeRound: true };
 				}
+				const preFixPorcelain = await sessionFixerPorcelainBaseline(pi, intent.worktree);
 				const launched = hooks.onSessionFixer
 					? await hooks.onSessionFixer(intent)
 					: await (async (): Promise<LaunchResult> => {
@@ -824,17 +846,24 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 							if (!events) throw new Error("pr-review launch handler is not registered in this runtime");
 							return await requestReviewLaunch(events, intent);
 					  })();
+				const durableLaunch = launched.preFixPorcelain === undefined && preFixPorcelain !== undefined
+					? { ...launched, preFixPorcelain }
+					: launched;
 				const rec: RunSnapshot & { key: string; settled?: Promise<unknown> } = {
-					runId: launched.runId,
+					runId: durableLaunch.runId,
 					status: "running",
 					key: intent.idempotencyKey,
 					worktree: intent.worktree,
-					...(launched.settled ? { settled: launched.settled } : {}),
+					...(durableLaunch.settled ? { settled: durableLaunch.settled } : {}),
 				};
-				sessionRuns.set(launched.runId, rec);
+				sessionRuns.set(durableLaunch.runId, rec);
 				sessionRuns.set(intent.idempotencyKey, rec);
-				persistLaunchRun(intent, launched.runId);
-				return launched;
+				persistLaunchRun(
+					intent,
+					durableLaunch.runId,
+					durableLaunch.preFixPorcelain,
+				);
+				return durableLaunch;
 			},
 			queryRun:
 				hooks.queryRun ??
@@ -853,14 +882,40 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 						);
 					const runId = mem?.runId || stored?.launch?.runId || key;
 					const snap = readPiRunDisk(runId);
-					// launchSessionFixer returns before the child exits, so wait for its
-					// host-side commit gate before sampling HEAD for publication.
-					if (snap?.terminal) await mem?.settled;
-					let head: string | undefined;
 					// HEAD is the fixer's worktree, not the live latch cwd. A later
 					// `git pr-await` on another PR would otherwise publish the wrong SHA.
 					const cwd = mem?.worktree || stored?.launch?.worktree || stored?.worktree;
-					if (cwd) {
+					let gateReady = true;
+					// launchSessionFixer returns before the child exits, so wait for its
+					// host-side commit gate before sampling HEAD for publication. After a
+					// restart there is no in-memory settlement; re-run the persisted,
+					// baseline-scoped gate before reading the branch.
+					if (snap?.terminal) {
+						const settled = (await mem?.settled) as { state?: string } | undefined;
+						if (settled?.state === "dirty" || settled?.state === "unknown") gateReady = false;
+						if (!mem?.settled) {
+							const baseline = stored?.launch?.preFixPorcelain;
+							if (!cwd || baseline === undefined) {
+								gateReady = false;
+							} else {
+								try {
+									const orch = await import("./orchestrate.ts");
+									const storedPr = stored?.pr;
+									const gate = await orch.ensureSessionFixerCommitGate(
+										pi,
+										cwd,
+										`fix: review session ${storedPr?.owner ?? "unknown"}/${storedPr?.repo ?? "unknown"}#${storedPr?.number ?? "?"}`,
+										baseline,
+									);
+									gateReady = gate.state === "clean" || gate.state === "committed";
+								} catch {
+									gateReady = false;
+								}
+							}
+						}
+					}
+					let head: string | undefined;
+					if (cwd && gateReady) {
 						try {
 							const r = await pi.exec("git", ["rev-parse", "HEAD"], { cwd, timeout: SHORT_MS });
 							if (r.code === 0) {
@@ -875,9 +930,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 						const out: RunSnapshot & { key: string } = {
 							runId,
 							status: "exited",
-							ok: snap.ok,
+							ok: snap.ok && gateReady,
 							stopped: snap.stopped,
-							head,
+							head: gateReady ? head : undefined,
 							key: mem?.key ?? stored?.launch?.idempotencyKey ?? key,
 							worktree: cwd,
 						};

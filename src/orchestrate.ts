@@ -3650,6 +3650,40 @@ export function firstWaveTaskBlockedByDirtyTree(
  * Darwin Cargo.lock is not included (Mac pre-commit refuses that lock; we
  * cannot `git reset`/`git restore` it). Leftover lock dirt is not a block.
  */
+function porcelainPathSignatures(
+  porcelain: string,
+  platform: NodeJS.Platform,
+): Map<string, string[]> {
+  const byPath = new Map<string, string[]>();
+  for (const line of actionablePorcelain(porcelain, platform).split("\n")) {
+    if (!line.trim()) continue;
+    for (const path of porcelainEntryPaths(line)) {
+      if (isCommitGateIgnoredPath(path, platform)) continue;
+      const entries = byPath.get(path) ?? [];
+      entries.push(line);
+      byPath.set(path, entries);
+    }
+  }
+  return byPath;
+}
+
+/** Paths whose porcelain entry changed between the fixer baseline and settle. */
+export function porcelainChangedPaths(
+  before: string | undefined,
+  after: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (before === undefined || after === undefined) return [];
+  const oldEntries = porcelainPathSignatures(before, platform);
+  const newEntries = porcelainPathSignatures(after, platform);
+  const paths = new Set([...oldEntries.keys(), ...newEntries.keys()]);
+  return [...paths]
+    .filter((path) =>
+      JSON.stringify(oldEntries.get(path) ?? []) !== JSON.stringify(newEntries.get(path) ?? []),
+    )
+    .sort();
+}
+
 export async function ensureWriterCommit(
   pi: ExtensionAPI,
   cwd: string,
@@ -3720,6 +3754,39 @@ export async function ensureWriterCommit(
   // transactions; holding it across porcelain/add/commit would block other
   // processes for longer than their lock budget.
   return withWriterCommitLock(gate);
+}
+
+/** Close a session fixer gate without sweeping dirt that predates the fixer. */
+export async function ensureSessionFixerCommitGate(
+  pi: ExtensionAPI,
+  cwd: string,
+  message: string,
+  before: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): Promise<{ state: CommitGateState; reason: string }> {
+  const after = await porcelainStatus(pi, cwd);
+  if (before === undefined || after === undefined) {
+    return { state: "unknown", reason: "could not read the session fixer porcelain baseline" };
+  }
+  const touched = porcelainChangedPaths(before, after, platform);
+  let gate: { state: CommitGateState; reason: string } = { state: "clean", reason: "" };
+  if (touched.length > 0) {
+    gate = await ensureWriterCommit(pi, cwd, message, platform, touched);
+  }
+  const settled = await porcelainStatus(pi, cwd);
+  if (settled === undefined) {
+    return { state: "unknown", reason: "could not verify the session fixer commit gate" };
+  }
+  const outside = actionablePorcelain(settled, platform)
+    .split("\n")
+    .filter((line) => line.trim())
+    .filter((line) => porcelainEntryPaths(line).some(
+      (path) => !isCommitGateIgnoredPath(path, platform) && !writeSetsOverlap(touched, [path]),
+    ));
+  if (outside.length > 0) {
+    return { state: "dirty", reason: "unrelated pre-existing paths remain dirty after the session fixer" };
+  }
+  return gate;
 }
 
 /**
@@ -4281,6 +4348,9 @@ export async function launchSessionFixer(
   if (policy.action === "reject") {
     throw new Error(policy.reason ?? "spawn rejected");
   }
+  // Persist the exact pre-fix porcelain so a restarted controller can close
+  // the same scoped gate instead of falling back to git add -A.
+  const preFixPorcelain = await porcelainStatus(pi, intent.worktree);
 
   // The session fixer is spawned directly rather than through runChildInPhase,
   // because the review controller must receive its runId immediately. Keep a
@@ -4305,10 +4375,11 @@ export async function launchSessionFixer(
     void (async () => {
       let gate: SessionFixerSettlement;
       try {
-        gate = await ensureWriterCommit(
+        gate = await ensureSessionFixerCommitGate(
           pi,
           intent.worktree,
           `fix: review session ${intent.pr.owner}/${intent.pr.repo}#${intent.pr.number}`,
+          preFixPorcelain,
         );
       } catch (error) {
         gate = { state: "dirty", reason: `commit gate error: ${String(error)}` };
@@ -4357,7 +4428,12 @@ export async function launchSessionFixer(
   }
   runId = spawnedId;
   for (const data of early.splice(0)) settle(data);
-  return { runId, recovered: false, settled: settlement };
+  return {
+    runId,
+    recovered: false,
+    settled: settlement,
+    ...(preFixPorcelain !== undefined ? { preFixPorcelain } : {}),
+  };
 }
 
 /**

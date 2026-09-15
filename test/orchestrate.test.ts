@@ -3688,7 +3688,7 @@ test("session fixer launch returns when the child is spawned, not when it exits"
     publication: "controller",
   };
   const p = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, intent);
-  await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
     success: true,
     data: { details: { runId: "run-session-1" } },
@@ -3736,12 +3736,15 @@ function phaseAgentViolationFn() {
 
 test("session fixer settles through the host commit gate", async () => {
   const calls: string[] = [];
+  let committed = false;
   let statusReads = 0;
   const pi = makeFakePi(async (cmd, args) => {
     calls.push([cmd, ...args].join(" "));
     if (cmd === "git" && args[0] === "status") {
-      return { code: 0, stdout: statusReads++ === 0 ? " M src/fix.ts\\n" : "", stderr: "" };
+      const stdout = statusReads++ === 0 || committed ? "" : " M src/fix.ts\n";
+      return { code: 0, stdout, stderr: "" };
     }
+    if (cmd === "git" && args[0] === "commit") committed = true;
     if (cmd === "git" && (args[0] === "add" || args[0] === "commit")) {
       return { code: 0, stdout: "", stderr: "" };
     }
@@ -3763,7 +3766,7 @@ test("session fixer settles through the host commit gate", async () => {
     publication: "controller",
   };
   const launch = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, intent);
-  await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
   pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
     success: true,
     data: { details: { runId: "run-session-gate" } },
@@ -3774,6 +3777,44 @@ test("session fixer settles through the host commit gate", async () => {
   const gate = (await withDeadline(result.settled!, 1000)) as { state?: string };
   assert.equal(gate.state, "committed", "dirty session-fix work must reach the host commit gate");
   assert.ok(calls.some((call) => call.startsWith("git commit -m fix: review session")));
+});
+
+test("session fixer gate leaves pre-existing unrelated dirt uncommitted", async () => {
+  const calls: string[] = [];
+  let statusReads = 0;
+  let committed = false;
+  const pi = makeFakePi(async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    if (cmd === "git" && args[0] === "status") {
+      const stdout = statusReads++ === 0
+        ? " M unrelated.ts\n"
+        : committed
+          ? " M unrelated.ts\n"
+          : " M unrelated.ts\n M src/fix.ts\n";
+      return { code: 0, stdout, stderr: "" };
+    }
+    if (cmd === "git" && args[0] === "commit") committed = true;
+    return { code: 0, stdout: "", stderr: "" };
+  });
+  const spawn = captureSpawn(pi);
+  const { ctx } = makeFakeCtx();
+  const launch = (orch as never as { launchSessionFixer: Function }).launchSessionFixer(pi, ctx, {
+    ...SESSION_FIX_INTENT,
+    idempotencyKey: "k-session-unrelated-dirt",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  pi.events.emit(`${RPC_REPLY_PREFIX}${spawn.requestId}`, {
+    success: true,
+    data: { details: { runId: "run-session-unrelated-dirt" } },
+  });
+  const result = (await withDeadline(launch, 1000)) as { runId: string; settled: Promise<unknown> };
+  assert.equal(result.runId, "run-session-unrelated-dirt");
+  pi.events.emit(ASYNC_COMPLETE_EVENT, { runId: result.runId, success: true });
+  const gate = (await withDeadline(result.settled, 1000)) as { state?: string; reason?: string };
+  assert.equal(gate.state, "dirty");
+  assert.match(gate.reason ?? "", /unrelated pre-existing/);
+  const mutation = calls.filter((call) => call.startsWith("git add") || call.startsWith("git commit"));
+  assert.ok(mutation.every((call) => !call.includes("unrelated.ts")), mutation.join(" | "));
 });
 
 test("phase allowlist: every legacy launch's own agent sits inside its phase", () => {

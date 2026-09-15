@@ -760,6 +760,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		journal.runId = launched.runId;
 		journal.acceptedAt = now();
 		journal.worktree = journal.worktree || ob.worktree;
+		if (launched.preFixPorcelain !== undefined) journal.preFixPorcelain = launched.preFixPorcelain;
 		if (ob.writer) {
 			ob.writer.runId = launched.runId;
 			store.reserveWriter(ob.pr, ob.writer);

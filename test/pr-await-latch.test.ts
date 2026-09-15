@@ -9,7 +9,7 @@
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -2028,6 +2028,91 @@ test("queryRun recovers a live fixer after restart without spawning another", as
 		await h2.settle();
 		await sleep(80);
 		assert.equal(h2.sessionFixes.length, 0, "live disk snapshot must recover, not spawn a second fixer");
+	} finally {
+		rmSync(snapDir, { recursive: true, force: true });
+		h2?.cleanup();
+		h1.cleanup();
+	}
+});
+
+test("restarted controller gates terminal fixer before sampling HEAD", async () => {
+	const runId = `session-terminal-restart-gate-${process.pid}`;
+	const newHead = "cccccccccccccccccccccccccccccccccccccccc";
+	const h1 = harness(
+		(cmd, args) => {
+			if (cmd === "gh") return OPEN;
+			if (cmd === "git" && args?.[0] === "status") return ok("");
+			return ok(REAL_OUTPUT);
+		},
+		REPO,
+		{ onSessionFixer: () => ({ runId, recovered: false, preFixPorcelain: "" }) },
+	);
+	const snapDir = piRunDir(runId);
+	let committed = false;
+	const gateCalls: string[] = [];
+	const published: string[] = [];
+	let h2: ReturnType<typeof harness> | undefined;
+	try {
+		await h1.start();
+		await h1.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h1.dir, h1.sessionId);
+		await h1.settle();
+		await sleep(80);
+		writePiRunComplete(runId);
+
+		h2 = harness(
+			(cmd, args, opts) => {
+				gateCalls.push([cmd, ...(args ?? [])].join(" "));
+				if (cmd === "gh") return OPEN;
+				if (cmd === "git" && args?.[0] === "status") {
+					return ok(committed ? "" : " M src/fix.ts\n");
+				}
+				if (cmd === "git" && args?.[0] === "commit") {
+					committed = true;
+					return ok("");
+				}
+				if (cmd === "git" && args?.[0] === "rev-parse" && args?.[1] === "HEAD") {
+					assert.equal(opts?.cwd, REPO);
+					return ok(`${newHead}\n`);
+				}
+				return ok("");
+			},
+			REPO,
+			{
+				driverRunning: () => true,
+				publish: async (req: { localHead: string }) => {
+					published.push(req.localHead);
+					return { ok: true, remoteHead: req.localHead };
+				},
+			},
+		);
+		await h2.start();
+		await h2.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		const sourceObligation = readdirSync(join(h1.dir, "review"))
+			.filter((name) => name.endsWith(".json"))
+			.map((name) => JSON.parse(readFileSync(join(h1.dir, "review", name), "utf8")) as { launch?: { preFixPorcelain?: string } })
+			.find((item) => item.launch);
+		assert.ok(sourceObligation?.launch, "launch record must survive the first process");
+		assert.equal(sourceObligation?.launch?.preFixPorcelain, "", "restart gate needs the persisted baseline");
+		cpSync(join(h1.dir, "review"), join(h2.dir, "review"), { recursive: true });
+		assert.ok(readdirSync(join(h2.dir, "review")).some((name) => name.endsWith(".json")), "restart fixture must copy an obligation");
+		for (const name of readdirSync(join(h2.dir, "review"))) {
+			if (!name.endsWith(".json")) continue;
+			const path = join(h2.dir, "review", name);
+			const obligation = JSON.parse(readFileSync(path, "utf8")) as { owner?: { kind?: string; id?: string; generation?: string }; launch?: { preFixPorcelain?: string } };
+			if (obligation.owner?.kind === "session") {
+				obligation.owner.id = h2.sessionId;
+				obligation.owner.generation = h2.sessionId;
+				writeFileSync(path, `${JSON.stringify(obligation)}\n`);
+			}
+		}
+		writeActionable(h2.dir, h2.sessionId);
+		await h2.settle();
+		await sleep(100);
+		assert.equal(published.length, 1);
+		assert.deepEqual(published, [newHead], "restart must publish the post-gate HEAD");
+		assert.ok(gateCalls.some((call) => call.startsWith("git add -- :(literal)src/fix.ts")));
+		assert.ok(gateCalls.some((call) => call.startsWith("git commit -m fix: review session")));
 	} finally {
 		rmSync(snapDir, { recursive: true, force: true });
 		h2?.cleanup();
