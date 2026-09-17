@@ -81,6 +81,8 @@ const {
 	isExtensionOwnedStateFile,
 	readLiveRound,
 	repoKey,
+	referenceCheckoutFor,
+	resolveQueryCwd,
 	seedWaiterState,
 	spawnCwdFor,
 	waiterStatePath,
@@ -1062,6 +1064,58 @@ test("spawnCwdFor refuses a cwd that is not a git checkout", () => {
 		"same-origin slug is a defensible waiter cwd",
 	);
 });
+
+test("current worktree layout resolves removed, nested and container paths without crossing repos", () => {
+	const root = mkdtempSync(join(tmpdir(), "latch-layout-"));
+	const ref = join(root, "project");
+	mkdirSync(join(ref, ".git"), { recursive: true });
+	try {
+		for (const suffix of ["", "gone", "feature/nested/gone"]) {
+			const cwd = join(root, "wt", "project", suffix);
+			assert.equal(referenceCheckoutFor(cwd), ref, cwd);
+			assert.equal(resolveQueryCwd(cwd), ref, cwd);
+			assert.equal(spawnCwdFor({ pr: "552", cwd }), ref, cwd);
+		}
+		assert.equal(referenceCheckoutFor(join(root, "wt", "different", "gone")), undefined);
+		assert.equal(referenceCheckoutFor(join(root, "wt")), undefined);
+		assert.equal(referenceCheckoutFor(join(root, "unrelated", "project", "gone")), undefined);
+		const live = join(root, "wt", "project", "live");
+		mkdirSync(live, { recursive: true });
+		writeFileSync(join(live, ".git"), "gitdir: fixture");
+		assert.equal(referenceCheckoutFor(live), live, "live worktrees retain precedence");
+		assert.equal(spawnCwdFor({ pr: "552", cwd: join(root, "wt", "project", "gone"), slug: "wrong/repo" }), undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+for (const terminal of ["merged", "closed"] as const) {
+	test(`removed current-layout worktree ${terminal} wakes once despite a stale delivered verdict`, async () => {
+		const cwd = join(homedir(), "Dev", "git", "wt", "icemining", "__removed_latch_regression__", "nested");
+		assert.equal(existsSync(cwd), false);
+		const h = harness((cmd, args, opts) => {
+			if (cmd !== "gh") return ok("[]");
+			if (!existsSync(opts.cwd)) throw new Error("spawn ENOENT");
+			assert.equal(ghRepo(args), "moofone/icemining");
+			return terminal === "merged" ? MERGED : ok('{"state":"CLOSED","mergedAt":null}');
+		}, REPO, { watchMs: 15, watchStateDir: false });
+		try {
+			await h.start();
+			armObservedLatch(h.ctx, { pr: "552", cwd, lastNext: "yield", slug: "moofone/icemining" });
+			writeFileSync(waiterState(h.dir, "552"), JSON.stringify({ pr: "552", cwd,
+				lastNext: "read_comments_and_fix", verdictDelivered: true, round: "2", roundTotal: "2" }));
+			await h.settle();
+			await sleep(150);
+			assert.equal(h.wakes.length, 1, h.calls.join("\n"));
+			assert.match(h.wakes[0] ?? "", new RegExp(terminal));
+			assert.equal(h.sessionFixes.length, 0, "old delivered findings must not restart a fixer");
+			await sleep(60);
+			assert.equal(h.wakes.length, 1, "terminal notification is exactly once");
+		} finally {
+			h.cleanup();
+		}
+	});
+}
 
 const NOT_IN_THIS_REPO = {
 	stdout: "",
