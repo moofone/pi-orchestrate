@@ -1008,7 +1008,16 @@ export function undeliveredWaiterVerdicts(
 export function referenceCheckoutFor(cwd: string): string | undefined {
 	if (!cwd) return undefined;
 	if (existsSync(join(cwd, ".git"))) return cwd;
-	// Two shapes resolve to the same reference checkout:
+	// Current layout: <git-parent>/wt/<repo>/<branch...>. Walk path
+	// components (not directory contents) so removed trees, nested branch names,
+	// and the per-repo container all recover to the same reference checkout.
+	for (let project = cwd; dirname(project) !== project; project = dirname(project)) {
+		const container = dirname(project);
+		if (basename(container) !== "wt") continue;
+		const ref = join(dirname(container), basename(project));
+		if (existsSync(join(ref, ".git"))) return ref;
+	}
+	// Legacy shapes still resolve to the same reference checkout:
 	//   ~/Dev/git/<repo>-wt/<branch>  a worktree (possibly already removed)
 	//   ~/Dev/git/<repo>-wt           the worktree *container*, which holds no
 	//                                 `.git` of its own but is a real cwd a
@@ -1036,7 +1045,7 @@ export function referenceCheckoutFor(cwd: string): string | undefined {
 export function spawnCwdFor(latch: Partial<LatchState> | undefined): string | undefined {
 	if (!latch?.cwd) return undefined;
 	// `referenceCheckoutFor` returns `cwd` itself when it holds a `.git`, and
-	// otherwise maps a removed `<repo>-wt/<branch>` worktree back to its
+	// otherwise maps a removed `wt/<repo>/<branch...>` or legacy worktree to its
 	// reference checkout. Anything else — /tmp, an orchestrator scratch dir, a
 	// deleted tree with no reference — yields undefined, and *no* daemon is
 	// better than one that loops on `cannot resolve owner/repo`.
