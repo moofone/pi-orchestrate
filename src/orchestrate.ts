@@ -22,7 +22,7 @@
  * Never .pi/plan.md / enter_plan_mode. Workers never open a PR; code runs `gh pr create`.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync,
   cpSync,
@@ -327,6 +327,26 @@ function modelWithThinking(worker: { model: string; thinking: string }): string 
 
 function utcStamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+/** Random suffix so two sessions creating a Feature in the same millisecond do
+ * not share a `pending-<utc>` folder (orchestration_bug.md: pending-dir
+ * collision routes one session's planner at another session's plan.md). */
+function pendingRandomSuffix(): string {
+  return randomUUID().replace(/-/g, "").slice(0, 6);
+}
+
+/** Collision-proof `pending-<utc>-<rand>` name that does not yet exist under
+ * `repoDir`. Timestamp-only names collide within the same millisecond across
+ * sessions/processes (in-memory chain locks do not cross processes); the
+ * random suffix plus existence check makes reuse impossible without a
+ * filesystem race, and the retry loop closes even that. */
+export function uniquePendingName(repoDir: string): string {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const name = `pending-${utcStamp()}-${pendingRandomSuffix()}`;
+    if (!existsSync(join(repoDir, name))) return name;
+  }
+  return `pending-${utcStamp()}-${randomUUID().replace(/-/g, "")}`;
 }
 
 const NAME_MAX = 36;
@@ -1380,13 +1400,24 @@ export function matchFeature(rows: FeatureRow[], want: string): FeatureRow | und
     return x.keys.some((k) => k.length >= 12 && w.startsWith(`${k}-`));
   });
   if (extensions.length === 1) return extensions[0]!.r;
-  return (
-    rows.find(
-      (r) =>
-        r.name.toLowerCase().includes(w) ||
-        basename(r.dir).toLowerCase().includes(w),
-    ) || uniqueNearMiss(rows, w)
+  if (extensions.length > 1) return undefined;
+  // Substring fallback must be unique: a generic query like "gap" matching
+  // both "sync-gap" and "pplns-gap" across sessions/repos previously bound
+  // the first in array order (readdir order, non-deterministic), routing one
+  // session's scouts at another session's Feature (orchestration_bug.md
+  // 2026-09-20: icemining scouts returned PPLNS review content). Require
+  // uniqueness here; ambiguity returns undefined so the caller asks for
+  // disambiguation instead of silently binding the wrong Feature. Archived
+  // rows are ignored so a retired name cannot shadow a live one.
+  const substring = rows.filter(
+    (r) =>
+      !r.archived &&
+      (r.name.toLowerCase().includes(w) ||
+        basename(r.dir).toLowerCase().includes(w)),
   );
+  if (substring.length === 1) return substring[0];
+  if (substring.length > 1) return undefined;
+  return uniqueNearMiss(rows, w);
 }
 
 function featureIsActive(row: FeaturePick): boolean {
@@ -2044,9 +2075,9 @@ function migrateLegacyCurrent(repoDir: string): void {
   const named =
     planHeaderField(plan, "Name") || nameFromTitle(featureTitle(plan, ""));
   let destName =
-    named && !isPendingToken(named) ? named : `pending-${utcStamp()}`;
-  const dest = join(repoDir, destName);
-  if (existsSync(dest)) destName = `pending-${utcStamp()}`;
+    named && !isPendingToken(named) ? named : uniquePendingName(repoDir);
+  let dest = join(repoDir, destName);
+  if (existsSync(dest)) destName = uniquePendingName(repoDir);
   const finalDest = join(repoDir, destName);
   if (!existsSync(finalDest)) renameSync(current, finalDest);
 }
@@ -8436,7 +8467,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       }
       applyBase(paths, chosen);
       writeLastBase(chosen);
-      const feat = bindFeature(paths, join(paths.repoDir, `pending-${utcStamp()}`));
+      const feat = bindFeature(paths, join(paths.repoDir, uniquePendingName(paths.repoDir)));
       seedFeature(feat, objective);
       uiNotify(ctx, 
         `Planning a new Feature → ${feat.planFile}\n` +
