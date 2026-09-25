@@ -2812,18 +2812,10 @@ export function applySpawnPolicy(params: Record<string, unknown>): {
 }
 
 /**
- * Orchestrate-only children on the parent `subagent` tool path.
- * `tdd-worker` and `fixer` are shared with solo sessions (ad-hoc TDD, and
- * git-workflow `read_comments_and_fix`). `/orchestrate` still launches them
- * over RPC; `applySpawnPolicy` still pins their model/caps.
+ * Parent `subagent` tool path. No agent is orchestrate-only: a solo parent may
+ * launch any agent directly. `/orchestrate` still launches its children over
+ * RPC; `applySpawnPolicy` still pins model/caps on both paths.
  */
-const PARENT_FORBIDDEN_AGENTS = new Set([
-  "feature-qa",
-  "qa-opus",
-  "plan-reviewer",
-  "planner",
-]);
-
 export function subagentToolGuard(event: {
   toolName?: string;
   input?: unknown;
@@ -2834,13 +2826,6 @@ export function subagentToolGuard(event: {
   if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
   const params = input as Record<string, unknown>;
   if (typeof params.action === "string" && params.action.trim()) return undefined;
-  const agent = typeof params.agent === "string" ? params.agent.trim() : "";
-  if (PARENT_FORBIDDEN_AGENTS.has(agent)) {
-    return {
-      block: true,
-      reason: `refusing parent spawn of ${agent}; /orchestrate launches it`,
-    };
-  }
   const decision = applySpawnPolicy(params);
   if (decision.action === "reject") {
     return { block: true, reason: decision.reason ?? "spawn rejected" };
