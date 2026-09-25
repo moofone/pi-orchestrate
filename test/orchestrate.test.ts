@@ -4765,7 +4765,7 @@ test("T1: orchestrate.ts does not sendTurn planner, review, or resume prompts", 
   );
 });
 
-test("T1: subagentToolGuard allows shared writers and blocks orchestrate-only children", () => {
+test("T1: subagentToolGuard lets the parent spawn every agent directly", () => {
   const guard = (
     orch as never as {
       subagentToolGuard: (event: {
@@ -4784,9 +4784,11 @@ test("T1: subagentToolGuard allows shared writers and blocks orchestrate-only ch
     undefined,
     "solo parent can dispatch fixer",
   );
+  // No agent is orchestrate-only: a solo parent may launch planners, reviewers
+  // and QA directly (model/caps policy still applies via applySpawnPolicy).
   for (const agent of ["feature-qa", "qa-opus", "plan-reviewer", "planner"]) {
-    const blocked = guard({ toolName: "subagent", input: { agent, model: "xai/grok-4.6:high" } });
-    assert.equal(blocked?.block, true, `parent must not spawn ${agent}`);
+    const verdict = guard({ toolName: "subagent", input: { agent, task: "standalone run" } });
+    assert.equal(verdict, undefined, `parent must be able to spawn ${agent}: ${verdict?.reason}`);
   }
   assert.equal(
     guard({ toolName: "subagent", input: { action: "status", id: "run-1" } }),
