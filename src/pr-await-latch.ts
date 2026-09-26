@@ -169,6 +169,8 @@ const TERMINAL_NEXT = new Set(["done", "stop"]);
 
 /** Settle window for a burst of waiter writes. One `gh` call, not one per event. */
 const WATCH_DEBOUNCE_MS = 250;
+/** Wait-chrome spinner, advanced by the 1s chrome tick, never by an 80ms timer. */
+const WAIT_SPINNER_FRAMES = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 
 /**
  * `known` is the extension's in-memory latch. It is passed in because
@@ -295,6 +297,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	let waitCtx: ExtensionContext | undefined;
 	/** Pi's `Loader` — same braille frames and 80ms tick as the working spinner. */
 	let waitLoader: Loader | undefined;
+	let waitSpin: { color: (s: string) => string; frame: number } | undefined;
 	let terminalWoken = false;
 	/** Fingerprint of the ACTIONABLE verdict already injected this session. */
 	let lastActionableFingerprint: string | undefined;
@@ -504,17 +507,32 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			}
 			const linked = waitLine(true) ?? text;
 			if (waitLoader) {
+				// Advance one frame per chrome paint (~1s). Both calls request a
+				// render in the same tick, so pi coalesces them into one frame.
+				if (waitSpin) {
+					waitSpin.frame = (waitSpin.frame + 1) % WAIT_SPINNER_FRAMES.length;
+					waitLoader.setIndicator({
+						frames: [waitSpin.color(WAIT_SPINNER_FRAMES[waitSpin.frame] ?? "")],
+					});
+				}
 				waitLoader.setMessage(linked);
 				return;
 			}
 			ctx.ui.setWidget(
 				"pr-await",
 				(tui, theme) => {
+					// A single-frame indicator disables Loader's own 80ms interval.
+					// That interval re-rendered the whole transcript 12x/s for the
+					// entire (hours-long) wait: ~20-35% CPU per waiting session.
+					// The chrome timer advances the frame instead (see above).
+					const color = (s: string) => theme.fg("accent", s);
+					waitSpin = { color, frame: 0 };
 					const loader = new Loader(
 						tui,
-						(s) => theme.fg("accent", s),
+						color,
 						(s) => theme.fg("muted", s),
 						linked,
+						{ frames: [color(WAIT_SPINNER_FRAMES[0] ?? "")] },
 					);
 					(loader as Loader & { dispose: () => void }).dispose = () => {
 						loader.stop();
