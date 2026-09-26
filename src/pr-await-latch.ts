@@ -52,7 +52,6 @@ import {
 	MECHANICAL,
 	REPO_ROOT,
 	SHORT_MS,
-	adoptableLatch,
 	ensureDriver,
 	findFeatureOwningPr,
 	listFeaturePrOwners,
@@ -125,6 +124,8 @@ const TERMINAL_NEXT = new Set(["done", "stop"]);
 
 /** Settle window for a burst of waiter writes. One `gh` call, not one per event. */
 const WATCH_DEBOUNCE_MS = 250;
+/** Wait-chrome spinner, advanced by the 1s chrome tick, never by an 80ms timer. */
+const WAIT_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /**
  * `known` is the extension's in-memory latch. It is passed in because
@@ -234,6 +235,7 @@ type LatchSlot = {
 	waitStartedAt: number;
 	waitCtx: ExtensionContext | undefined;
 	waitLoader: Loader | undefined;
+	waitSpin: { color: (s: string) => string; frame: number } | undefined;
 	terminalWoken: boolean;
 	lastActionableFingerprint: string | undefined;
 	lastRefusedFingerprint: string | undefined;
@@ -264,6 +266,7 @@ function newLatchSlot(sessionId: string): LatchSlot {
 		waitStartedAt: 0,
 		waitCtx: undefined,
 		waitLoader: undefined,
+		waitSpin: undefined,
 		terminalWoken: false,
 		lastActionableFingerprint: undefined,
 		lastRefusedFingerprint: undefined,
@@ -560,18 +563,32 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			}
 			const linked = waitLine(true) ?? text;
 			const existingLoader = st().waitLoader;
+			const spin = st().waitSpin;
 			if (existingLoader) {
+				// Advance one frame per chrome paint (~1s). Both calls request a
+				// render in the same tick, so pi coalesces them into one frame.
+				if (spin) {
+					spin.frame = (spin.frame + 1) % WAIT_SPINNER_FRAMES.length;
+					existingLoader.setIndicator({ frames: [spin.color(WAIT_SPINNER_FRAMES[spin.frame] ?? "")] });
+				}
 				existingLoader.setMessage(linked);
 				return;
 			}
 			ctx.ui.setWidget(
 				"pr-await",
 				(tui, theme) => {
+					// A single-frame indicator disables Loader's own 80ms interval.
+					// That interval re-rendered the whole transcript 12x/s for the
+					// entire (hours-long) wait: ~20-35% CPU per waiting session.
+					// The chrome timer advances the frame instead (see above).
+					const color = (s: string) => theme.fg("accent", s);
+					st().waitSpin = { color, frame: 0 };
 					const loader = new Loader(
 						tui,
-						(s) => theme.fg("accent", s),
+						color,
 						(s) => theme.fg("muted", s),
 						linked,
+						{ frames: [color(WAIT_SPINNER_FRAMES[0] ?? "")] },
 					);
 					(loader as Loader & { dispose: () => void }).dispose = () => {
 						loader.stop();
@@ -1421,7 +1438,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		return hit;
 	}, pi.events);
 
-	pi.on("session_start", async (event, ctx) => withSession(ctx, async () => {
+	pi.on("session_start", async (_event, ctx) => withSession(ctx, async () => {
 		const id = ctx.sessionManager.getSessionId();
 		st().sessionId = id;
 		rememberCtx(ctx);
@@ -1430,11 +1447,6 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		pendingCommands.clear();
 		st().deferralActive = false;
 		if (!st().latchFile) return;
-
-		const reason =
-			event && typeof event === "object" && typeof (event as { reason?: unknown }).reason === "string"
-				? (event as { reason: string }).reason
-				: "startup";
 
 		// This session's own mustLatch(), and only that. The fallback used to be the
 		// shared `pi-<id>.json`, which by then was whatever the waiter had last
@@ -1499,21 +1511,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			void handoff(ctx, { wakeOnTerminal: true }).catch(() => {});
 			return;
 		}
-		if (reason === "new") return;
-		const repo = repoKey(ctx.cwd);
-		if (!repo) return;
-		const adopted = adoptableLatch(stateDir(), {
-			exclude: st().latchFile ? [st().latchFile as string] : [],
-			repo,
-			cwd: ctx.cwd,
-		});
-		if (!adopted) return;
-		setLatch({ ...adopted, origin: "adopted" });
-		// Successor of a wait in this worktree: still waiting, even though origin
-		// is adopted (the wake must not claim this session deferred the work).
-		st().deferralActive = true;
-		notify(ctx, `pr-latch: adopted ${prLinkLabel(adopted)} from a previous session`);
-		void handoff(ctx, { wakeOnTerminal: adopted.source !== "manual" }).catch(() => {});
+		// No session record or explicitly owned Feature means no ownership.
+		// A fresh CLI launch is "startup", not "new". Matching folders, dead
+		// processes, and shared manual waiter files cannot establish successorship.
+		// Reload/resume restore the same session above; a different session must
+		// explicitly run pr-await to claim a PR.
 	}));
 
 	pi.on("session_shutdown", async (_event, ctx) => withSession(ctx, () => {

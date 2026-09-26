@@ -741,34 +741,23 @@ test("ACTIONABLE is the judgment set the waiter records and the latch delivers",
 });
 
 // ---------------------------------------------------------------------------
-// Reload adoption. A pi reload mints a NEW session id, so `pi-<id>.json` does
-// not exist and the latch was silently dropped: no handoff, no watch, no wake.
-// That is how shared-lmdb#18 merged 19s before a reload and never resumed.
+// Session ownership. Reload/resume can restore the same session's record;
+// a new session ID cannot inherit another chat's latch from its folder.
 // ---------------------------------------------------------------------------
 
-test("reload under a NEW session id adopts an orphaned live latch and wakes", async () => {
+test("reload under a NEW session id leaves an orphaned latch alone", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_me__");
 	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT);
-	// A real reload leaves the dead session's OWN latch behind: `pi-<id>.latch.json`
-	// carrying its pid. That file is what makes this session a successor, so it is
-	// what the wake is licensed by. (It used to be sourced from `manual-9931.json`
-	// — the waiter's bookkeeping, which names no session at all. That is the exact
-	// route by which an unrelated `manual-2162.json` woke a fresh session.)
+	// A dead process is not proof that this new conversation is its successor.
 	const orphan = join(h.dir, "pi-DEAD-RELOAD.latch.json");
 	writeFileSync(orphan, JSON.stringify({ pr: "9931", cwd: WT, origin: "observed", pid: 999999 }));
 	try {
 		// Brand-new session id, same worktree: what a reload in that Feature produces.
 		await h.start({ reason: "reload" });
 		await sleep(120);
-		assert.equal(h.wakes.length, 1, `adopted latch must wake the reloaded parent; wakes=${h.wakes.length}`);
-		assert.match(h.wake(0), /#9931 merged/);
-		// Inherited, not observed: the wake may not assert this session deferred it.
-		assert.match(h.wake(0), /inherited/i);
-		assert.doesNotMatch(
-			h.wake(0),
-			/the work you deferred/i,
-			`an inherited latch must not claim this session deferred the work; got ${h.wake(0)}`,
-		);
+		assert.deepEqual(h.wakes, []);
+		assert.deepEqual(h.calls, []);
+		assert.ok(existsSync(orphan), "another session's latch is untouched");
 	} finally {
 		h.cleanup();
 		rmSync(orphan, { force: true });
@@ -998,16 +987,15 @@ test("a manual latch for a PR a live session already owns is not adopted", async
 	}
 });
 
-test("a waiter-written manual latch is still adoptable", async () => {
-	// `manual-<pr>.json` has no owning pi session by construction, so the pid rule
-	// must not lock out the case adoption exists for — but only in this worktree.
+test("a waiter-written manual latch is not session ownership", async () => {
+	// Waiter bookkeeping names no owning conversation, even in the same worktree.
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__manual_ok__");
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), WT);
 	writeFileSync(join(h.dir, "manual-9950.json"), JSON.stringify({ pr: "9950", cwd: WT }));
 	try {
 		await h.start({ reason: "reload" });
 		await sleep(120);
-		assert.equal(h.spawns.length, 1, "a manual latch must still be re-armed after a reload");
+		assert.equal(h.spawns.length, 0, "shared waiter state cannot arm a session");
 	} finally {
 		h.cleanup();
 	}
@@ -1028,7 +1016,7 @@ test("an inherited latch is not re-adopted onward by a third session", async () 
 	}
 });
 
-test("an adopted still-open latch is re-armed with a driver instead of dropped", async () => {
+test("an unowned still-open latch cannot arm a driver in another chat", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_open__");
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok("[]")), WT);
 	const orphan = join(h.dir, "manual-9933.json");
@@ -1036,7 +1024,7 @@ test("an adopted still-open latch is re-armed with a driver instead of dropped",
 	try {
 		await h.start({ reason: "reload" });
 		await sleep(120);
-		assert.equal(h.spawns.length, 1, "reload must re-ensure the waiter for an adopted open PR");
+		assert.equal(h.spawns.length, 0, "reload cannot claim an unowned PR");
 		assert.equal(h.wakes.length, 0, "an open PR must not wake the parent");
 	} finally {
 		h.cleanup();
@@ -1044,10 +1032,10 @@ test("an adopted still-open latch is re-armed with a driver instead of dropped",
 	}
 });
 
-test("adopted terminal latch wakes exactly once even with the watch armed", async () => {
+test("same-session terminal latch wakes exactly once even with the watch armed", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__adopt_once__");
 	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT, { watchMs: 20 });
-	const orphan = join(h.dir, "pi-DEAD-ONCE.latch.json");
+	const orphan = join(h.dir, `pi-${h.sessionId}.latch.json`);
 	writeFileSync(orphan, JSON.stringify({ pr: "9932", cwd: WT, origin: "observed", pid: 999999 }));
 	try {
 		await h.start({ reason: "reload" });
@@ -1215,10 +1203,8 @@ test("defaultSpawnDriver never falls back to HOME or process.cwd()", async () =>
 	rmSync(DRIVER_PROBE_DIR, { recursive: true, force: true });
 });
 
-test("a manual latch still wakes about a merge it actually witnesses", async () => {
-	// The other half of the #2162 rule. Suppressing the *already-merged* wake must
-	// not suppress a real one: if the PR is open when adopted, this session took
-	// over the wait, and the merge that follows is genuinely its outcome.
+test("an observed session latch wakes about a merge it witnesses", async () => {
+	// Removing directory-based adoption must preserve the actual owner's wake.
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__manual_witness__");
 	let merged = false;
 	const h = harness(
@@ -1230,12 +1216,12 @@ test("a manual latch still wakes about a merge it actually witnesses", async () 
 		WT,
 		{ watchMs: 20 },
 	);
-	writeFileSync(join(h.dir, "manual-9955.json"), JSON.stringify({ pr: "9955", cwd: WT }));
+	writeFileSync(join(h.dir, `pi-${h.sessionId}.latch.json`), JSON.stringify({ pr: "9955", cwd: WT, origin: "observed" }));
 	try {
 		await h.start({ reason: "reload" });
 		await sleep(80);
 		assert.equal(h.wakes.length, 0, "still open — nothing to announce yet");
-		assert.equal(h.spawns.length, 1, "an adopted open PR must get its waiter back");
+		assert.equal(h.spawns.length, 1, "the owning session must get its waiter back");
 		merged = true;
 		await sleep(200);
 		assert.equal(h.wakes.length, 1, `a witnessed merge must wake; got ${h.wakes.join(" | ")}`);
@@ -1251,7 +1237,7 @@ test("no wake is ever labelled with a bare, repo-less PR number", async () => {
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__labelled__");
 	const h = harness((cmd) => (cmd === "gh" ? MERGED : ok("[]")), WT);
 	writeFileSync(
-		join(h.dir, "pi-DEAD-LABEL.latch.json"),
+		join(h.dir, `pi-${h.sessionId}.latch.json`),
 		JSON.stringify({ pr: "478", cwd: WT, origin: "observed", pid: 999999 }),
 	);
 	try {
@@ -1265,7 +1251,7 @@ test("no wake is ever labelled with a bare, repo-less PR number", async () => {
 	}
 });
 
-test("a terminal manual latch is retired so later sessions stop re-adopting it", async () => {
+test("an unowned terminal manual latch is left to its owner", async () => {
 	// manual-2162.json survived its own PR's merge and stayed adoptable for the
 	// full 24h window, so every subsequent session in the repo picked it up again.
 	const WT = join(homedir(), "Dev", "git", "ice-wt", "__retire__");
@@ -1276,7 +1262,7 @@ test("a terminal manual latch is retired so later sessions stop re-adopting it",
 		await h.start({ reason: "reload" });
 		await sleep(120);
 		assert.equal(h.wakes.length, 0);
-		assert.equal(existsSync(spent), false, "a merged manual latch must not survive to be re-adopted");
+		assert.equal(existsSync(spent), true, "a fresh chat must not clean up another owner's state");
 	} finally {
 		h.cleanup();
 	}
@@ -2027,9 +2013,20 @@ test("wait chrome is a Loader factory, not a frozen braille string", async () =>
 		assert.equal(
 			typeof last,
 			"function",
-			"widget must be a TUI factory so pi's Loader can tick at 80ms",
+			"widget must be a TUI factory so the Loader can advance its frame",
 		);
 		assert.equal(Array.isArray(last), false, "a frozen string array cannot animate");
+		let renders = 0;
+		const loader = (last as (tui: unknown, theme: unknown) => { intervalId: unknown; stop(): void })(
+			{ requestRender: () => renders++ },
+			{ fg: (_c: string, s: string) => s },
+		);
+		assert.equal(
+			loader.intervalId,
+			null,
+			"no 80ms Loader interval: it re-renders the whole transcript 12x/s for hours (high CPU)",
+		);
+		loader.stop();
 	} finally {
 		h.cleanup();
 	}
@@ -2419,11 +2416,11 @@ test("solo observed merge still wakes after an unrelated prompt from the waiter 
 	}
 });
 
-test("an adopted latch does not wake on merge after a later user prompt", async () => {
+test("a legacy adopted same-session latch does not wake after a later user prompt", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, watchOnly);
 	writeFileSync(
-		join(h.dir, "pi-DEAD.latch.json"),
-		JSON.stringify({ pr: "2142", cwd: REPO, origin: "observed", pid: 999999999 }),
+		join(h.dir, `pi-${h.sessionId}.latch.json`),
+		JSON.stringify({ pr: "2142", cwd: REPO, origin: "adopted", pid: 999999999 }),
 	);
 	try {
 		await h.start();
