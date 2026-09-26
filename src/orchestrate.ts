@@ -2187,11 +2187,31 @@ export function ensureFeatureNamed(
   return { plan: next, name, branch, assigned: true };
 }
 
+/** stat-keyed cache: the 1s overlay heartbeat re-scans every Feature (MBs of
+ * plan/status text) in every Pi session; re-reading unchanged files blocked the
+ * event loop ~20ms/s and churned GC, causing input lag. */
+const readTextCache = new Map<string, { key: string; text: string }>();
+
 function readText(path: string): string {
-  if (!existsSync(path)) return "";
+  let st: ReturnType<typeof statSync> | undefined;
   try {
-    return readFileSync(path, "utf8");
+    st = statSync(path, { throwIfNoEntry: false });
   } catch {
+    st = undefined;
+  }
+  if (!st) {
+    readTextCache.delete(path);
+    return "";
+  }
+  const key = `${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+  const hit = readTextCache.get(path);
+  if (hit && hit.key === key) return hit.text;
+  try {
+    const text = readFileSync(path, "utf8");
+    readTextCache.set(path, { key, text });
+    return text;
+  } catch {
+    readTextCache.delete(path);
     return "";
   }
 }
