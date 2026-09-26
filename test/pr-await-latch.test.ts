@@ -3065,9 +3065,20 @@ test("wait chrome is a Loader factory, not a frozen braille string", async () =>
 		assert.equal(
 			typeof last,
 			"function",
-			"widget must be a TUI factory so pi's Loader can tick at 80ms",
+			"widget must be a TUI factory so the Loader can advance its frame",
 		);
 		assert.equal(Array.isArray(last), false, "a frozen string array cannot animate");
+		let renders = 0;
+		const loader = (last as (tui: unknown, theme: unknown) => { intervalId: unknown; stop(): void })(
+			{ requestRender: () => renders++ },
+			{ fg: (_c: string, s: string) => s },
+		);
+		assert.equal(
+			loader.intervalId,
+			null,
+			"no 80ms Loader interval: it re-renders the whole transcript 12x/s for hours (high CPU)",
+		);
+		loader.stop();
 	} finally {
 		h.cleanup();
 	}
