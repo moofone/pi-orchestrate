@@ -982,7 +982,7 @@ export function undeliveredWaiterVerdicts(
 	const paths: string[] = [...waiterManualFiles(want, dir, repo)];
 	let names: string[] = [];
 	try {
-		names = readdirSync(dir);
+		names = listDirCached(dir);
 	} catch {
 		names = [];
 	}
@@ -1154,7 +1154,7 @@ export function adoptableLatch(
 	let best: { state: LatchState; mtime: number } | undefined;
 	let names: string[];
 	try {
-		names = readdirSync(dir);
+		names = listDirCached(dir);
 	} catch {
 		return undefined;
 	}
@@ -1268,6 +1268,26 @@ export function waiterPaths(
  * because #2232 does would leave #232 with none at all. Repo names contain
  * digits and hyphens (`icemining-devops`), so only an exact `-<pr>` tail counts.
  */
+/**
+ * The waiter state dir accumulates thousands of files and the wait chrome lists
+ * it several times per 1s tick in every waiting session; readdir dominated CPU.
+ * Reuse a listing while the directory itself is unchanged (add/remove/rename
+ * bumps its mtime/ctime); the short TTL bounds any same-tick staleness.
+ * Throws like readdirSync so callers keep their ENOENT handling.
+ */
+const DIR_LIST_TTL_MS = 5_000;
+const dirListCache = new Map<string, { key: string; at: number; names: string[] }>();
+
+export function listDirCached(dir: string, now = Date.now()): string[] {
+	const st = statSync(dir);
+	const key = `${st.ino}:${st.mtimeMs}:${st.ctimeMs}:${st.size}`;
+	const hit = dirListCache.get(dir);
+	if (hit && hit.key === key && now - hit.at < DIR_LIST_TTL_MS) return hit.names.slice();
+	const names = readdirSync(dir);
+	dirListCache.set(dir, { key, at: now, names });
+	return names.slice();
+}
+
 function waiterRepoToken(repo?: string): string {
 	return githubRepoShortName(repo);
 }
@@ -1286,7 +1306,7 @@ function waiterFilesFor(
 	const wantRepo = waiterRepoToken(repo);
 	let names: string[];
 	try {
-		names = readdirSync(dir);
+		names = listDirCached(dir);
 	} catch {
 		// No state directory yet means no waiter has ever run. That is an
 		// answer, not a failure: throwing here would take the session down.
