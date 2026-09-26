@@ -3055,7 +3055,12 @@ test("githubPrUrlFor picks the URL whose pull number matches, not the first URL"
 });
 
 test("wait chrome is a Loader factory, not a frozen braille string", async () => {
-	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchMs: 20 });
+	const chromeMs = 500;
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, {
+		watchMs: 60_000,
+		chromeMs,
+	});
+	let loader: { stop(): void } | undefined;
 	try {
 		await h.start();
 		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
@@ -3069,17 +3074,66 @@ test("wait chrome is a Loader factory, not a frozen braille string", async () =>
 		);
 		assert.equal(Array.isArray(last), false, "a frozen string array cannot animate");
 		let renders = 0;
-		const loader = (last as (tui: unknown, theme: unknown) => { intervalId: unknown; stop(): void })(
+		const indicatorFrames: string[] = [];
+		loader = (last as (
+			tui: { requestRender(): void },
+			theme: { fg(color: string, text: string): string },
+		) => { stop(): void })(
 			{ requestRender: () => renders++ },
-			{ fg: (_c: string, s: string) => s },
+			{
+				fg: (color, text) => {
+					if (color === "accent") indicatorFrames.push(text);
+					return text;
+				},
+			},
+		);
+
+		const initialPaintCount = h.titles.length;
+		const initialRenderCount = renders;
+		await sleep(300);
+		const firstWindowPaints = h.titles.length - initialPaintCount;
+		assert.equal(
+			renders,
+			initialRenderCount + firstWindowPaints * 2,
+			"only the two Loader updates from each chrome paint may request a render during 300ms",
 		);
 		assert.equal(
-			loader.intervalId,
-			null,
-			"no 80ms Loader interval: it re-renders the whole transcript 12x/s for hours (high CPU)",
+			indicatorFrames.length,
+			1 + firstWindowPaints,
+			"every steady-state chrome paint must advance the indicator",
 		);
-		loader.stop();
+
+		const waitForPaints = async (count: number) => {
+			const deadline = Date.now() + 1500;
+			while (h.titles.length < initialPaintCount + count && Date.now() < deadline) {
+				await sleep(10);
+			}
+			assert.ok(h.titles.length >= initialPaintCount + count, `expected ${count} chrome paints`);
+		};
+
+		await waitForPaints(2);
+		const twoPaintRenderCount = initialRenderCount + (h.titles.length - initialPaintCount) * 2;
+		assert.equal(renders, twoPaintRenderCount, "renders remain bounded by the chrome paints");
+		assert.equal(
+			indicatorFrames.length,
+			1 + h.titles.length - initialPaintCount,
+			"each subsequent chrome paint calls setIndicator with its next frame",
+		);
+		for (let i = 1; i < indicatorFrames.length; i++) {
+			assert.notEqual(indicatorFrames[i], indicatorFrames[i - 1], "each chrome paint advances the frame");
+		}
+
+		const lastPaintCount = h.titles.length;
+		const lastRenderCount = renders;
+		await sleep(300);
+		const finalWindowPaints = h.titles.length - lastPaintCount;
+		assert.equal(
+			renders,
+			lastRenderCount + finalWindowPaints * 2,
+			"between chrome paints, the Loader must not re-render the transcript every 80ms",
+		);
 	} finally {
+		loader?.stop();
 		h.cleanup();
 	}
 });
