@@ -1,7 +1,7 @@
 {
   "autoAdvanceOnLanded": true,
-  "planReviewer": "openai-codex/gpt-5.6-luna:xhigh",
-  "qaReviewer": "cursor/grok-4.6:high",
-  "tddWorkerSimple": "openai-codex/gpt-5.6-luna:xhigh",
-  "tddWorkerCritical": "openai-codex/gpt-5.6-luna:xhigh"
+  "planReviewer": "openai-codex/gpt-6-luna:xhigh",
+  "qaReviewer": "cursor/grok-4.7:high",
+  "tddWorkerSimple": "openai-codex/gpt-6-luna:xhigh",
+  "tddWorkerCritical": "openai-codex/gpt-6-luna:xhigh"
 }

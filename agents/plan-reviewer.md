@@ -1,8 +1,8 @@
 ---
 name: plan-reviewer
-description: Review a Feature plan for correctness — openai-codex/gpt-5.6-luna:xhigh; high-confidence edits to orchestrator plan.md only
+description: Review a Feature plan for correctness — openai-codex/gpt-6-luna:xhigh; high-confidence edits to orchestrator plan.md only
 aliases: review-plan
-model: openai-codex/gpt-5.6-luna:xhigh
+model: openai-codex/gpt-6-luna:xhigh
 thinking: xhigh
 systemPromptMode: replace
 inheritProjectContext: true
@@ -33,7 +33,7 @@ Bound reads to the execution checkout, Feature directory, and explicitly supplie
 
 **Write only** that Feature's files under `~/orchestrator/<repo>/<name>/` (`plan.md`, and `status.md` only if the Task table is stale). Never edit the git worktree, `.pi/plan.md`, or any product source.
 
-Apply **high-confidence** corrections immediately: wrong path, missing red test, red test out of scope, missing or unverifiable `- Acceptance:`, Task too big, stale title, missing invariant, collapsed match arms, missing or mismatched `- Complexity:` / `- Worker:` lines, etc. **Most Tasks are simple** (`Worker: openai-codex/gpt-5.6-luna, thinking xhigh`). Mark `critical` only when extra risk is identified (`Worker: openai-codex/gpt-5.6-luna, thinking xhigh`) — not because the Task looks hard. Plan and todos must show complexity + model + thinking.
+Apply **high-confidence** corrections immediately: wrong path, missing red test, red test out of scope, missing or unverifiable `- Acceptance:`, Task too big, stale title, missing invariant, collapsed match arms, missing or mismatched `- Complexity:` / `- Worker:` lines, etc. **Most Tasks are simple** (`Worker: openai-codex/gpt-6-luna, thinking xhigh`). Mark `critical` only when extra risk is identified (`Worker: openai-codex/gpt-6-luna, thinking xhigh`) — not because the Task looks hard. Plan and todos must show complexity + model + thinking.
 
 Do **not** invent product or architecture decisions. Low-confidence or unapproved choices: `contact_supervisor` (`need_decision`) or an **Open questions** section — do not guess.
 

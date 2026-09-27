@@ -142,8 +142,8 @@ export const FORBIDDEN = [
   "Do NOT open a PR per Task. tdd-worker never opens a PR.",
   "Do NOT edit, stage, or commit in a reference checkout under ~/Dev/git/<repo>.",
   "Do NOT launch tdd-worker with cwd set to a reference checkout.",
-  "Do NOT spawn tdd-worker, fixer, feature-qa, qa-opus, planner, or plan-reviewer from this parent. The /orchestrate extension launches those.",
-  "Do NOT launch tdd-worker on composer-*, inherit, or unnamed models. Simple tdd-worker is `tddWorkerSimple` (openai-codex/gpt-5.6-luna:xhigh). Critical tdd-worker is `tddWorkerCritical` (openai-codex/gpt-5.6-luna:xhigh). feature-qa and qa-opus are `qaReviewer` (cursor/grok-4.6:high). plan-reviewer is `planReviewer` (cursor/grok-4.6:high) — never name your own. Never fall back to this session's model.",
+  "Do NOT spawn tdd-worker, fixer, feature-qa, planner, or plan-reviewer from this parent during an orchestrated Feature. The /orchestrate extension launches those. Standalone qa-opus reviews may be launched directly; /orchestrate owns QA for its own Feature.",
+  "Do NOT launch tdd-worker on composer-*, inherit, or unnamed models. Simple tdd-worker is `tddWorkerSimple` (openai-codex/gpt-6-luna:xhigh). Critical tdd-worker is `tddWorkerCritical` (openai-codex/gpt-6-luna:xhigh). Orchestrated feature-qa and qa-opus are `qaReviewer` (cursor/grok-4.7:high). plan-reviewer is `planReviewer` (cursor/grok-4.6:high) — never name your own for an orchestrated Feature. Never fall back to this session's model.",
   "ALWAYS follow git-workflow aliases: `git wt`, `git pr-await`, `git pr-land`, `git wt-rm`. Never raw `git worktree add` / `gh pr merge` for those steps.",
   "`next=yield` means stop talking. Do not re-invoke, pipe, `timeout`, or `--once` on `git pr-await`. `ghl-pr-await` owns the wait.",
 ].join("\n");
@@ -177,14 +177,14 @@ type WriterSpec = { model: string; thinking: string; short: string };
 
 const DEFAULT_WORKERS: Record<WriterComplexity, WriterSpec> = {
   simple: {
-    model: "openai-codex/gpt-5.6-luna",
+    model: "openai-codex/gpt-6-luna",
     thinking: "xhigh",
-    short: "gpt-5.6-luna xhigh",
+    short: "gpt-6-luna xhigh",
   },
   critical: {
-    model: "openai-codex/gpt-5.6-luna",
+    model: "openai-codex/gpt-6-luna",
     thinking: "xhigh",
-    short: "gpt-5.6-luna xhigh"
+    short: "gpt-6-luna xhigh"
   },
 };
 
@@ -245,7 +245,7 @@ const WRITER_AGENTS = new Set(["tdd-worker", "fixer", "feature-qa", "qa-opus", "
 /**
  * The review agents, and the places their models are decided.
  *
- * `feature-qa` and `qa-opus` are `qaReviewer` (cursor/grok-4.6).
+ * `feature-qa` and `qa-opus` are `qaReviewer` (cursor/grok-4.7).
  * `plan-reviewer` is `planReviewer` (cursor/grok-4.6). Luna xhigh is legal
  * for simple and critical tdd-workers and refused here;
  * launching QA on the wrong id is refused by modelScope before the child
@@ -259,9 +259,9 @@ const WRITER_AGENTS = new Set(["tdd-worker", "fixer", "feature-qa", "qa-opus", "
  * in settings.json to match. Nothing else.
  */
 const QA_AGENTS = new Set(["feature-qa", "qa-opus", "plan-reviewer"]);
-const DEFAULT_QA_MODEL = "cursor/grok-4.6";
-const DEFAULT_FEATURE_QA_MODEL = "cursor/grok-4.6";
-const DEFAULT_QA_OPUS_MODEL = "cursor/grok-4.6";
+const DEFAULT_QA_MODEL = "cursor/grok-4.7";
+const DEFAULT_FEATURE_QA_MODEL = "cursor/grok-4.7";
+const DEFAULT_QA_OPUS_MODEL = "cursor/grok-4.7";
 /** Per-agent thinking, used when neither the caller nor the sidecar names one. */
 const QA_THINKING: Record<string, string> = {
   "feature-qa": "high",
@@ -269,7 +269,7 @@ const QA_THINKING: Record<string, string> = {
   "plan-reviewer": "high",
 };
 
-/** QA never launches above high. tdd-worker is openai-codex/gpt-5.6-luna:xhigh. */
+/** QA never launches above high. tdd-worker is openai-codex/gpt-6-luna:xhigh. */
 function capThinking(level: string): string {
   return /^(xhigh|extra-high|max)$/i.test(level.trim()) ? "high" : level;
 }
@@ -333,8 +333,8 @@ export function isAllowedWriterModel(model: string): boolean {
   if (typeof model !== "string") return false;
   const base = (model.split(":")[0] ?? "").trim().toLowerCase();
   return (
-    base === "openai-codex/gpt-5.6-luna" ||
-    base === "cursor/grok-4.6" ||
+    base === "openai-codex/gpt-6-luna" ||
+    base === "cursor/grok-4.7" ||
     base === "anthropic/claude-opus-5"
   );
 }
@@ -1826,7 +1826,7 @@ const VERB_COMPLETIONS = [
   { value: "resume", label: "resume", description: "Unpause and continue" },
   { value: "status", label: "status", description: "All Features, Tasks, PRs" },
   { value: "review", label: "review", description: "cursor/grok-4.6 high plan review" },
-  { value: "qa", label: "qa", description: "cursor/grok-4.6 high QA Tasks on a Feature" },
+  { value: "qa", label: "qa", description: "cursor/grok-4.7 high QA Tasks on a Feature" },
   { value: "help", label: "help", description: "Usage" },
 ];
 
@@ -2313,7 +2313,7 @@ function isDraft(plan: string): boolean {
  */
 const TASK_SEP = "[—–:.-]";
 
-/** `- Worker: openai-codex/gpt-5.6-luna, thinking xhigh` or `openai-codex/gpt-5.6-luna:xhigh`. */
+/** `- Worker: openai-codex/gpt-6-luna, thinking xhigh` or `openai-codex/gpt-6-luna:xhigh`. */
 export function parseTaskWorkerLine(body: string): { model?: string; thinking?: string } {
   const wk = body.match(/-\s*Worker:\s*(.+)$/im);
   const raw = (wk?.[1] ?? "").replace(/#.*$/, "").trim();
@@ -2440,7 +2440,7 @@ function withAgentSuffix(subject: string, label: string): string {
   return label ? `${subject} · ${label}` : subject;
 }
 
-/** Task row: `simple · tdd-worker gpt-5.6-luna:xhigh`. */
+/** Task row: `simple · tdd-worker gpt-6-luna:xhigh`. */
 export function overlayTaskAgentLabel(
   complexity?: "simple" | "critical",
   workerModel?: string,
@@ -3430,7 +3430,7 @@ export function isForbiddenBillingModel(model: string): boolean {
   if (!base || base === "inherit") return true;
   if (base.startsWith("cursor/")) return true;
   if (base.includes("composer")) return true;
-  if (base === "grok-4.6") return true;
+  if (base === "grok-4.6" || base === "grok-4.7") return true;
   return false;
 }
 
@@ -3561,11 +3561,11 @@ function applyOneSpawn(params: Record<string, unknown>): {
       reason: `refusing ${agent || "subagent"} on ${model}; cursor/grok-4.6, composer, and inherit are not allowed`,
     };
   }
-  if (typeof params.model === "string" && /grok-4\.6/i.test(params.model)) {
+  if (typeof params.model === "string" && /grok-4\.(6|7)/i.test(params.model)) {
     const capped = params.model.replace(/:(xhigh|extra-high|max)\b/i, ":high");
     if (capped !== params.model) {
       params.model = capped;
-      return { action: "pin", reason: `capped grok-4.6 thinking to high (refused xhigh)` };
+      return { action: "pin", reason: `capped grok thinking to high (refused xhigh)` };
     }
   }
   return { action: "allow" };
@@ -3606,15 +3606,10 @@ export function applySpawnPolicy(params: Record<string, unknown>): {
   return worst;
 }
 
-/** Parent-model `subagent` tool path — mutate input on pin, `{block}` on reject. */
-const PARENT_FORBIDDEN_AGENTS = new Set([
-  "tdd-worker",
-  "feature-qa",
-  "qa-opus",
-  "plan-reviewer",
-  "planner",
-]);
-
+/**
+ * Parent-model `subagent` tool path — mutate input on pin, `{block}` on reject.
+ * No agent is orchestrate-only: a solo parent may launch any agent directly.
+ */
 export function subagentToolGuard(event: {
   toolName?: string;
   input?: unknown;
@@ -3626,12 +3621,9 @@ export function subagentToolGuard(event: {
   const params = input as Record<string, unknown>;
   if (typeof params.action === "string" && params.action.trim()) return undefined;
   const agent = typeof params.agent === "string" ? params.agent.trim() : "";
-  if (PARENT_FORBIDDEN_AGENTS.has(agent)) {
-    return {
-      block: true,
-      reason: `refusing parent spawn of ${agent}; /orchestrate launches it`,
-    };
-  }
+  // Standalone QA keeps its agent-configured Opus model; orchestrated QA
+  // continues through the RPC path and its dedicated reviewer pin.
+  if (agent === "qa-opus") return undefined;
   const decision = applySpawnPolicy(params);
   if (decision.action === "reject") {
     return { block: true, reason: decision.reason ?? "spawn rejected" };
@@ -7218,9 +7210,7 @@ export function parentGitWorkflowAppend(input: {
     );
   }
   if ((input.featureLive || input.latchWake) && !input.featureLanded) {
-    parts.push(
-      `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`,
-    );
+    parts.push(ORCHESTRATE_LIVE_BASELINE);
   }
   if (input.featureLive) {
     parts.push(FORBIDDEN);
@@ -7275,6 +7265,42 @@ export function parentGitWorkflowAppend(input: {
     );
   }
   return parts.join("\n\n");
+}
+
+/** Stable floor for the `orchestrate-live` section once a session has carried it. */
+export const ORCHESTRATE_LIVE_BASELINE = `git-workflow is not optional progressive disclosure. Read ${GIT_WORKFLOW_SKILL} with the read tool before any worktree, PR, review-fix, or merge work. The skills-list description is not the skill.`;
+
+/**
+ * Whether the transcript's effective system prompt currently carries the
+ * `orchestrate-live` section: the last system message that mentions it wins,
+ * and `null` means it was removed.
+ */
+export function transcriptHasOrchestrateLive(entries: readonly unknown[] | undefined): boolean {
+  if (!entries) return false;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i] as { type?: string; message?: { role?: string; sections?: Record<string, unknown> } };
+    if (entry?.type !== "message" || entry.message?.role !== "system") continue;
+    const sections = entry.message.sections;
+    if (!sections || !Object.prototype.hasOwnProperty.call(sections, "orchestrate-live")) continue;
+    return sections["orchestrate-live"] !== null && sections["orchestrate-live"] !== undefined;
+  }
+  return false;
+}
+
+/**
+ * The `orchestrate-live` section value for this turn. Once a session carries
+ * the section it never goes away: quiet turns fall back to the stable baseline
+ * instead of removing it. Toggling the section on/off per turn (e.g. only on
+ * pr-latch wakes) made Anthropic's thinking-block prefix binding drop two
+ * different sets of historical thinking blocks, alternating the wire history
+ * and forcing a full ~650k-token cache re-write on most flips.
+ */
+export function resolveOrchestrateLiveSection(
+  extra: string | undefined,
+  alreadyPresent: boolean,
+): string | undefined {
+  if (extra) return extra;
+  return alreadyPresent ? ORCHESTRATE_LIVE_BASELINE : undefined;
 }
 
 export function plannerLaunchParams(paths: Paths, objective: string, baseline = ""): Record<string, unknown> {
@@ -7853,7 +7879,7 @@ ${loc}
 /orchestrate resume          unpause + continue auto loop
 /orchestrate status          all Features, Tasks, PRs
 /orchestrate review [feature]  cursor/grok-4.6 high plan review; high-confidence plan edits
-/orchestrate qa [feature]      end QA: qa-opus cursor/grok-4.6 high (auto feature-qa is cursor/grok-4.6 high after Tasks 1..N)
+/orchestrate qa [feature]      end QA: qa-opus cursor/grok-4.7 high (auto feature-qa is cursor/grok-4.7 high after Tasks 1..N)
 /orchestrate implement [feature] [task]   escape hatch: re-open one Task
 /orchestrate pr [feature]                 escape hatch: land the Feature PR
 
@@ -7867,9 +7893,9 @@ the session is never asked to implement; pr_round counts those fix writers.
 One chain per Feature: a second approve/resume while one is running is refused.
 autoAdvanceOnLanded (orchestrate.json, default true): harness fail + landed
 work → next Task. Override per Feature with auto_advance_on_landed in status.md.
-qaReviewer (orchestrate.json) is feature-qa and qa-opus (cursor/grok-4.6:high).
+qaReviewer (orchestrate.json) is feature-qa and qa-opus (cursor/grok-4.7:high).
 planReviewer is plan-reviewer (cursor/grok-4.6:high). tddWorkerSimple / tddWorkerCritical
-are tdd-worker pins (openai-codex/gpt-5.6-luna xhigh). Planner inherits this session's model (\`inherit\`) and is not
+are tdd-worker pins (openai-codex/gpt-6-luna xhigh). Planner inherits this session's model (\`inherit\`) and is not
 pinned to xai/grok-4.6. Changing those models also needs modelScope.agents.* in
 settings.json.
 Approve/resume/implement first settle a Task an earlier (now dead) session
@@ -7958,8 +7984,27 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
       awaitingPr: !featureLanded && liveFeatureAwaitingPr(cwd, undefined, session),
       featureLanded,
     });
-    if (!extra) return;
-    return { systemPrompt: `${event.systemPrompt}\n\n${extra}` };
+    // Inject as a named section, NOT via returned systemPrompt. Returning
+    // systemPrompt replaces the provider's leading system prompt: since `extra`
+    // changes on every orchestration state transition, that invalidated the
+    // entire prompt cache on resume turns (~$1.25 re-bill at 230k ctx).
+    // Sections are diffed per turn — pi appends a mid-conversation system
+    // message patching only this section, preserving the cached prefix on
+    // models with supportsMidConvoSystemMessages (e.g. claude-opus-5).
+    // `null` removes the section when orchestration goes quiet.
+    // `sections` exists on the runtime's NormalizedBuildSystemPromptOptions;
+    // this package's bundled pi types predate it.
+    const promptOpts = event.systemPromptOptions as typeof event.systemPromptOptions & {
+      sections?: Record<string, string>;
+    };
+    const branch = (ctx as { sessionManager?: { getBranch?: () => unknown[] } }).sessionManager?.getBranch?.();
+    const section = resolveOrchestrateLiveSection(extra, transcriptHasOrchestrateLive(branch));
+    if (section) {
+      (promptOpts.sections ??= {})["orchestrate-live"] = section;
+    } else if (promptOpts.sections) {
+      delete promptOpts.sections["orchestrate-live"];
+    }
+    return;
   });
 
   pi.registerEntryRenderer<ApproveCardData>(APPROVE_ENTRY, (entry, options, theme) =>

@@ -1,8 +1,8 @@
 ---
 name: tdd-worker
-description: Fresh-context TDD implementer — openai-codex/gpt-5.6-luna:xhigh, red-first, one writer, no PR
+description: Fresh-context TDD implementer — openai-codex/gpt-6-luna:xhigh, red-first, one writer, no PR
 aliases: tdd
-model: openai-codex/gpt-5.6-luna:xhigh
+model: openai-codex/gpt-6-luna:xhigh
 thinking: xhigh
 systemPromptMode: replace
 inheritProjectContext: true
@@ -35,7 +35,7 @@ Working rules:
 - `cargo test` takes one substring filter, not a regex. Use one check per distinct filter or a shared substring; never join names with |. Verify that the expected tests actually executed.
 - Do **not** call `contact_supervisor` or send `progress_update`. You do not have that tool. Put blockers in the handoff and stop. Never ping the parent that you are starting.
 - Do not launch subagents.
-- If this session's model is composer-* or inherit, stop immediately and report that simple Tasks must be openai-codex/gpt-5.6-luna:xhigh and critical Tasks must be openai-codex/gpt-5.6-luna:xhigh. Do not implement on the wrong model.
+- If this session's model is composer-* or inherit, stop immediately and report that simple Tasks must be openai-codex/gpt-6-luna:xhigh and critical Tasks must be openai-codex/gpt-6-luna:xhigh. Do not implement on the wrong model.
 
 Final handoff shape:
 Implemented: …
