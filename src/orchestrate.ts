@@ -86,6 +86,7 @@ import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts
 import {
   acceptCompletedDependency, baselineMismatch, capturePlanBaseline, readPlanBaseline,
   structuredAcceptance, taskChecks, writePlanBaseline, type ReviewedTask,
+  taskFiles,
 } from "./lib/task-contract.ts";
 
 
@@ -241,6 +242,20 @@ function workerFor(complexity?: WriterComplexity, jsonText?: string) {
 }
 
 const WRITER_AGENTS = new Set(["tdd-worker", "fixer", "feature-qa", "qa-opus", "plan-reviewer"]);
+
+/**
+ * Writer agents a plan Task may name with `- Lane:`. tdd-worker keeps its
+ * pinned model; every other lane launches on its own agent settings
+ * (modelScope decides), so none of them is pinned to a tdd-worker model.
+ */
+export const TASK_LANES = ["tdd-worker", "rust-tdd-worker", "rust-worker", "dev-worker", "cuda-dev"] as const;
+export type TaskLane = (typeof TASK_LANES)[number];
+/** Task lanes other than tdd-worker: writer caps apply, no model pin. */
+const LANE_WRITERS: ReadonlySet<string> = new Set(TASK_LANES.filter((lane) => lane !== "tdd-worker"));
+
+/** Agents that write the Feature plan. rust-architect plans Features in Cargo repos. */
+export const PLAN_AGENTS = ["planner", "rust-architect"] as const;
+export type PlanAgent = (typeof PLAN_AGENTS)[number];
 
 /**
  * The review agents, and the places their models are decided.
@@ -3411,6 +3426,8 @@ const CHILD_WATCHDOG_GRACE_MS = 5 * 60 * 1000;
 const WRITER_TURN_BUDGET = { maxTurns: 220, graceTurns: 30 };
 export const QA_TURN_BUDGET = { maxTurns: 60, graceTurns: 10 };
 const PLANNER_TURN_BUDGET = { maxTurns: 80, graceTurns: 15 };
+/** rust-architect reads the code itself (no scouts), so it gets a larger budget. */
+const ARCHITECT_TURN_BUDGET = { maxTurns: 160, graceTurns: 30 };
 const WRITER_MAX_CONCURRENCY = 2;
 const PLANNER_MODEL = "inherit";
 export const MAX_QA_FINDINGS = 8;
@@ -3441,6 +3458,7 @@ function defaultWriterModel(agent: string, thinking?: string): string {
 
 function turnCapFor(agent: string): { maxTurns: number; graceTurns: number } {
   if (agent === "planner") return PLANNER_TURN_BUDGET;
+  if (agent === "rust-architect") return ARCHITECT_TURN_BUDGET;
   if (QA_AGENTS.has(agent)) return QA_TURN_BUDGET;
   return WRITER_TURN_BUDGET;
 }
@@ -3465,7 +3483,7 @@ function clampTurnBudget(
 }
 
 /** Mutation writers must never get `contact_supervisor`. progress_update does not wait for a reply, so a writer can loop it for thousands of turns. */
-const MUTATION_WRITERS = new Set(["tdd-worker", "fixer"]);
+const MUTATION_WRITERS = new Set(["tdd-worker", "fixer", ...LANE_WRITERS]);
 export const WRITER_TOOLS = ["read", "grep", "find", "ls", "bash", "edit", "write"] as const;
 export const WRITER_INTERCOM_OFF = { mode: "off" } as const;
 
@@ -3553,6 +3571,24 @@ function applyOneSpawn(params: Record<string, unknown>): {
       reason ??= `clamped ${agent} concurrency to ${WRITER_MAX_CONCURRENCY}`;
     }
     return { action, reason };
+  }
+
+  if (LANE_WRITERS.has(agent)) {
+    // Non-tdd Task lanes run on their own agent settings; pinning them to the
+    // tdd-worker model would put them outside their modelScope. Only the
+    // billing guard and the shared writer caps apply.
+    if (model && isForbiddenBillingModel(model)) {
+      return {
+        action: "reject",
+        reason: `refusing ${agent} on ${model}; cursor, composer, and inherit are not allowed`,
+      };
+    }
+    pinWriterCaps(params);
+    if (typeof params.concurrency === "number" && params.concurrency > WRITER_MAX_CONCURRENCY) {
+      params.concurrency = WRITER_MAX_CONCURRENCY;
+      return { action: "pin", reason: `clamped ${agent} concurrency to ${WRITER_MAX_CONCURRENCY}` };
+    }
+    return { action: "allow" };
   }
 
   if (model && isForbiddenBillingModel(model)) {
@@ -3922,9 +3958,9 @@ type RegisterCeiling = (input: {
 }) => CeilingRegistration;
 
 const PHASE_AGENTS: Record<string, string[]> = {
-  implement: ["tdd-worker", "fixer", "feature-qa"],
+  implement: [...TASK_LANES, "fixer", "feature-qa"],
   qa: ["qa-opus"],
-  plan: ["planner"],
+  plan: [...PLAN_AGENTS],
   review: ["plan-reviewer"],
 };
 
@@ -4071,6 +4107,49 @@ export function taskGateCommand(body: string): string {
 /** Plan header `> Repo: coins-minimal` — not the orchestrator folder name. */
 export function planRepoName(plan: string): string {
   return (plan.match(/^>\s*Repo:\s*([A-Za-z0-9._-]+)\s*$/m)?.[1] ?? "").trim();
+}
+
+type FileLanguage = "rust" | "cuda" | "other";
+
+function fileLanguage(path: string): FileLanguage {
+  const base = path.split("/").at(-1) ?? "";
+  if (/\.rs$/i.test(base) || base === "Cargo.toml" || base === "Cargo.lock") return "rust";
+  if (/\.(cu|cuh)$/i.test(base)) return "cuda";
+  return "other";
+}
+
+function laneFits(lane: TaskLane, language: FileLanguage): boolean {
+  if (language === "rust") return lane === "rust-tdd-worker" || lane === "rust-worker";
+  if (language === "cuda") return lane === "cuda-dev";
+  return lane === "tdd-worker" || lane === "dev-worker";
+}
+
+function declaredFiles(body: string): string[] {
+  try {
+    return taskFiles(body);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The writer agent for one Task. The plan's `- Lane:` wins when it fits the
+ * Task's `- Files:`. A Lane that contradicts single-language Files (a
+ * TypeScript Task on rust-tdd-worker) is corrected here, keeping its
+ * red-first vs non-TDD choice. Mixed-language or undeclared Files trust the
+ * declared Lane; no Lane at all keeps the historical tdd-worker.
+ */
+export function taskLane(body: string): TaskLane {
+  const declared = taskScalar(body, "Lane");
+  const lane = (TASK_LANES as readonly string[]).includes(declared) ? (declared as TaskLane) : undefined;
+  const languages = new Set(declaredFiles(body).map(fileLanguage));
+  if (languages.size !== 1) return lane ?? "tdd-worker";
+  const [language] = [...languages] as [FileLanguage];
+  if (lane && laneFits(lane, language)) return lane;
+  const nonTdd = lane === "rust-worker" || lane === "dev-worker";
+  if (language === "rust") return nonTdd ? "rust-worker" : "rust-tdd-worker";
+  if (language === "cuda") return "cuda-dev";
+  return nonTdd ? "dev-worker" : "tdd-worker";
 }
 
 function taskScalar(body: string, name: string): string {
@@ -4421,8 +4500,10 @@ export function workerLaunchParams(
   const checks = structuredAcceptance(body, cwd);
   const previous = parseTasks(plan).filter(t => t.status === "done" && Number(t.id) < Number(task.id)).at(-1);
   const previousHandoff = previous ? readText(join(paths.handoffsDir, `task-${previous.id}.md`)).slice(0, 5000) : "";
+  // The plan's Lane (checked against the Task's Files) picks the writer.
+  const agent = taskLane(body);
   const params: Record<string, unknown> = {
-    agent: "tdd-worker",
+    agent,
     task: [
       `Task ${task.id}/${Math.max(parseTasks(plan).length, Number.parseInt(task.id, 10) || 1)} — ${task.title}`,
       `Implement exactly this Task and nothing else.`,
@@ -4439,7 +4520,8 @@ export function workerLaunchParams(
     ].join("\n"),
     context: "fresh",
     cwd,
-    model: modelWithThinking(worker),
+    // Only tdd-worker is pinned; other lanes run on their agent settings.
+    ...(agent === "tdd-worker" ? { model: modelWithThinking(worker) } : {}),
     timeoutMs: CHILD_TIMEOUT_MS,
     turnBudget: WRITER_TURN_BUDGET,
     intercomBridge: { ...WRITER_INTERCOM_OFF },
@@ -4452,7 +4534,7 @@ export function workerLaunchParams(
     ? gateAcceptance(gate)
     : {
         level: "none",
-        reason: "tdd-worker implements; host Command gate is absent on this Task",
+        reason: `${agent} implements; host Command gate is absent on this Task`,
       });
   return params;
 }
@@ -7303,21 +7385,33 @@ export function resolveOrchestrateLiveSection(
   return alreadyPresent ? ORCHESTRATE_LIVE_BASELINE : undefined;
 }
 
-export function plannerLaunchParams(paths: Paths, objective: string, baseline = ""): Record<string, unknown> {
+/** rust-architect plans any Feature in a Cargo repo; everything else keeps planner. */
+export function architectAgentFor(gitRoot: string): PlanAgent {
+  return gitRoot && existsSync(join(gitRoot, "Cargo.toml")) ? "rust-architect" : "planner";
+}
+
+export function plannerLaunchParams(
+  paths: Paths,
+  objective: string,
+  baseline = "",
+  agent: PlanAgent = "planner",
+): Record<string, unknown> {
+  const architect = agent === "rust-architect";
   return {
-    agent: "planner",
-    task: plannerBody(paths, objective, baseline),
+    agent,
+    task: plannerBody(paths, objective, baseline, agent),
     context: "fresh",
     // Every other launcher pins its child's cwd; the planner's was unset, so it
     // inherited whatever the session was rooted at and opened a
     // home-directory grep that timed out and lost the run. Planning reads the
     // reference checkout — it never edits it (`git wt` is the writer's job).
     cwd: paths.gitRoot,
-    model: PLANNER_MODEL,
+    // rust-architect runs on its own agent settings; planner keeps its pin.
+    ...(architect ? {} : { model: PLANNER_MODEL }),
     output: join(paths.handoffsDir, "plan-run.md"),
     outputMode: "inline",
     timeoutMs: CHILD_TIMEOUT_MS,
-    turnBudget: PLANNER_TURN_BUDGET,
+    turnBudget: architect ? ARCHITECT_TURN_BUDGET : PLANNER_TURN_BUDGET,
     // `planner.md` declares `acceptanceRole: writer` and this task says
     // "overwrite plan.md", so an omitted acceptance is inferred as `checked` —
     // whose required evidence includes `tests-added`. A planner forbidden from
@@ -7386,8 +7480,11 @@ function recordCompletedInputs(paths: Paths, completed: ReviewedTask, worktree: 
   writePlanBaseline(baselineFile(paths), baseline);
 }
 
-function plannerBody(paths: Paths, objective: string, baseline: string): string {
-  return `You are \`planner\` on the parent session model (inherit) with thinking high. Do NOT implement product code.
+function plannerBody(paths: Paths, objective: string, baseline: string, agent: PlanAgent = "planner"): string {
+  const role = agent === "planner"
+    ? "You are `planner` on the parent session model (inherit) with thinking high."
+    : "You are `rust-architect`: settle the design and write this Feature plan yourself. Do not launch subagents.";
+  return `${role} Do NOT implement product code.
 Do NOT write plan files inside the git worktree. Do NOT use enter_plan_mode.
 
 Objective:
@@ -7486,6 +7583,7 @@ Overwrite ${paths.planFile}:
 - Status: pending
 - Complexity: simple | critical
 - Worker: ${writerSpec("simple").model}, thinking ${writerSpec("simple").thinking}   # or ${writerSpec("critical").short} if critical
+- Lane: tdd-worker   # by file type: .rs/Cargo → rust-tdd-worker (red-first) or rust-worker; .cu/.cuh → cuda-dev; else tdd-worker or dev-worker. Never mix languages in one Task.
 - Kind: implement | verify
 - Goal: [one sentence]
 - Files: ["src/file.ts", "test/file.test.ts", "package.json"]
@@ -8464,7 +8562,7 @@ export default function orchestrateExtension(pi: ExtensionAPI): void {
           try { baseline = await planningBase(pi, feat.gitRoot); }
           catch (error) { uiNotify(ctx, String(error), "error"); return; }
         }
-        const planned = await runChildInPhase(pi, ctx, "plan", plannerLaunchParams(feat, objective, baseline));
+        const planned = await runChildInPhase(pi, ctx, "plan", plannerLaunchParams(feat, objective, baseline, architectAgentFor(feat.gitRoot)));
         if (!planned.ok) {
           uiNotify(ctx,
             `Planner did not complete (${planned.reason ?? planned.state ?? "failed"}). Plan remains DRAFT.\n${feat.planFile}`,

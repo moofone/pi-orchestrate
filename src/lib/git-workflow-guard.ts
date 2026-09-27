@@ -116,8 +116,20 @@ export function classifyGitWorkflowCommand(command: string): GuardVerdict {
  * state file from inside a child session (F7).
  * ------------------------------------------------------------------ */
 
-/** Children that write code. `planner` and `plan-reviewer` are not writers. */
-export const WRITER_AGENTS = new Set(["tdd-worker", "fixer", "feature-qa"]);
+/**
+ * Children that write code: every Task writer lane a plan may name, plus the
+ * fixer and feature-qa. `planner`, `rust-architect` and `plan-reviewer` are
+ * not writers.
+ */
+export const WRITER_AGENTS = new Set([
+	"tdd-worker",
+	"rust-tdd-worker",
+	"rust-worker",
+	"dev-worker",
+	"cuda-dev",
+	"fixer",
+	"feature-qa",
+]);
 
 /**
  * Whether this process is a writer child.
