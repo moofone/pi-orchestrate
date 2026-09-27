@@ -1,6 +1,6 @@
 {
   "autoAdvanceOnLanded": true,
-  "planReviewer": "openai-codex/gpt-6-luna:xhigh",
+  "planReviewer": "anthropic/claude-opus-5-5:high",
   "qaReviewer": "cursor/grok-4.7:high",
   "tddWorkerSimple": "openai-codex/gpt-6-luna:xhigh",
   "tddWorkerCritical": "openai-codex/gpt-6-luna:xhigh"
