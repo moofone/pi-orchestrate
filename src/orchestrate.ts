@@ -5345,7 +5345,7 @@ export async function dispatchFeaturePrVerdict(
 ): Promise<FeaturePrAction> {
   // The fix executor (ghl-pr-fix) owns this verdict: no writer, no status
   // write, no model turn. The one Feature-side decision point (spec §3.3).
-  if (result.next === "read_comments_and_fix" && executorOwnsPr(pr)) return "idle";
+  if (result.next === "read_comments_and_fix" && executorOwnsPr(pr, { cwd: worktree, slug: paths.repo })) return "idle";
   sweepStaleWorkerRecord(paths);
   const status = readText(paths.statusFile);
 
@@ -5659,7 +5659,7 @@ export async function reconcileLiveFeaturePrs(
       driverRunning: (owner) => isDriverRunning(owner.pr),
       ensureWaiter: (owner) => {
         // The executor re-arms the waiter itself after its push.
-        if (executorOwnsPr(owner.pr)) return;
+        if (executorOwnsPr(owner.pr, { cwd: owner.worktree, slug: owner.repo })) return;
         // The waiter's own `--state` file, never the extension's latch copy,
         // and never a path this extension then writes to (F20).
         const paths = waiterPaths(owner.repo, owner.pr);

@@ -118,10 +118,17 @@ export function readWaiterVerdict(path: string): WaiterVerdict | undefined {
  * Cheap local read; the one fs-level entry to `executorOwnsVerdict` for callers
  * that hold a PR number rather than a parsed verdict.
  */
-export function executorOwnsPr(pr: string, dir = stateDir()): boolean {
+export function executorOwnsPr(
+	pr: string,
+	owner: { cwd?: string; slug?: string },
+	dir = stateDir(),
+): boolean {
 	const want = String(pr ?? "").trim();
 	if (!want) return false;
-	return waiterManualFiles(want, dir).some((path) => executorOwnsVerdict(readWaiterVerdict(path)));
+	// Repo + PR, never the number alone: another repo's PR #N must not be silenced.
+	return waiterManualFilesOwnedBy(want, dir, owner).some((path) =>
+		executorOwnsVerdict(readWaiterVerdict(path)),
+	);
 }
 
 /**
