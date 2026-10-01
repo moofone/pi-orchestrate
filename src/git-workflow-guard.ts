@@ -18,6 +18,7 @@ import {
 	isWriterRole,
 	viewRepeatKey,
 } from "./lib/git-workflow-guard.ts";
+import { fixHostActive } from "./lib/fix-executor.ts";
 import { stateDir } from "./lib/pr-await-core.ts";
 import { createReviewStore } from "./lib/pr-review-store.ts";
 
@@ -65,8 +66,12 @@ export default function (pi: ExtensionAPI) {
 			const reserved = targets.some(dir => durableExecutionReservation(dir) || durableExecutionWorkspaceFence(dir));
 			if (executionWorker) executionRole = "worker";
 			else if (reserved || verified.some(Boolean)) executionRole = "parent";
-			const store = createReviewStore(stateDir());
-			writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
+			// Latch bookkeeping (the PR-review store) is inert in a fix host; the
+			// writer role itself (PI_SUBAGENT_CHILD_AGENT) still gates push/pr-await.
+			if (!fixHostActive()) {
+				const store = createReviewStore(stateDir());
+				writerReserved = !executionWorker && targets.some((dir) => Boolean(store.writerForWorktree(dir)));
+			}
 		} catch {
 			// Lookup failure must not degrade to ordinary git rules: that would
 			// allow a commit inside a reserved worker workspace exactly when the

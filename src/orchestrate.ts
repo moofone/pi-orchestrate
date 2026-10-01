@@ -58,6 +58,7 @@ import {
   repoKey,
   spendWaiterVerdict,
   undeliveredWaiterVerdicts,
+  executorOwnsPr,
   wakeLiveLatch,
   waiterPaths,
   type FeaturePrOwner,
@@ -84,6 +85,7 @@ import {
   writerBlockedByPlanReview,
 } from "./lib/lifecycle.ts";
 import { spawnDetachedWaiter } from "./lib/pr-await-drive.ts";
+import { fixHostActive } from "./lib/fix-executor.ts";
 import { reconcileFeaturePrs, type ReconcileResult } from "./lib/pr-reconcile.ts";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import {
@@ -5341,6 +5343,9 @@ export async function dispatchFeaturePrVerdict(
   result: { next: string; output: string; round?: string },
   opts: { holdsChainLock?: boolean; depth?: number } = {},
 ): Promise<FeaturePrAction> {
+  // The fix executor (ghl-pr-fix) owns this verdict: no writer, no status
+  // write, no model turn. The one Feature-side decision point (spec §3.3).
+  if (result.next === "read_comments_and_fix" && executorOwnsPr(pr)) return "idle";
   sweepStaleWorkerRecord(paths);
   const status = readText(paths.statusFile);
 
@@ -5653,6 +5658,8 @@ export async function reconcileLiveFeaturePrs(
         dispatchFeaturePrVerdictForOwner(pi, ctx as ExtensionContext, owner, verdict),
       driverRunning: (owner) => isDriverRunning(owner.pr),
       ensureWaiter: (owner) => {
+        // The executor re-arms the waiter itself after its push.
+        if (executorOwnsPr(owner.pr)) return;
         // The waiter's own `--state` file, never the extension's latch copy,
         // and never a path this extension then writes to (F20).
         const paths = waiterPaths(owner.repo, owner.pr);
@@ -8015,6 +8022,8 @@ Approve is a TUI card after plan-reviewer finishes, not a fence. Tasks never ove
 }
 
 export default function orchestrateExtension(pi: ExtensionAPI): void {
+  // Headless fixer host (ghl-pr-fix): no dispatchers, reconcile timers, gh calls.
+  if (fixHostActive()) return;
   overlayPi = pi;
   void bindRpivTodoOverlaySink(pi);
   let lastCtx: ExtensionContext | undefined;
