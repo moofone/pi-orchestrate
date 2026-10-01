@@ -58,13 +58,86 @@ test("readWaiterVerdict carries the executor fields; undeliveredWaiterVerdicts s
 	);
 	const v = core.readWaiterVerdict(owned);
 	assert.equal(v?.fixOwner, "executor");
-	assert.equal(core.executorOwnsPr("801", dir), true);
+	assert.equal(core.executorOwnsPr("801", { slug: "o/repo" }, dir), true);
 	assert.deepEqual(core.undeliveredWaiterVerdicts("801", dir), []);
 
 	const plain = core.waiterStatePath("repo", "802", dir);
 	writeFileSync(plain, JSON.stringify({ pr: "802", lastNext: "read_comments_and_fix", verdict: "v", verdictDelivered: false }));
-	assert.equal(core.executorOwnsPr("802", dir), false);
+	assert.equal(core.executorOwnsPr("802", { slug: "o/repo" }, dir), false);
 	assert.equal(core.undeliveredWaiterVerdicts("802", dir).length, 1, "off path: no fixOwner behaves as today");
+});
+
+test("executorOwnsPr is scoped by repo + PR: same number in another repo is not owned", () => {
+	const dir = mkdtempSync(join(tmpdir(), "ghl-fixexec-scope-"));
+	writeFileSync(
+		core.waiterPaths("repoa", "810", dir).manual[0]!,
+		JSON.stringify({ pr: "810", lastNext: "read_comments_and_fix", verdict: "v", verdictDelivered: false, fixOwner: "executor", fixOutcome: { state: "failed", reason: "x", round: 1 } }),
+	);
+	writeFileSync(
+		core.waiterPaths("repob", "810", dir).manual[0]!,
+		JSON.stringify({ pr: "810", lastNext: "read_comments_and_fix", verdict: "v", verdictDelivered: false }),
+	);
+	assert.equal(core.executorOwnsPr("810", { slug: "o/repoa" }, dir), true);
+	assert.equal(core.executorOwnsPr("810", { slug: "o/repob" }, dir), false);
+	assert.equal(core.executorOwnsPr("810", { cwd: "/w/repob" }, dir), false);
+});
+
+test("Feature dispatch: same PR number owned by another repo's executor still dispatches", async () => {
+	const pr = "811";
+	writeFileSync(
+		core.waiterPaths("repoa", pr, STATE).manual[0]!,
+		JSON.stringify({ pr, lastNext: "read_comments_and_fix", verdict: "v", verdictDelivered: false, fixOwner: "executor" }),
+	);
+	const dir = mkdtempSync(join(tmpdir(), "orch-fixexec-scope-"));
+	const paths = {
+		repo: "repob", gitRoot: dir, repoDir: dir, featureDir: dir,
+		planFile: join(dir, "plan.md"), statusFile: join(dir, "status.md"),
+		handoffsDir: join(dir, "handoffs"), archiveDir: join(dir, "archive"),
+	};
+	writeFileSync(paths.planFile, "# Feature: t\n");
+	writeFileSync(paths.statusFile, ["# Status", "", "pause: off", "phase: pr", `pr: ${pr}`, "pr_round: 0", ""].join("\n"));
+	const execs: string[] = [];
+	const pi = {
+		events: { on: () => () => {}, emit: () => {} },
+		exec: async (cmd: string, args: string[]) => (execs.push([cmd, ...args].join(" ")), { code: 0, stdout: "", stderr: "" }),
+		sendUserMessage: () => {},
+	};
+	const ctx = { cwd: dir, hasUI: false, ui: { notify() {}, setStatus() {}, setWidget() {} } };
+	let threw = false;
+	try {
+		await (orch as never as { dispatchFeaturePrVerdict: Function }).dispatchFeaturePrVerdict(
+			pi, ctx, paths, pr, dir, { next: "read_comments_and_fix", output: "next=read_comments_and_fix\nfinding" },
+		);
+	} catch {
+		threw = true;
+	}
+	assert.ok(threw || execs.length > 0, "repob's verdict must get past the executor gate (not the idle short-circuit)");
+});
+
+test("executorLostNotice: dead pid, or no dispatch after 60s; none while alive/early/outcome/off", () => {
+	const base = { pr: "9", slug: "o/r", lastNext: "read_comments_and_fix", fixOwner: "executor" };
+	const dead = { now: 1_000_000, pidAlive: () => false };
+	const alive = { now: 1_000_000, pidAlive: () => true };
+	const n = fx.executorLostNotice({ ...base, fixDispatch: { pid: 5, round: 2 } }, dead);
+	assert.equal(n?.level, "error");
+	assert.equal(n?.key, "9:2:executor-lost");
+	assert.match(n?.text ?? "", /executor-lost/);
+	assert.equal(fx.executorLostNotice({ ...base, fixDispatch: { pid: 5, round: 2 } }, alive), undefined);
+	// no dispatch: grace 60s from the verdict write
+	assert.equal(fx.executorLostNotice(base, { ...alive, verdictAtMs: 1_000_000 - 59_000 }), undefined);
+	assert.equal(fx.executorLostNotice(base, { ...alive, verdictAtMs: 1_000_000 - 60_000 })?.level, "error");
+	assert.equal(fx.executorLostNotice(base, alive), undefined, "unknown verdict time: no guess");
+	// outcome present, off path, foreign owner
+	assert.equal(fx.executorLostNotice({ ...base, fixDispatch: { pid: 5 }, fixOutcome: { state: "failed" } }, dead), undefined);
+	assert.equal(fx.executorLostNotice({ ...base, fixOwner: undefined, fixDispatch: { pid: 5 } }, dead), undefined);
+	assert.equal(fx.executorLostNotice({ ...base, lastNext: "yield", fixDispatch: { pid: 5 } }, dead), undefined);
+});
+
+test("outcomeNotice: stopped is an error-level notice with reason", () => {
+	const n = fx.outcomeNotice({ pr: "7", slug: "o/r", fixOutcome: { state: "stopped", reason: "disagreement", round: 3 } });
+	assert.equal(n?.level, "error");
+	assert.equal(n?.key, "7:3:stopped");
+	assert.match(n?.text ?? "", /stopped.*disagreement/);
 });
 
 test("Feature dispatch: executor-owned read_comments_and_fix spawns no writer", async () => {

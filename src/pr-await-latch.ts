@@ -29,6 +29,7 @@ import {
 	closeSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	watch,
 	writeFileSync,
 	writeSync,
@@ -90,7 +91,8 @@ import {
 	type FeaturePrOwner,
 	type LatchState,
 } from "./lib/pr-await-core.ts";
-import { FIXING_EXECUTOR_TEXT, executorOwnsVerdict, fixHostActive, outcomeNotice } from "./lib/fix-executor.ts";
+import type { FixExecutorFields, OutcomeNotice } from "./lib/fix-executor.ts";
+import { FIXING_EXECUTOR_TEXT, executorLostNotice, executorOwnsVerdict, fixHostActive, outcomeNotice } from "./lib/fix-executor.ts";
 import { classifyGithubStatus, parsePrKey, parseVerdictHead, verdictIdentity } from "./lib/pr-review-identity.ts";
 import { createReviewStore, readPiRunDisk } from "./lib/pr-review-store.ts";
 import { createExecutionStore } from "./lib/execution-store.ts";
@@ -272,6 +274,9 @@ export type LatchHooks = {
 	publish?: (req: PublishRequest) => Promise<PublishResult>;
 	reviewController?: ReviewController;
 };
+
+/** Injectable clock / pid probe for the executor-lost notice (tests). */
+export const fixLostDeps = { now: (): number => Date.now(), pidAlive };
 
 export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	// Headless fixer host (ghl-pr-fix, GHL_FIX_HOST=1): no arming, adoption,
@@ -492,8 +497,17 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		if (!latch) return;
 		for (const path of paths) {
 			const v = readWaiterVerdict(path);
-			if (!v?.fixOutcome) continue;
-			const n = outcomeNotice({ ...v, pr: v.pr ?? latch.pr, slug: latch.slug });
+			if (!v) continue;
+			const full: FixExecutorFields = { ...v, pr: v.pr ?? latch.pr, slug: latch.slug };
+			let verdictAtMs: number | undefined;
+			try {
+				verdictAtMs = statSync(path).mtimeMs;
+			} catch {
+				// Unreadable mtime: no grace-based verdict.
+			}
+			const n: OutcomeNotice | undefined = v.fixOutcome
+				? outcomeNotice(full)
+				: executorLostNotice(full, { now: fixLostDeps.now(), verdictAtMs, pidAlive: fixLostDeps.pidAlive });
 			if (!n || latch.fixNotified?.includes(n.key)) continue;
 			latch = { ...latch, fixNotified: [...(latch.fixNotified ?? []), n.key].slice(-50) };
 			persist();

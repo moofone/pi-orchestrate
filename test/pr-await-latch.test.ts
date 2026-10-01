@@ -56,6 +56,7 @@ const {
 	ACTIONABLE,
 	WATCH_BACKSTOP_MS,
 	defaultSpawnDriver,
+	fixLostDeps,
 	parseAwaitCall,
 	parseField,
 	trailingCd,
@@ -3930,4 +3931,55 @@ test("fixOutcome notifies once per (pr, round, state), survives reload, never wa
 test("formatWaitLine: executor-owned phase replaces 'waiting'", () => {
 	assert.equal(formatWaitLine({ phase: "fixing (executor)", label: "icemining#1", elapsed: "2m" }), "fixing (executor) icemining#1 · 2m");
 	assert.equal(formatWaitLine({ label: "icemining#1", elapsed: "2m" }), "waiting icemining#1 · 2m");
+});
+
+test("executor lost: dead dispatch pid yields exactly one error notice, no wake, no fixer", async () => {
+	const prior = { ...fixLostDeps };
+	fixLostDeps.pidAlive = () => false;
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId, { fixOwner: "executor", fixDispatch: { pid: 424242, startedAt: 1, head: "abc", round: 1 } });
+		for (let i = 0; i < 3; i++) {
+			await h.settle();
+			await sleep(60);
+		}
+		const lost = h.notifies.filter((n) => /executor-lost/.test(n));
+		assert.equal(lost.length, 1, "notify-once");
+		assert.equal(h.wakes.length, 0);
+		assert.equal(h.sessionFixes.length, 0);
+		assert.equal(h.dispatches.length, 0);
+	} finally {
+		Object.assign(fixLostDeps, prior);
+		h.cleanup();
+	}
+});
+
+test("executor lost: no dispatch within 60s is quiet; after 60s (injected clock) one notice", async () => {
+	const prior = { ...fixLostDeps };
+	const t0 = Date.now();
+	let clock = t0;
+	fixLostDeps.now = () => clock;
+	fixLostDeps.pidAlive = () => true;
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId, { fixOwner: "executor" });
+		await h.settle();
+		await sleep(60);
+		assert.equal(h.notifies.filter((n) => /executor-lost/.test(n)).length, 0, "within grace");
+		clock = t0 + 61_000;
+		for (let i = 0; i < 3; i++) {
+			await h.settle();
+			await sleep(60);
+		}
+		assert.equal(h.notifies.filter((n) => /executor-lost/.test(n)).length, 1);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(h.sessionFixes.length, 0);
+	} finally {
+		Object.assign(fixLostDeps, prior);
+		h.cleanup();
+	}
 });

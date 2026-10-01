@@ -85,3 +85,30 @@ export function outcomeNotice(latch: FixExecutorFields | undefined): OutcomeNoti
 	const reason = o.reason ? `: ${o.reason}` : "";
 	return { key, level: "error", text: `pr-latch: ${label(latch)} fix executor ${o.state}${round}${reason}` };
 }
+
+/** Grace for a dispatch to appear after the waiter recorded the verdict. */
+export const EXECUTOR_LOST_GRACE_MS = 60_000;
+
+/**
+ * An executor-owned verdict with no outcome whose executor is gone: its
+ * `fixDispatch.pid` is dead, or no dispatch appeared within the grace window.
+ * One error notice (never a wake, never a fixer). Pure: pid probe and clock injected.
+ */
+export function executorLostNotice(
+	latch: FixExecutorFields | undefined,
+	deps: { now: number; verdictAtMs?: number; pidAlive: (pid: number) => boolean },
+): OutcomeNotice | undefined {
+	if (!latch || !latch.pr || !executorOwnsVerdict(latch) || latch.fixOutcome) return undefined;
+	const d = latch.fixDispatch;
+	const pid = typeof d?.pid === "number" ? d.pid : undefined;
+	let lost: boolean;
+	if (d) lost = pid === undefined || !deps.pidAlive(pid);
+	else lost = deps.verdictAtMs !== undefined && deps.now - deps.verdictAtMs >= EXECUTOR_LOST_GRACE_MS;
+	if (!lost) return undefined;
+	const round = d?.round ?? "?";
+	return {
+		key: `${latch.pr}:${round}:executor-lost`,
+		level: "error",
+		text: `pr-latch: ${label(latch)} fix executor lost (executor-lost): no outcome and the executor is not running`,
+	};
+}
