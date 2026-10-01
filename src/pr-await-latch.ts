@@ -85,7 +85,6 @@ import {
 	formatWaitLine,
 	originSlug,
 	prUrl,
-	waiterManualFiles,
 	waiterPidFiles,
 	waitProgressSequence,
 	type FeaturePrOwner,
@@ -460,7 +459,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const files: string[] = [];
 		const own = waiterState();
 		if (own) files.push(own);
-		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
+		if (latch?.pr) files.push(...waiterManualFilesOwnedBy(latch.pr, stateDir(), latch));
 		for (const path of files) {
 			if (existsSync(path)) seenWaiterPaths.add(path);
 		}
