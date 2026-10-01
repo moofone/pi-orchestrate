@@ -29,6 +29,7 @@ import {
 	closeSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	watch,
 	writeFileSync,
 	writeSync,
@@ -84,12 +85,13 @@ import {
 	formatWaitLine,
 	originSlug,
 	prUrl,
-	waiterManualFiles,
 	waiterPidFiles,
 	waitProgressSequence,
 	type FeaturePrOwner,
 	type LatchState,
 } from "./lib/pr-await-core.ts";
+import type { FixExecutorFields, OutcomeNotice } from "./lib/fix-executor.ts";
+import { FIXING_EXECUTOR_TEXT, executorLostNotice, executorOwnsVerdict, fixHostActive, outcomeNotice } from "./lib/fix-executor.ts";
 import { classifyGithubStatus, parsePrKey, parseVerdictHead, verdictIdentity } from "./lib/pr-review-identity.ts";
 import { createReviewStore, readPiRunDisk } from "./lib/pr-review-store.ts";
 import { createExecutionStore } from "./lib/execution-store.ts";
@@ -272,7 +274,13 @@ export type LatchHooks = {
 	reviewController?: ReviewController;
 };
 
+/** Injectable clock / pid probe for the executor-lost notice (tests). */
+export const fixLostDeps = { now: (): number => Date.now(), pidAlive };
+
 export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
+	// Headless fixer host (ghl-pr-fix, GHL_FIX_HOST=1): no arming, adoption,
+	// timers, `gh`/`git pr-await` calls, or registry hooks in this process.
+	if (fixHostActive()) return;
 	const pendingCommands = new Map<string, string>();
 	const seenCwds = new Set<string>();
 
@@ -451,7 +459,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		const files: string[] = [];
 		const own = waiterState();
 		if (own) files.push(own);
-		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
+		if (latch?.pr) files.push(...waiterManualFilesOwnedBy(latch.pr, stateDir(), latch));
 		for (const path of files) {
 			if (existsSync(path)) seenWaiterPaths.add(path);
 		}
@@ -475,6 +483,41 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		return {};
 	}
 
+	/** The fix executor owns the current verdict (any of this PR's waiter files says so). */
+	function executorOwnsAnyWaiterFile(): boolean {
+		return waiterStateFiles().some((path) => executorOwnsVerdict(readWaiterVerdict(path)));
+	}
+
+	/**
+	 * Show each executor outcome once per (pr, round, state). UI only — never a
+	 * model wake. Keys persist in the latch file so a reload does not repeat them.
+	 */
+	function noticeFixOutcomes(ctx: ExtensionContext, paths: string[]): void {
+		if (!latch) return;
+		for (const path of paths) {
+			const v = readWaiterVerdict(path);
+			if (!v) continue;
+			const full: FixExecutorFields = { ...v, pr: v.pr ?? latch.pr, slug: latch.slug };
+			let verdictAtMs: number | undefined;
+			try {
+				verdictAtMs = statSync(path).mtimeMs;
+			} catch {
+				// Unreadable mtime: no grace-based verdict.
+			}
+			const n: OutcomeNotice | undefined = v.fixOutcome
+				? outcomeNotice(full)
+				: executorLostNotice(full, { now: fixLostDeps.now(), verdictAtMs, pidAlive: fixLostDeps.pidAlive });
+			if (!n || latch.fixNotified?.includes(n.key)) continue;
+			latch = { ...latch, fixNotified: [...(latch.fixNotified ?? []), n.key].slice(-50) };
+			persist();
+			try {
+				ctx.ui.notify(n.text, n.level);
+			} catch {
+				// No UI in print/rpc mode.
+			}
+		}
+	}
+
 	function waitLine(link = false): string | undefined {
 		if (!latch || !waitStartedAt) return undefined;
 		// No spinner glyph here. `Loader` owns the frames and the 80ms timer;
@@ -482,6 +525,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		// on the chrome tick. OSC 8 only on the widget — not the tab title.
 		const { round, roundTotal } = waiterRound();
 		return formatWaitLine({
+			...(executorOwnsAnyWaiterFile() ? { phase: FIXING_EXECUTOR_TEXT } : {}),
 			label: prLabel(latch),
 			elapsed: formatWaitElapsed(waitStartedAt),
 			round,
@@ -1131,15 +1175,27 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 		waitCtx = ctx;
 		const pr = latch.pr;
 		const candidates = waiterStateFiles();
+		noticeFixOutcomes(ctx, candidates);
 		let hit:
 			| { path: string; lastNext: string; verdict?: string; round?: string }
 			| undefined;
+		let executorOwned = false;
 		for (const path of candidates) {
 			const v = readWaiterVerdict(path);
+			// The single session-side decision point for the fix executor: it owns
+			// this verdict, so no controller handoff, Feature dispatch, or wake.
+			if (executorOwnsVerdict(v)) {
+				executorOwned = true;
+				continue;
+			}
 			if (!v?.lastNext || !ACTIONABLE.has(v.lastNext) || v.verdictDelivered) continue;
 			if (v.pr && v.pr !== pr) continue;
 			hit = { path, lastNext: v.lastNext, verdict: v.verdict, round: v.round };
 			break;
+		}
+		if (!hit && executorOwned) {
+			status(ctx, `pr-await ${prLabel(latch)} · ${FIXING_EXECUTOR_TEXT}`);
+			return;
 		}
 		if (!hit) {
 			try {
@@ -1439,6 +1495,15 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 					`pr-latch: ${prLinkLabel(latch)} belongs to a live /orchestrate Feature — ` +
 						`/orchestrate owns its waiter. This session watches only.`,
 				);
+				startWatch(ctx);
+				await checkActionable(ctx);
+				return;
+			}
+
+			// The executor re-arms the waiter itself when it pushes; a session
+			// spawning one now would race it.
+			if (executorOwnsAnyWaiterFile()) {
+				status(ctx, `pr-await ${prLabel(latch)} · ${FIXING_EXECUTOR_TEXT}`);
 				startWatch(ctx);
 				await checkActionable(ctx);
 				return;

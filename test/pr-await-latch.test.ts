@@ -56,6 +56,7 @@ const {
 	ACTIONABLE,
 	WATCH_BACKSTOP_MS,
 	defaultSpawnDriver,
+	fixLostDeps,
 	parseAwaitCall,
 	parseField,
 	trailingCd,
@@ -3842,5 +3843,143 @@ test("P5 F20: nothing in the extension writes a waiter pid file", async () => {
 			false,
 			`${name} wrote drive-<pr>.pid, which is the waiter's to write`,
 		);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Fix executor (ghl-pr-fix) ownership: spec GHL_PR_FIX_EXECUTOR.md §3.3.
+// ---------------------------------------------------------------------------
+
+test("fixOwner=executor: no session fixer, no Feature dispatch, no wake", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	await h.start();
+	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+	const spawnsBefore = h.spawns.length;
+	writeActionable(h.dir, h.sessionId, { fixOwner: "executor", fixDispatch: { pid: 99, startedAt: 1, head: "abc", round: 1 } });
+	await h.settle();
+	await sleep(80);
+	assert.equal(h.sessionFixes.length, 0, "executor owns the fix; no session fixer");
+	assert.equal(h.wakes.length, 0, "no model wake");
+	assert.equal(h.dispatches.length, 0);
+	assert.equal(h.spawns.length, spawnsBefore, "no waiter spawn while the executor owns the verdict");
+	h.cleanup();
+});
+
+test("fixOwner=executor on a Feature-owned PR: no writer dispatch, no wake", async () => {
+	const owner = {
+		dir: join(tmpdir(), "feature-executor-owned"), name: "feat-x", repo: "icemining", pr: "2142",
+		statusFile: join(tmpdir(), "feature-executor-owned", "status.md"), worktree: REPO,
+	};
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { featureOwnedPr: () => owner });
+	await h.start();
+	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+	writeActionable(h.dir, h.sessionId, { fixOwner: "executor" });
+	await h.settle();
+	await sleep(80);
+	assert.equal(h.dispatches.length, 0);
+	assert.equal(h.sessionFixes.length, 0);
+	assert.equal(h.wakes.length, 0);
+	h.cleanup();
+});
+
+test("off path: a latch without fixOwner (or a foreign owner) behaves as before", async () => {
+	for (const extra of [{}, { fixOwner: "someone-else" }]) {
+		const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId, extra);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 1, `controller must still launch one fixer for ${JSON.stringify(extra)}`);
+		assert.equal(h.wakes.length, 0);
+		h.cleanup();
+	}
+});
+
+test("fixOutcome notifies once per (pr, round, state), survives reload, never wakes", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	await h.start();
+	await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+	const fixed = (outcome: Record<string, unknown>) =>
+		writeActionable(h.dir, h.sessionId, { fixOwner: "executor", fixOutcome: { head: "a".repeat(40), finishedAt: 1, ...outcome } });
+	const fixNotes = () => h.notifies.filter((n) => /fix executor/.test(n));
+	fixed({ state: "pushed", round: 1, newHead: "1234567890abcdef".padEnd(40, "0") });
+	await h.settle();
+	await sleep(60);
+	await h.settle();
+	await sleep(60);
+	assert.equal(fixNotes().length, 1, "same outcome shown once");
+	assert.match(fixNotes()[0] ?? "", /1234567/);
+	assert.doesNotMatch(fixNotes()[0] ?? "", /1234567890/);
+
+	await h.start(); // same-session reload re-reads the persisted latch
+	await sleep(60);
+	await h.settle();
+	await sleep(60);
+	assert.equal(fixNotes().length, 1, "reload must not repeat a notified outcome");
+
+	fixed({ state: "failed", reason: "no-commit", round: 1 });
+	await h.settle();
+	await sleep(60);
+	assert.equal(fixNotes().length, 2, "a different state is a different key");
+	assert.match(fixNotes()[1] ?? "", /no-commit/);
+	assert.equal(h.wakes.length, 0, "outcomes never wake the model");
+	assert.equal(h.sessionFixes.length, 0);
+	h.cleanup();
+});
+
+test("formatWaitLine: executor-owned phase replaces 'waiting'", () => {
+	assert.equal(formatWaitLine({ phase: "fixing (executor)", label: "icemining#1", elapsed: "2m" }), "fixing (executor) icemining#1 · 2m");
+	assert.equal(formatWaitLine({ label: "icemining#1", elapsed: "2m" }), "waiting icemining#1 · 2m");
+});
+
+test("executor lost: dead dispatch pid yields exactly one error notice, no wake, no fixer", async () => {
+	const prior = { ...fixLostDeps };
+	fixLostDeps.pidAlive = () => false;
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId, { fixOwner: "executor", fixDispatch: { pid: 424242, startedAt: 1, head: "abc", round: 1 } });
+		for (let i = 0; i < 3; i++) {
+			await h.settle();
+			await sleep(60);
+		}
+		const lost = h.notifies.filter((n) => /executor-lost/.test(n));
+		assert.equal(lost.length, 1, "notify-once");
+		assert.equal(h.wakes.length, 0);
+		assert.equal(h.sessionFixes.length, 0);
+		assert.equal(h.dispatches.length, 0);
+	} finally {
+		Object.assign(fixLostDeps, prior);
+		h.cleanup();
+	}
+});
+
+test("executor lost: no dispatch within 60s is quiet; after 60s (injected clock) one notice", async () => {
+	const prior = { ...fixLostDeps };
+	const t0 = Date.now();
+	let clock = t0;
+	fixLostDeps.now = () => clock;
+	fixLostDeps.pidAlive = () => true;
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId, { fixOwner: "executor" });
+		await h.settle();
+		await sleep(60);
+		assert.equal(h.notifies.filter((n) => /executor-lost/.test(n)).length, 0, "within grace");
+		clock = t0 + 61_000;
+		for (let i = 0; i < 3; i++) {
+			await h.settle();
+			await sleep(60);
+		}
+		assert.equal(h.notifies.filter((n) => /executor-lost/.test(n)).length, 1);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(h.sessionFixes.length, 0);
+	} finally {
+		Object.assign(fixLostDeps, prior);
+		h.cleanup();
 	}
 });

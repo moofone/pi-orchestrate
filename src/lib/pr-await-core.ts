@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 import { statusValue as sharedStatusValue } from "./feature-state.ts";
+import { executorOwnsVerdict, parseFixFields, type FixExecutorFields } from "./fix-executor.ts";
 
 export const ACTIONABLE = new Set([
 	"read_comments_and_fix",
@@ -62,7 +63,7 @@ export function isAcceptedFeaturePrAction(action: unknown): boolean {
 }
 
 /** Waiter-owned fields on `manual-<pr>.json` (and legacy `pi-<id>.json`). */
-export type WaiterVerdict = {
+export type WaiterVerdict = FixExecutorFields & {
 	lastNext?: string;
 	verdict?: string;
 	verdictDelivered: boolean;
@@ -105,10 +106,29 @@ export function readWaiterVerdict(path: string): WaiterVerdict | undefined {
 			pr: v.pr != null ? String(v.pr) : undefined,
 			round,
 			roundTotal,
+			...parseFixFields(v),
 		};
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * The fix executor owns this PR's current verdict (any waiter file says so).
+ * Cheap local read; the one fs-level entry to `executorOwnsVerdict` for callers
+ * that hold a PR number rather than a parsed verdict.
+ */
+export function executorOwnsPr(
+	pr: string,
+	owner: { cwd?: string; slug?: string },
+	dir = stateDir(),
+): boolean {
+	const want = String(pr ?? "").trim();
+	if (!want) return false;
+	// Repo + PR, never the number alone: another repo's PR #N must not be silenced.
+	return waiterManualFilesOwnedBy(want, dir, owner).some((path) =>
+		executorOwnsVerdict(readWaiterVerdict(path)),
+	);
 }
 
 /**
@@ -305,6 +325,8 @@ export function prUrl(s: Partial<LatchState>): string | undefined {
 
 /** Compact latch chrome: `waiting icemining#2178 · r2/3 · 2m`. */
 export function formatWaitLine(opts: {
+	/** Leading word; `waiting` unless the fix executor owns the verdict. */
+	phase?: string;
 	label: string;
 	elapsed: string;
 	round?: string;
@@ -315,9 +337,10 @@ export function formatWaitLine(opts: {
 	const tot = opts.roundTotal && opts.roundTotal !== "none" ? opts.roundTotal : "";
 	const roundBit = r ? (tot ? `r${r}/${tot}` : `r${r}`) : "";
 	const label = opts.url ? osc8Link(opts.url, opts.label) : opts.label;
+	const phase = opts.phase ?? "waiting";
 	return roundBit
-		? `waiting ${label} · ${roundBit} · ${opts.elapsed}`
-		: `waiting ${label} · ${opts.elapsed}`;
+		? `${phase} ${label} · ${roundBit} · ${opts.elapsed}`
+		: `${phase} ${label} · ${opts.elapsed}`;
 }
 
 /**
@@ -376,6 +399,8 @@ export type LatchState = {
 	 * so the staleness is remembered here instead and filtered on read.
 	 */
 	roundStale?: string;
+	/** `pr:round:state` keys of executor outcomes already shown. Persisted so a reload does not repeat them. */
+	fixNotified?: string[];
 };
 
 /**
@@ -835,6 +860,8 @@ export function undeliveredWaiterVerdicts(
 		seen.add(path);
 		const v = readWaiterVerdict(path);
 		if (!v?.lastNext || !ACTIONABLE.has(v.lastNext) || v.verdictDelivered) continue;
+		// The executor owns this verdict: nothing in a session may dispatch it.
+		if (executorOwnsVerdict(v)) continue;
 		// A manual file is named for its PR; a session file must say so itself.
 		if (v.pr ? v.pr !== want : basename(path).startsWith("pi-")) continue;
 		out.push({ path, next: v.lastNext, verdict: v.verdict, round: v.round });
