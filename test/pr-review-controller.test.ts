@@ -63,6 +63,7 @@ type World = {
 	owner: OwnerLookup;
 	parentFixTurns: number;
 	failLaunch?: Error;
+	failWaiter?: Error;
 	cleanup: () => void;
 };
 
@@ -112,6 +113,7 @@ function world(opts: { owner?: OwnerLookup; now?: () => number } = {}): World {
 			return { ok: true, remoteHead: req.localHead };
 		},
 		reawait: async () => {
+			if (w.failWaiter) throw w.failWaiter;
 			w.reawaits += 1;
 			w.waiter.running = true;
 			w.waiter.stale = false;
@@ -120,6 +122,7 @@ function world(opts: { owner?: OwnerLookup; now?: () => number } = {}): World {
 		currentHead: async () => w.github.head,
 		waiterHealth: async () => ({ running: w.waiter.running, stale: w.waiter.stale }),
 		ensureWaiter: async () => {
+			if (w.failWaiter) throw w.failWaiter;
 			w.waiter.running = true;
 			w.waiter.stale = false;
 		},
@@ -1297,6 +1300,44 @@ test("handoff during launch cannot clobber the writer reservation", async () => 
 		assert.equal(store.read(PR)?.owner.id, "session-1");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("dead-reviewer rearm bootstrap failures remain retryable, not sticky recovery", async () => {
+	let clock = 1000;
+	const w = world({ now: () => clock });
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/repo-wt/fix", head: HEAD1 });
+		const ack = w.ctrl.observeVerdict({ pr: PR, next: "investigate_dead_reviewers", head: HEAD1,
+			body: "status=action_required\nnext=investigate_dead_reviewers\nhead=" + HEAD1 });
+		w.failWaiter = new Error("waiter state bootstrap refused");
+		await w.ctrl.reconcile();
+		assert.equal(w.ctrl.status(PR)[0]?.state, "retry_scheduled");
+		assert.equal(createReviewStore(w.dir).hasReceipt(ack.identity!), false, "do not consume a verdict until rearm succeeds");
+		clock = w.ctrl.status(PR)[0]!.retry!.deadline + 1;
+		w.failWaiter = undefined;
+		await w.ctrl.reconcile();
+		assert.equal(w.ctrl.status(PR)[0]?.state, "waiting_review");
+		assert.equal(createReviewStore(w.dir).hasReceipt(ack.identity!), true);
+		assert.equal(w.launches.length, 0);
+	} finally {
+		w.cleanup();
+	}
+});
+
+test("stale-fixer reawait bootstrap failures release the writer and retry", async () => {
+	const w = world();
+	try {
+		w.ctrl.handoff({ pr: PR, owner: sessionOwner(), worktree: "/repo-wt/fix", head: HEAD1 });
+		observeFix(w, PR, HEAD1);
+		await w.ctrl.reconcile();
+		w.failWaiter = new Error("waiter state bootstrap refused");
+		await finishFixer(w, 1, HEAD1, { stale: true });
+		assert.equal(w.ctrl.status(PR)[0]?.state, "retry_scheduled");
+		assert.equal(createReviewStore(w.dir).read(PR)?.writer, undefined);
+		assert.equal(w.published.length, 0);
+	} finally {
+		w.cleanup();
 	}
 });
 

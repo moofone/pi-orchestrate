@@ -78,13 +78,13 @@ import {
 	spawnCwdFor,
 	stateDir,
 	waiterStatePath,
+	waiterOwnerTokens,
 	trailingCd,
 	markVerdictDelivered,
 	formatWaitElapsed,
 	formatWaitLine,
 	originSlug,
 	prUrl,
-	waiterManualFiles,
 	waiterPidFiles,
 	waitProgressSequence,
 	type FeaturePrOwner,
@@ -116,7 +116,7 @@ const DRIVE_BIN =
 	process.env.GHL_AWAIT_DRIVE_BIN ??
 	join(homedir(), ".local", "bin", "ghl-pr-await");
 
-export type SpawnDriver = (argv: string[]) => { pid?: number };
+export type SpawnDriver = (argv: string[], target?: LatchState) => { pid?: number };
 
 /**
  * How long a wait may go without asking GitHub anything at all.
@@ -194,7 +194,7 @@ export function defaultSpawnDriver(stateFile: string, known?: LatchState): { pid
 	// cwd, so spawning anyway just burns a process on a resolve-error loop.
 	if (!spawnCwd) return {};
 	const log = latch
-		? logFile(latch.pr, stateDir(), repoKey(latch.cwd))
+		? logFile(latch.pr, stateDir(), waiterOwnerTokens(latch)[0])
 		: join(stateDir(), "drive-unknown.log");
 	const fd = openSync(log, "a");
 	const child = spawn(DRIVE_BIN, ["--state", stateFile, "--daemon"], {
@@ -329,8 +329,9 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	const watchStateDir = hooks.watchStateDir ?? true;
 
 	const spawnDriver: SpawnDriver =
-		hooks.spawnDriver ?? ((argv) => defaultSpawnDriver(argv[argv.indexOf("--state") + 1] ?? "", latch));
-	const driverRunning = hooks.driverRunning ?? ((pr: string) => isDriverRunning(pr));
+		hooks.spawnDriver ?? ((argv, target) => defaultSpawnDriver(argv[argv.indexOf("--state") + 1] ?? "", target ?? latch));
+	const driverRunning = (pr: string, owner: { cwd?: string; slug?: string } | undefined = latch) =>
+		hooks.driverRunning ? hooks.driverRunning(pr) : isDriverRunning(pr, stateDir(), pidAlive, owner ?? {});
 	// `repoKey` is required, not optional: #475 in icemining-devops and #475 in
 	// icemining are different pull requests, so a session whose own repo cannot be
 	// named cannot establish ownership and is treated as solo.
@@ -361,7 +362,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 */
 	function waiterState(): string | undefined {
 		if (!latch?.pr) return undefined;
-		return waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
+		return waiterStatePath(waiterOwnerTokens(latch)[0], latch.pr, stateDir());
 	}
 
 	/**
@@ -448,10 +449,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 	 * non-terminal (L2).
 	 */
 	function waiterStateFiles(): string[] {
-		const files: string[] = [];
+		const files = latch ? waiterManualFilesOwnedBy(latch.pr, stateDir(), latch) : [];
 		const own = waiterState();
-		if (own) files.push(own);
-		if (latch?.pr) files.push(...waiterManualFiles(latch.pr, stateDir()));
+		// Keep an absent bootstrap path for deletion observation, but never add
+		// an existing file that the ownership filter rejected.
+		if (own && !existsSync(own)) files.push(own);
 		for (const path of files) {
 			if (existsSync(path)) seenWaiterPaths.add(path);
 		}
@@ -994,10 +996,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				const cwd = worktree;
 				if (!cwd) return;
 				const prNum = pr.number;
-				const running = driverRunning(prNum);
-				const statePath = waiterStatePath(repoKey(cwd), prNum, stateDir());
-				seedWaiterState(statePath, { pr: prNum, cwd });
-				ensureDriver({ pr: prNum, stateFile: statePath, spawn: spawnDriver, running });
+				const target = { pr: prNum, cwd, slug: `${pr.owner}/${pr.repo}` };
+				const running = driverRunning(prNum, target);
+				const statePath = waiterStatePath(waiterOwnerTokens(target)[0], prNum, stateDir());
+				if (!seedWaiterState(statePath, target)) throw new Error("waiter state bootstrap refused: unavailable or foreign state");
+				ensureDriver({ pr: prNum, stateFile: statePath, spawn: (argv) => spawnDriver(argv, target), running });
 			},
 			prState: async (prKey) => {
 				const held = latch;
@@ -1022,7 +1025,7 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				}
 				return latch?.head;
 			},
-			waiterHealth: async (prKey) => ({ running: driverRunning(prKey.number) }),
+			waiterHealth: async (prKey) => ({ running: driverRunning(prKey.number, { slug: `${prKey.owner}/${prKey.repo}` }) }),
 			ensureWaiter: async (prKey, worktree) => {
 				const cwd = worktree;
 				if (!cwd) return;
@@ -1037,10 +1040,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				} catch {
 					return;
 				}
-				const running = driverRunning(prNum);
-				const statePath = waiterStatePath(repoKey(cwd), prNum, stateDir());
-				seedWaiterState(statePath, { pr: prNum, cwd });
-				ensureDriver({ pr: prNum, stateFile: statePath, spawn: spawnDriver, running });
+				const target = { pr: prNum, cwd, slug: `${prKey.owner}/${prKey.repo}` };
+				const running = driverRunning(prNum, target);
+				const statePath = waiterStatePath(waiterOwnerTokens(target)[0], prNum, stateDir());
+				if (!seedWaiterState(statePath, target)) throw new Error("waiter state bootstrap refused: unavailable or foreign state");
+				ensureDriver({ pr: prNum, stateFile: statePath, spawn: (argv) => spawnDriver(argv, target), running });
 			},
 		});
 		return reviewCtrl;
@@ -1444,6 +1448,11 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 				return;
 			}
 
+			if (waiterOwnerTokens(latch).length === 0) {
+				status(ctx, `pr-await ${prLabel(latch)} · NO WAITER`);
+				notify(ctx, `pr-latch: cannot start a waiter for ${prLinkLabel(latch)} — repository identity is unavailable. Configure the GitHub origin or provide the PR URL; a number-only PID cannot prove ownership.`);
+				return;
+			}
 			const running = driverRunning(latch.pr);
 			if (!running && !spawnCwdFor(latch)) {
 				// Slug is a different GitHub repo than this checkout's origin
@@ -1468,12 +1477,16 @@ export default function (pi: ExtensionAPI, hooks: LatchHooks = {}) {
 			// The waiter is handed one of its own files, seeded with the same
 			// `{pr, cwd}` bootstrap `ghl-pr-await`'s handoff writes for itself —
 			// the `--daemon` hop takes no positional PR and reads both out of it.
-			const statePath = waiterStatePath(repoKey(latch.cwd), latch.pr, stateDir());
-			seedWaiterState(statePath, { pr: latch.pr, cwd: latch.cwd });
+			const statePath = waiterStatePath(waiterOwnerTokens(latch)[0], latch.pr, stateDir());
+			const seeded = seedWaiterState(statePath, latch);
+			if (!seeded && !running) {
+				notify(ctx, `pr-latch: ${prLinkLabel(latch)} waiter bootstrap refused — state is unavailable or belongs to another repository.`);
+				return;
+			}
 			// The seed is a file coming into existence under this latch: its later
 			// absence is the waiter's terminal delete, even if no read ever got
 			// there between seed and delete.
-			seenWaiterPaths.add(statePath);
+			if (seeded) seenWaiterPaths.add(statePath);
 			const result = ensureDriver({
 				pr: latch.pr,
 				stateFile: statePath,

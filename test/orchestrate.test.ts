@@ -4160,13 +4160,13 @@ test("F4: an accepted verdict marks the waiter file spent before the fixer finis
       "",
     ].join("\n"),
   );
-  // Both spellings on disk, both undelivered.
+  // Both spellings belong to this repository; legacy names need cwd evidence.
   const manualNew = join(stateDir, "manual-icemining-99.json");
   const manualOld = join(stateDir, "manual-99.json");
   for (const path of [manualNew, manualOld]) {
     writeFileSync(
       path,
-      JSON.stringify({ pr: "99", lastNext: "read_comments_and_fix", verdictDelivered: false }),
+      JSON.stringify({ pr: "99", cwd: join(homedir(), "Dev/git/wt/icemining/accepted"), lastNext: "read_comments_and_fix", verdictDelivered: false }),
     );
   }
 

@@ -5648,10 +5648,10 @@ export async function reconcileLiveFeaturePrs(
     return await reconcileFeaturePrs({
       listFeatures: () => listFeaturePrOwners(),
       prState: (owner) => featurePrState(pi, owner),
-      undeliveredVerdicts: (owner) => undeliveredWaiterVerdicts(owner.pr),
+      undeliveredVerdicts: (owner) => undeliveredWaiterVerdicts(owner.pr, undefined, { cwd: owner.worktree, slug: owner.repo }),
       dispatch: (owner, verdict) =>
         dispatchFeaturePrVerdictForOwner(pi, ctx as ExtensionContext, owner, verdict),
-      driverRunning: (owner) => isDriverRunning(owner.pr),
+      driverRunning: (owner) => isDriverRunning(owner.pr, undefined, undefined, { cwd: owner.worktree, slug: owner.repo }),
       ensureWaiter: (owner) => {
         // The waiter's own `--state` file, never the extension's latch copy,
         // and never a path this extension then writes to (F20).

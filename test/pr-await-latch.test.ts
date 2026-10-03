@@ -6,10 +6,10 @@
  *
  * Run: npm test  (or: node --experimental-strip-types --test test/pr-await-latch.test.ts)
  */
-import { mock, test } from "node:test";
+import { after, mock, test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,13 +21,14 @@ const DRIVER_STUB = join(DRIVER_PROBE_DIR, "ghl-await-drive");
 writeFileSync(
 	DRIVER_STUB,
 	`#!/bin/sh
-printf '%s\\n' "$PWD" > "$GHL_TEST_SPAWN_MARKER"
+printf '%s\\n' "$PWD" >> "$GHL_TEST_SPAWN_MARKER"
 `,
 );
 chmodSync(DRIVER_STUB, 0o755);
 process.env.GHL_TEST_SPAWN_MARKER = DRIVER_MARKER;
 process.env.GHL_AWAIT_DRIVE_BIN = DRIVER_STUB;
 process.env.GHL_PR_AWAIT_BIN = DRIVER_STUB;
+after(() => rmSync(DRIVER_PROBE_DIR, { recursive: true, force: true }));
 
 const REAL_OUTPUT = [
 	"status=reviewer_active",
@@ -40,6 +41,15 @@ const REAL_OUTPUT = [
 
 const REPO = join(homedir(), "Dev", "git", "icemining");
 const PI_SUB = join(homedir(), "Dev", "git", "pi-subagents");
+
+/** Origin-mismatch tests must not depend on the user's current fork remote. */
+function forkCheckout(t: TestContext): string {
+	const cwd = mkdtempSync(join(tmpdir(), "latch-fork-"));
+	mkdirSync(join(cwd, ".git"));
+	writeFileSync(join(cwd, ".git", "config"), '[remote "origin"]\n\turl = git@github.com:moofone/pi-subagents.git\n');
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	return cwd;
+}
 // Isolate from the real latch dir. Adoption scans this directory, and the live
 // ~/.local/state/ghl-await holds real orphaned latches that would be adopted.
 // One directory PER HARNESS: a settled handoff can still persist after a test
@@ -124,6 +134,7 @@ function harness(
 		publish?: any;
 		/** Present-and-undefined selects the production pid probe. */
 		driverRunning?: any;
+		useDefaultSpawnDriver?: boolean;
 	} = {},
 ) {
 	const handlers: Record<string, any> = {};
@@ -159,7 +170,7 @@ function harness(
 		},
 	};
 	latch(pi as any, {
-		spawnDriver: (argv) => {
+		spawnDriver: extraHooks.useDefaultSpawnDriver ? undefined : (argv) => {
 			spawns.push(argv);
 			const stateFile = argv[argv.indexOf("--state") + 1];
 			try {
@@ -257,8 +268,8 @@ function harness(
 		input: (text: string, source = "interactive") =>
 			handlers.input?.({ text, source }, ctx),
 		bash: async (command: string, output: string) => {
-			await handlers.tool_execution_start({ toolName: "bash", toolCallId: "tc", args: { command } });
-			await handlers.tool_execution_end({ toolCallId: "tc", result: { output }, isError: false });
+			await handlers.tool_execution_start({ toolName: "bash", toolCallId: "tc", args: { command } }, ctx);
+			await handlers.tool_execution_end({ toolCallId: "tc", result: { output }, isError: false }, ctx);
 		},
 		cleanup: () => {
 			handlers.session_shutdown?.({}, ctx);
@@ -1016,7 +1027,8 @@ test("an ownerless session latch still protects its PR from the manual route", a
 	}
 });
 
-test("spawnCwdFor refuses a cwd that is not a git checkout", () => {
+test("spawnCwdFor refuses a cwd that is not a git checkout", (t) => {
+	const PI_SUB = forkCheckout(t);
 	assert.equal(spawnCwdFor({ cwd: homedir() }), undefined, "HOME is not a git checkout");
 	// Live: the #2163 waiter died looping on
 	//   error=cannot resolve owner/repo from origin remote
@@ -1174,7 +1186,8 @@ test("observed latch for another repo's already-merged PR wakes and does not spa
 	}
 });
 
-test("slug-mismatched open PR still wakes on merge without a waiter", async () => {
+test("slug-mismatched open PR still wakes on merge without a waiter", async (t) => {
+	const PI_SUB = forkCheckout(t);
 	// nicobailon/pi-subagents#1831 from a moofone/pi-subagents checkout: cwd-only
 	// `gh pr view 1831` 404s, and a waiter started here loops the same way.
 	let view = OPEN;
@@ -1431,7 +1444,8 @@ test("absorb ignores a GitHub URL whose pull number is not the awaited PR", asyn
 	}
 });
 
-test("absorb selects a later URL whose pull number matches the awaited PR", async () => {
+test("absorb selects a later URL whose pull number matches the awaited PR", async (t) => {
+	const PI_SUB = forkCheckout(t);
 	const YIELD_OUT = [
 		"https://github.com/moofone/icemining/pull/2150",
 		"https://github.com/nicobailon/pi-subagents/pull/1831",
@@ -1563,7 +1577,6 @@ test("defaultSpawnDriver never falls back to HOME or process.cwd()", async () =>
 		false,
 		"non-checkout latches must not run the driver stub",
 	);
-	rmSync(DRIVER_PROBE_DIR, { recursive: true, force: true });
 });
 
 test("a manual latch still wakes about a merge it actually witnesses", async () => {
@@ -1769,6 +1782,200 @@ function writeActionable(dir: string, _sessionId: string, extra: Record<string, 
 		}),
 	);
 }
+
+test("controller recovery spawns a target obligation in its own checkout, not the held latch", async (t) => {
+	const oldCwd = forkCheckout(t);
+	const newCwd = forkCheckout(t);
+	writeFileSync(join(oldCwd, ".git/config"), '[remote "origin"]\n\turl = git@github.com:moofone/pi-gpt-pro.git\n');
+	writeFileSync(join(newCwd, ".git/config"), '[remote "origin"]\n\turl = git@github.com:moofone/pi-appserver.git\n');
+	const h = harness((cmd) => cmd === "gh" ? OPEN : ok(""), newCwd,
+		{ watchStateDir: false, driverRunning: undefined, useDefaultSpawnDriver: true });
+	try {
+		rmSync(DRIVER_MARKER, { force: true });
+		await h.start();
+		await h.bash("git pr-await 11", "status=handed_off\nnext=yield\npr=11");
+		writeFileSync(join(h.dir, "drive-pi-appserver-11.pid"), String(process.pid));
+		const key = parsePrKey({ pr: "11", slug: "moofone/pi-gpt-pro" })!;
+		createReviewStore(h.dir).write(emptyObligation({ pr: key,
+			owner: { kind: "session", id: h.sessionId, generation: h.sessionId }, worktree: oldCwd, head: "abcdef1" }));
+		await h.settle();
+		await sleep(150);
+		assert.deepEqual(readFileSync(DRIVER_MARKER, "utf8").trim().split("\n"), [realpathSync(oldCwd)], "only the target waiter may spawn; appending makes a wrong second launch visible");
+		assert.ok(existsSync(join(h.dir, "drive-pi-gpt-pro-11.log")), "log belongs to the target repository");
+		assert.ok(existsSync(join(h.dir, "manual-pi-gpt-pro-11.json")), "external-layout checkout uses its origin identity");
+	} finally {
+		h.cleanup();
+		rmSync(DRIVER_MARKER, { force: true });
+	}
+});
+
+test("out-of-layout sessions infer origin identity before naming and checking their waiter", async (t) => {
+	const cwd = forkCheckout(t);
+	const h = harness((cmd) => cmd === "gh" ? OPEN : ok(""), cwd, { watchStateDir: false, driverRunning: undefined });
+	try {
+		await h.start();
+		await h.bash("git pr-await 2142", REAL_OUTPUT);
+		writeFileSync(join(h.dir, "drive-pi-subagents-2142.pid"), String(process.pid));
+		await h.settle();
+		await sleep(40);
+		await h.settle();
+		await sleep(40);
+		assert.equal(h.spawns.length, 0, "setLatch must infer the origin, even without a PR URL in output");
+		assert.ok(existsSync(join(h.dir, "manual-pi-subagents-2142.json")), JSON.stringify(h.notifies));
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("an identity-less external checkout never starts a daemon on each settle", async (t) => {
+	const cwd = forkCheckout(t);
+	writeFileSync(join(cwd, ".git/config"), "");
+	const h = harness((cmd) => cmd === "gh" ? OPEN : ok(""), cwd, { watchStateDir: false, driverRunning: undefined });
+	try {
+		await h.start();
+		await h.bash("git pr-await 2142", REAL_OUTPUT);
+		writeFileSync(join(h.dir, "drive-2142.pid"), String(process.pid));
+		await h.settle();
+		await sleep(40);
+		await h.settle();
+		await sleep(40);
+		assert.equal(h.spawns.length, 0, "without repository evidence, neither borrowing a legacy PID nor spawning repeatedly is safe");
+		assert.ok(h.notifies.some(n => /repository identity/i.test(n)), JSON.stringify(h.notifies));
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("an owned running waiter keeps watching despite a foreign bootstrap file", async () => {
+	const h = harness((cmd) => cmd === "gh" ? OPEN : ok(""), REPO, { watchStateDir: false });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		h.running.add("2142");
+		const path = join(h.dir, "manual-icemining-2142.json");
+		const raw = JSON.stringify({ pr: "2142", cwd: join(homedir(), "Dev/git/pi-gpt-pro"), verdict: "foreign" });
+		writeFileSync(path, raw);
+		await h.settle();
+		await sleep(40);
+		assert.equal(readFileSync(path, "utf8"), raw);
+		assert.equal(h.spawns.length, 0);
+		assert.ok(h.notifies.some(n => /already running/.test(n)), `live owned waiter is watched; rejected state is not reseeded: ${JSON.stringify(h.notifies)}`);
+		assert.equal(h.notifies.some(n => /bootstrap refused/.test(n)), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
+for (const token of ["pi-gpt-pro", "wt"]) {
+test(`two current-layout worktree sessions keep same-number findings independent (${token} state)`, async () => {
+	const oneCwd = join(homedir(), "Dev/git/wt/pi-appserver/integrate");
+	const twoCwd = join(homedir(), "Dev/git/wt/pi-gpt-pro/fix-orphan-tab-close");
+	const h1 = harness((cmd) => cmd === "gh" ? OPEN : ok(""), oneCwd, { watchStateDir: false });
+	const h2 = harness((cmd) => cmd === "gh" ? OPEN : ok(""), twoCwd, { watchStateDir: false });
+	try {
+		// Both real extension instances read one state directory, as live sessions do.
+		process.env.GHL_LATCH_STATE_DIR = h1.dir;
+		for (const h of [h1, h2]) {
+			await h.start();
+			await h.bash("git pr-await 11", "status=handed_off\nnext=yield\npr=11\nhead=abcdef1");
+			h.running.add("11"); // Existing waiters; this test exercises delivery, not filesystem provisioning.
+		}
+		const path = join(h1.dir, `manual-${token}-11.json`);
+		writeFileSync(path, JSON.stringify({ pr: "11", cwd: twoCwd, lastNext: "read_comments_and_fix",
+			verdict: "status=action_required\nnext=read_comments_and_fix\npr=11\nhead=abcdef1\ncomment bot=reviewer path=src/browser/page.ts line=93 body=fix", verdictDelivered: false }));
+		await h1.settle();
+		await sleep(80);
+		assert.equal(h1.sessionFixes.length, 0);
+		assert.equal(JSON.parse(readFileSync(path, "utf8")).verdictDelivered, false);
+		await h2.settle();
+		await sleep(80);
+		assert.equal(h2.sessionFixes.length, 1, JSON.stringify({ notices: h2.notifies, obligations: createReviewStore(h1.dir).list() }));
+		assert.equal(h2.sessionFix(0).worktree, twoCwd);
+		assert.equal(h2.sessionFix(0).pr.repo, "pi-gpt-pro");
+		assert.equal(h1.wakes.length + h2.wakes.length, 0);
+	} finally {
+		h1.cleanup();
+		h2.cleanup();
+	}
+});
+}
+
+test("same-number foreign findings never reach the latched session's fixer", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchStateDir: false });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		const foreign = join(h.dir, "manual-pi-gpt-pro-2142.json");
+		const raw = JSON.stringify({ pr: "2142", lastNext: "read_comments_and_fix", verdict: ACTIONABLE_VERDICT, verdictDelivered: false });
+		writeFileSync(foreign, raw);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 0, "PR numbers alone cannot route findings");
+		assert.equal(h.dispatches.length, 0);
+		assert.equal(h.wakes.length, 0);
+		assert.equal(readFileSync(foreign, "utf8"), raw);
+		assert.ok(existsSync(join(h.dir, "manual-icemining-2142.json")), "spawn seeds our own state, not the foreign file");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("dispatching our findings never marks a same-number foreign verdict delivered", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchStateDir: false });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeActionable(h.dir, h.sessionId);
+		const foreign = join(h.dir, "manual-pi-gpt-pro-2142.json");
+		const raw = JSON.stringify({ pr: "2142", lastNext: "read_comments_and_fix", verdict: ACTIONABLE_VERDICT, verdictDelivered: false });
+		writeFileSync(foreign, raw);
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.sessionFixes.length, 1);
+		assert.equal(readFileSync(foreign, "utf8"), raw, "foreign files are not in the delivery candidate set");
+		assert.equal(JSON.parse(readFileSync(join(h.dir, "manual-icemining-2142.json"), "utf8")).verdictDelivered, true);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a same-number foreign waiter cannot suppress the latched PR's waiter", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO,
+		{ watchStateDir: false, driverRunning: undefined });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		writeFileSync(join(h.dir, "drive-pi-gpt-pro-2142.pid"), String(process.pid));
+		await h.settle();
+		await sleep(80);
+		assert.equal(h.spawns.length, 1, "foreign live PID is not our waiter");
+		assert.equal(h.spawn(0)[h.spawn(0).indexOf("--state") + 1], join(h.dir, "manual-icemining-2142.json"));
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("key-pool exhaustion stays environment recovery, with no parent wake or code fixer", async () => {
+	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)), REPO, { watchStateDir: false });
+	try {
+		await h.start();
+		await h.bash(`cd ${REPO} && git pr-await 2142`, REAL_OUTPUT);
+		const path = join(h.dir, "manual-icemining-2142.json");
+		for (let i = 0; i < 3; i++) {
+			writeFileSync(path, JSON.stringify({ pr: "2142", lastNext: "fix_command_or_environment", verdictDelivered: false,
+				verdict: `status=error\nnext=fix_command_or_environment\npr=2142\nerror=event transport error: all 8 client keys are held by running waiters\nelapsed_seconds=${i}` }));
+			await h.settle();
+			await sleep(40);
+		}
+		assert.equal(h.sessionFixes.length, 0);
+		assert.equal(h.dispatches.length, 0);
+		assert.equal(h.wakes.length, 0);
+		const key = parsePrKey({ pr: "2142", slug: originSlug(REPO) ?? "moofone/icemining" })!;
+		assert.equal(createReviewStore(h.dir).read(key)?.state, "retry_scheduled");
+	} finally {
+		h.cleanup();
+	}
+});
 
 test("handoff persist does not wipe a waiter ACTIONABLE verdict", async () => {
 	const h = harness((cmd) => (cmd === "gh" ? OPEN : ok(REAL_OUTPUT)));

@@ -613,7 +613,12 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 		if (!pendingFix) {
 			const dead = ob.pendingVerdicts.find((v) => v.kind === "dead_reviewers");
 			if (dead) {
-				await deps.ensureWaiter(ob.pr, ob.worktree);
+				try {
+					await deps.ensureWaiter(ob.pr, ob.worktree);
+				} catch (error) {
+					scheduleWaiterRetry(ob, error);
+					return;
+				}
 				consumeRecord(ob, dead, "dead reviewers");
 				ob.state = "waiting_review";
 				save(ob, "re-armed waiter for dead reviewers");
@@ -870,7 +875,7 @@ export function createReviewController(deps: ReviewControllerDeps): ReviewContro
 			ob.writer = undefined;
 			ob.launch = undefined;
 			save(ob, "stale-head no-op; re-await");
-			await deps.reawait(ob.pr, ob.worktree);
+			await armWaiter(ob);
 			return;
 		}
 		if (result.disagreed) {
