@@ -67,9 +67,14 @@ export type WaiterVerdict = {
 	verdict?: string;
 	verdictDelivered: boolean;
 	pr?: string;
+	cwd?: string;
+	slug?: string;
 	round?: string;
 	roundTotal?: string;
 };
+
+/** Repository evidence used for waiter reads, delivery and liveness. */
+export type WaiterOwner = { cwd?: string; slug?: string };
 
 /** Read the waiter's verdict without treating the file as the extension latch. */
 export function readWaiterVerdict(path: string): WaiterVerdict | undefined {
@@ -103,6 +108,8 @@ export function readWaiterVerdict(path: string): WaiterVerdict | undefined {
 			verdict,
 			verdictDelivered: delivered === true,
 			pr: v.pr != null ? String(v.pr) : undefined,
+			cwd: typeof v.cwd === "string" ? v.cwd : undefined,
+			slug: typeof v.slug === "string" ? v.slug : undefined,
 			round,
 			roundTotal,
 		};
@@ -152,10 +159,7 @@ export function spendWaiterVerdict(
 	pr: string,
 	dir = stateDir(),
 ): void {
-	const paths = new Set([
-		...waiterManualFiles(pr, dir),
-		...waiterPaths(repo, pr, dir).manual,
-	]);
+	const paths = waiterManualFilesOwnedBy(pr, dir, { slug: repo });
 	for (const path of paths) {
 		if (!existsSync(path)) continue;
 		markVerdictDelivered(path);
@@ -588,8 +592,9 @@ const WT_ROOT_TO_REPO: Record<string, string> = {
 };
 
 /**
- * Repository a path belongs to, for both `~/Dev/git/<repo>` checkouts and
- * `~/Dev/git/<repo>-wt/<branch>` worktrees, or `undefined` outside the dev tree.
+ * Repository a path belongs to: reference checkouts, `wt/<repo>/<branch>`
+ * and legacy `<repo>-wt/<branch>` worktrees. Pure path arithmetic also works
+ * after a worktree has been removed.
  *
  * Latch decisions are cross-repo unsafe without this: `#475` in
  * `icemining-devops` and `#475` in `icemining` are different pull requests, and
@@ -601,8 +606,9 @@ export function repoKey(cwd: string): string | undefined {
 	for (const root of [join(homedir(), "Dev", "git"), join(homedir(), "Dev", "git-rel")]) {
 		const prefix = `${root}/`;
 		if (!cwd.startsWith(prefix)) continue;
-		const first = cwd.slice(prefix.length).split("/")[0];
+		const [first, project] = cwd.slice(prefix.length).split("/");
 		if (!first) return undefined;
+		if (first === "wt") return project || undefined;
 		if (first.endsWith("-wt")) return WT_ROOT_TO_REPO[first] ?? first.slice(0, -3);
 		return first;
 	}
@@ -813,10 +819,11 @@ export type UndeliveredVerdict = {
 export function undeliveredWaiterVerdicts(
 	pr: string,
 	dir = stateDir(),
+	owner?: WaiterOwner,
 ): UndeliveredVerdict[] {
 	const want = String(pr ?? "").trim();
 	if (!want) return [];
-	const paths: string[] = [...waiterManualFiles(want, dir)];
+	const paths = owner ? waiterManualFilesOwnedBy(want, dir, owner) : waiterManualFiles(want, dir);
 	let names: string[] = [];
 	try {
 		names = readdirSync(dir);
@@ -826,7 +833,9 @@ export function undeliveredWaiterVerdicts(
 	for (const name of names) {
 		if (!name.startsWith("pi-") || !name.endsWith(".json")) continue;
 		if (isExtensionOwnedStateFile(name)) continue;
-		paths.push(join(dir, name));
+		const path = join(dir, name);
+		if (owner && !waiterStateMatchesOwner(readWaiterVerdict(path), owner, true)) continue;
+		paths.push(path);
 	}
 	const out: UndeliveredVerdict[] = [];
 	const seen = new Set<string>();
@@ -1110,8 +1119,8 @@ export function waiterPaths(
 /**
  * Every waiter file in `dir` for this PR, whatever repo token it carries.
  *
- * A caller that holds only a PR number — the latch, which is keyed by PR —
- * cannot build the repo-qualified name, so the directory is the index instead.
+ * Unscoped discovery only. A session or Feature must use the OwnedBy helpers:
+ * a PR number alone cannot authorize reading or consuming another repo's state.
  *
  * The suffix test is string arithmetic, deliberately not a regex: `drive-.*-232`
  * matches `drive-icemining-2232.pid`, and answering "#232 already has a waiter"
@@ -1215,7 +1224,9 @@ export function waiterOwnerTokens(owner: { cwd?: string; slug?: string }): strin
  * Waiter files for this PR that belong to `owner`'s repository.
  * Repo-qualified names for another repo are left alone. Legacy `manual-<pr>.json`
  * is included only when JSON cwd matches the owner. Legacy `drive-<pr>.log` and
- * `drive-<pr>.pid` have no repository identity and are never claimed.
+ * `drive-<pr>.pid` have no repository identity and are never claimed. Old
+ * `manual-wt-<pr>.json` files from the shared-root bug need the same positive
+ * metadata evidence as number-only JSON; `wt` is not trusted as an owner.
  */
 export function waiterFilesOwnedBy(
 	pr: string,
@@ -1228,38 +1239,38 @@ export function waiterFilesOwnedBy(
 	if (!number) return [];
 	const all = waiterFilesFor(pr, stem, ext, dir);
 	const tokens = new Set(waiterOwnerTokens(owner));
-	const otherQualified = all.filter((path) => {
-		const token = waiterFileRepoToken(path, stem, ext, number);
-		return Boolean(token && !tokens.has(token));
-	});
 	const owned: string[] = [];
 	for (const path of all) {
 		const middle = waiterFileMiddle(path, stem, ext);
-		if (middle === number) {
-			if (ext === "json") {
-				const state = readLatchFile(path);
-				const cwd = state?.cwd?.replace(/\/+$/, "");
-				const want = owner.cwd?.replace(/\/+$/, "");
-				if (cwd && want && cwd === want) {
-					owned.push(path);
-					continue;
-				}
-				const stateRepo = state?.cwd ? repoKey(state.cwd) : undefined;
-				if (stateRepo && tokens.has(stateRepo)) {
-					owned.push(path);
-					continue;
-				}
-				if (!state?.cwd && otherQualified.length === 0 && tokens.size > 0) owned.push(path);
-				continue;
-			}
-			// No repo identity: a leftover drive-<pr>.log/.pid from another
-			// repository with the same number must not look owned.
+		const token = waiterFileRepoToken(path, stem, ext, number);
+		const legacy = middle === number || (stem === "manual" && ext === "json" && token === "wt");
+		if (!legacy && (!token || !tokens.has(token))) continue;
+		if (ext === "json") {
+			const state = readWaiterVerdict(path);
+			if (!state || (state.pr && state.pr !== number)) continue;
+			if (!waiterStateMatchesOwner(state, owner, legacy)) continue;
+		} else if (legacy) {
+			// Number-only logs and PIDs have no repository evidence.
 			continue;
 		}
-		const token = waiterFileRepoToken(path, stem, ext, number);
-		if (token && tokens.has(token)) owned.push(path);
+		owned.push(path);
 	}
 	return owned;
+}
+
+/** Reject contradictory metadata; legacy files also need positive ownership evidence. */
+function waiterStateMatchesOwner(
+	state: WaiterVerdict | undefined,
+	owner: WaiterOwner,
+	requireEvidence: boolean,
+): boolean {
+	if (!state) return false;
+	const tokens = new Set(waiterOwnerTokens(owner));
+	const stateTokens = waiterOwnerTokens(state);
+	if (stateTokens.some((token) => !tokens.has(token))) return false;
+	if (state.slug?.includes("/") && owner.slug?.includes("/") && !sameGithubSlug(state.slug, owner.slug)) return false;
+	const exactCwd = Boolean(state.cwd && owner.cwd && state.cwd.replace(/\/+$/, "") === owner.cwd.replace(/\/+$/, ""));
+	return !requireEvidence || exactCwd || stateTokens.some((token) => tokens.has(token));
 }
 
 export function waiterManualFilesOwnedBy(
@@ -1300,9 +1311,10 @@ export function pidAlive(pid: number): boolean {
 }
 
 /** Every pid recorded for this PR, under any spelling. */
-export function readPids(pr: string, dir = stateDir()): number[] {
+export function readPids(pr: string, dir = stateDir(), owner?: WaiterOwner): number[] {
 	const out: number[] = [];
-	for (const path of waiterPidFiles(pr, dir)) {
+	const paths = owner ? waiterPidFilesOwnedBy(pr, dir, owner) : waiterPidFiles(pr, dir);
+	for (const path of paths) {
 		try {
 			const n = Number(readFileSync(path, "utf8").trim());
 			if (Number.isInteger(n) && n > 0) out.push(n);
@@ -1318,18 +1330,16 @@ export function readPid(pr: string, dir = stateDir()): number | undefined {
 }
 
 /**
- * Is any waiter for this PR alive?
- *
- * "Any", across both spellings: the question this answers is only ever asked to
- * decide whether to fork another daemon, and a false negative is what produced
- * 25 concurrent waiters on one PR.
+ * Is this repository's waiter alive? Ownerless use is unscoped discovery only.
+ * A live PID from a different repository must not suppress this PR's daemon.
  */
 export function isDriverRunning(
 	pr: string,
 	dir = stateDir(),
 	alive: (pid: number) => boolean = pidAlive,
+	owner?: WaiterOwner,
 ): boolean {
-	return readPids(pr, dir).some((pid) => alive(pid));
+	return readPids(pr, dir, owner).some((pid) => alive(pid));
 }
 
 /* ------------------------------------------------------------------ *
@@ -1361,16 +1371,15 @@ export function isExtensionOwnedStateFile(path: string): boolean {
 
 /**
  * The `--state` path to hand `ghl-pr-await` for this PR — always a file the
- * waiter owns. An existing one wins over a freshly spelled name: which spelling
- * the installed binary uses is not knowable from here, and creating the other
- * one would leave two waiter files for one PR.
+ * waiter owns. Reuse existing state only when it belongs to this repository;
+ * a same-number file from another repository is never a bootstrap target.
  */
 export function waiterStatePath(
 	repo: string | undefined,
 	pr: string,
 	dir = stateDir(),
 ): string {
-	return waiterManualFiles(pr, dir)[0] ?? waiterPaths(repo, pr, dir).manual[0]!;
+	return waiterManualFilesOwnedBy(pr, dir, { slug: repo })[0] ?? waiterPaths(repo, pr, dir).manual[0]!;
 }
 
 /**
@@ -1381,22 +1390,30 @@ export function waiterStatePath(
  * `{pr, cwd}` and nothing else, byte for byte what `ghl-pr-await`'s own
  * `spawn_handoff` writes. A file that already names this PR is left alone: it
  * is the waiter's, and it may hold an undelivered verdict that overwriting
- * would throw away (F4).
+ * would throw away (F4). Return false when that file is foreign or bootstrap
+ * cannot be written; callers must not launch a new waiter into it.
  */
-export function seedWaiterState(path: string, seed: { pr: string; cwd: string }): void {
+export function seedWaiterState(path: string, seed: { pr: string; cwd: string }): boolean {
 	try {
 		mkdirSync(dirname(path), { recursive: true });
 		if (existsSync(path)) {
 			const existing = JSON.parse(readFileSync(path, "utf8")) as { pr?: unknown };
-			if (String(existing.pr ?? "") === String(seed.pr)) return;
+			if (String(existing.pr ?? "") === String(seed.pr)) {
+				// A matching number alone is not ownership, especially outside the
+				// known worktree layout where the fallback name is number-only.
+				return waiterManualFilesOwnedBy(seed.pr, dirname(path), {
+					cwd: seed.cwd, slug: originSlug(seed.cwd),
+				}).includes(path);
+			}
 		}
 	} catch {
 		// Unreadable or torn: a re-seed is the recovery.
 	}
 	try {
 		writeFileSync(path, JSON.stringify({ pr: String(seed.pr), cwd: seed.cwd }));
+		return true;
 	} catch {
-		// Never take the session down over the latch.
+		return false;
 	}
 }
 

@@ -13,7 +13,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -28,6 +28,11 @@ import {
 	waiterPidFilesOwnedBy,
 	waiterPaths,
 	waiterPidFiles,
+	waiterStatePath,
+	spendWaiterVerdict,
+	undeliveredWaiterVerdicts,
+	repoKey,
+	seedWaiterState,
 } from "../src/lib/pr-await-core.ts";
 
 function tmpStateDir(): string {
@@ -304,6 +309,125 @@ test("waiterFilesOwnedBy does not claim an ambiguous legacy drive file", () => {
 			true,
 			"unscoped callers still scan every spelling",
 		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("repoKey distinguishes repositories in the current worktree layout", () => {
+	const root = join(homedir(), "Dev/git");
+	assert.equal(repoKey(join(root, "wt/pi-appserver/integrate")), "pi-appserver");
+	assert.equal(repoKey(join(root, "wt/pi-gpt-pro/fix")), "pi-gpt-pro");
+	assert.equal(repoKey(join(root, "wt/pi-appserver/nested/branch")), "pi-appserver");
+	assert.equal(repoKey(join(root, "wt")), undefined, "shared worktree root has no repo identity");
+	assert.equal(repoKey(join(root, "pi-appserver-wt/integrate")), "pi-appserver");
+	assert.equal(repoKey(join(root, "ice-wt/feature")), "icemining");
+});
+
+test("waiterStatePath never borrows another repository's same-number state", () => {
+	const dir = tmpStateDir();
+	try {
+		const foreign = join(dir, "manual-pi-gpt-pro-11.json");
+		writeFileSync(foreign, JSON.stringify({ pr: "11", cwd: join(homedir(), "Dev/git/wt/pi-gpt-pro/fix") }));
+		assert.equal(waiterStatePath("pi-appserver", "11", dir), join(dir, "manual-pi-appserver-11.json"));
+		assert.equal(waiterStatePath(undefined, "11", dir), join(dir, "manual-11.json"), "unknown repo cannot claim a qualified file");
+		const legacy = join(dir, "manual-11.json");
+		writeFileSync(legacy, JSON.stringify({ pr: "11", cwd: join(homedir(), "Dev/git/wt/pi-appserver/integrate") }));
+		assert.equal(waiterStatePath("pi-appserver", "11", dir), legacy, "identity-proven legacy state is reusable");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("old wt-qualified state remains readable only with positive repository evidence", () => {
+	const dir = tmpStateDir();
+	try {
+		const cwd = join(homedir(), "Dev/git/wt/pi-appserver/integrate");
+		const owner = { cwd, slug: "moofone/pi-appserver" };
+		const path = join(dir, "manual-wt-11.json");
+		writeFileSync(path, JSON.stringify({ pr: "11", cwd, lastNext: "fix_command_or_environment", verdict: "owned", verdictDelivered: false }));
+		assert.deepEqual(waiterManualFilesOwnedBy("11", dir, owner), [path]);
+		assert.equal(waiterStatePath("pi-appserver", "11", dir), path, "keep an existing waiter's real state path without migration");
+		assert.equal(undeliveredWaiterVerdicts("11", dir, owner)[0]?.verdict, "owned");
+		assert.equal(seedWaiterState(path, { pr: "11", cwd }), true);
+		spendWaiterVerdict("moofone/pi-appserver", "11", dir);
+		assert.equal(JSON.parse(readFileSync(path, "utf8")).verdictDelivered, true);
+		writeFileSync(path, JSON.stringify({ pr: "11", cwd: join(homedir(), "Dev/git/wt/pi-gpt-pro/fix"), verdict: "foreign" }));
+		assert.deepEqual(waiterManualFilesOwnedBy("11", dir, owner), []);
+		writeFileSync(path, JSON.stringify({ pr: "11", verdict: "ambiguous" }));
+		assert.deepEqual(waiterManualFilesOwnedBy("11", dir, owner), []);
+		writeFileSync(join(dir, "drive-wt-11.pid"), String(process.pid));
+		assert.equal(isDriverRunning("11", dir, () => true, owner), false, "a shared-root PID never proves repository identity");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("unknown-layout bootstrap refuses foreign legacy state instead of spawning into it", () => {
+	const dir = tmpStateDir();
+	try {
+		const path = join(dir, "manual-11.json");
+		const raw = JSON.stringify({ pr: "11", cwd: join(homedir(), "Dev/git/wt/pi-gpt-pro/fix"), verdict: "foreign finding" });
+		writeFileSync(path, raw);
+		assert.equal(seedWaiterState(path, { pr: "11", cwd: "/tmp/unknown-checkout" }), false);
+		assert.equal(readFileSync(path, "utf8"), raw);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("accepting one repository's verdict leaves another repository's verdict unspent", () => {
+	const dir = tmpStateDir();
+	try {
+		const ours = join(dir, "manual-pi-appserver-11.json");
+		const foreign = join(dir, "manual-pi-gpt-pro-11.json");
+		const raw = JSON.stringify({ pr: "11", lastNext: "read_comments_and_fix", verdictDelivered: false });
+		writeFileSync(ours, raw);
+		writeFileSync(foreign, raw);
+		spendWaiterVerdict("pi-appserver", "11", dir);
+		assert.equal(readFileSync(foreign, "utf8"), raw, "foreign verdict must survive byte-for-byte");
+		assert.equal(JSON.parse(readFileSync(ours, "utf8")).verdictDelivered, true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("Feature verdict recovery is repository-scoped including legacy session files", () => {
+	const dir = tmpStateDir();
+	const cwd = join(homedir(), "Dev/git/wt/pi-appserver/integrate");
+	try {
+		const raw = { pr: "11", lastNext: "read_comments_and_fix", verdict: "head=abcdef1", verdictDelivered: false };
+		writeFileSync(join(dir, "manual-pi-appserver-11.json"), JSON.stringify(raw));
+		writeFileSync(join(dir, "manual-pi-gpt-pro-11.json"), JSON.stringify(raw));
+		writeFileSync(join(dir, "pi-foreign.json"), JSON.stringify({ ...raw, cwd: join(homedir(), "Dev/git/wt/pi-gpt-pro/fix") }));
+		writeFileSync(join(dir, "pi-owned.json"), JSON.stringify({ ...raw, cwd }));
+		writeFileSync(join(dir, "pi-unknown.json"), JSON.stringify(raw));
+		assert.deepEqual(undeliveredWaiterVerdicts("11", dir, { cwd }).map((v) => basename(v.path)).sort(),
+			["manual-pi-appserver-11.json", "pi-owned.json"]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("waiter health cannot be satisfied by another repository's same-number PID", () => {
+	const dir = tmpStateDir();
+	try {
+		writeFileSync(join(dir, "drive-pi-gpt-pro-11.pid"), "4242");
+		const owner = { slug: "moofone/pi-appserver" };
+		assert.equal(isDriverRunning("11", dir, () => true, owner), false);
+		writeFileSync(join(dir, "drive-pi-appserver-11.pid"), "4243");
+		assert.equal(isDriverRunning("11", dir, (pid) => pid === 4243, owner), true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("ownership rejects unproven legacy state and a qualified file with foreign contents", () => {
+	const dir = tmpStateDir();
+	try {
+		writeFileSync(join(dir, "manual-11.json"), JSON.stringify({ pr: "11" }));
+		writeFileSync(join(dir, "manual-pi-appserver-11.json"), JSON.stringify({ pr: "11", cwd: join(homedir(), "Dev/git/wt/pi-gpt-pro/fix") }));
+		assert.deepEqual(waiterManualFilesOwnedBy("11", dir, { slug: "moofone/pi-appserver" }), []);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
